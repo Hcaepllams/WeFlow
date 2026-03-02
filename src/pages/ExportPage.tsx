@@ -57,6 +57,7 @@ interface ExportOptions {
 interface SessionRow extends AppChatSession {
   kind: ConversationTab
   wechatId?: string
+  hasSession: boolean
 }
 
 interface TaskProgress {
@@ -207,6 +208,13 @@ const toKindByContactType = (session: AppChatSession, contact?: ContactInfo): Co
   return 'private'
 }
 
+const toKindByContact = (contact: ContactInfo): ConversationTab => {
+  if (contact.type === 'group') return 'group'
+  if (contact.type === 'official') return 'official'
+  if (contact.type === 'former_friend') return 'former_friend'
+  return 'private'
+}
+
 const isContentScopeSession = (session: SessionRow): boolean => (
   session.kind === 'private' || session.kind === 'group' || session.kind === 'former_friend'
 )
@@ -257,6 +265,50 @@ const toSessionRowsWithContacts = (
   sessions: AppChatSession[],
   contactMap: Record<string, ContactInfo>
 ): SessionRow[] => {
+  const sessionMap = new Map<string, AppChatSession>()
+  for (const session of sessions || []) {
+    sessionMap.set(session.username, session)
+  }
+
+  const contacts = Object.values(contactMap)
+    .filter((contact) => (
+      contact.type === 'friend' ||
+      contact.type === 'group' ||
+      contact.type === 'official' ||
+      contact.type === 'former_friend'
+    ))
+
+  if (contacts.length > 0) {
+    return contacts
+      .map((contact) => {
+        const session = sessionMap.get(contact.username)
+        const latestTs = session?.sortTimestamp || session?.lastTimestamp || 0
+        return {
+          ...(session || {
+            username: contact.username,
+            type: 0,
+            unreadCount: 0,
+            summary: '',
+            sortTimestamp: latestTs,
+            lastTimestamp: latestTs,
+            lastMsgType: 0
+          }),
+          username: contact.username,
+          kind: toKindByContact(contact),
+          wechatId: contact.username,
+          displayName: contact.displayName || session?.displayName || contact.username,
+          avatarUrl: contact.avatarUrl || session?.avatarUrl,
+          hasSession: Boolean(session)
+        } as SessionRow
+      })
+      .sort((a, b) => {
+        const latestA = a.sortTimestamp || a.lastTimestamp || 0
+        const latestB = b.sortTimestamp || b.lastTimestamp || 0
+        if (latestA !== latestB) return latestB - latestA
+        return (a.displayName || a.username).localeCompare(b.displayName || b.username, 'zh-Hans-CN')
+      })
+  }
+
   return sessions
     .map((session) => {
       const contact = contactMap[session.username]
@@ -265,7 +317,8 @@ const toSessionRowsWithContacts = (
         kind: toKindByContactType(session, contact),
         wechatId: contact?.username || session.username,
         displayName: contact?.displayName || session.displayName || session.username,
-        avatarUrl: contact?.avatarUrl || session.avatarUrl
+        avatarUrl: contact?.avatarUrl || session.avatarUrl,
+        hasSession: true
       } as SessionRow
     })
     .sort((a, b) => (b.sortTimestamp || b.lastTimestamp || 0) - (a.sortTimestamp || a.lastTimestamp || 0))
@@ -570,6 +623,9 @@ function ExportPage() {
       const cachedContactMap = toContactMapFromCaches(cachedContacts, cachedAvatarEntries)
       if (cachedContacts.length > 0) {
         syncContactTypeCounts(Object.values(cachedContactMap))
+        setSessions(toSessionRowsWithContacts([], cachedContactMap))
+        setSessionDataSource('cache')
+        setIsLoading(false)
       }
       setSessionContactsUpdatedAt(cachedContactsItem?.updatedAt || null)
       setSessionAvatarUpdatedAt(cachedAvatarItem?.updatedAt || null)
@@ -800,6 +856,8 @@ function ExportPage() {
   const selectedCount = selectedSessions.size
 
   const toggleSelectSession = (sessionId: string) => {
+    const target = sessions.find(session => session.username === sessionId)
+    if (!target?.hasSession) return
     setSelectedSessions(prev => {
       const next = new Set(prev)
       if (next.has(sessionId)) {
@@ -812,7 +870,7 @@ function ExportPage() {
   }
 
   const toggleSelectAllVisible = () => {
-    const visibleIds = visibleSessions.map(session => session.username)
+    const visibleIds = visibleSessions.filter(session => session.hasSession).map(session => session.username)
     if (visibleIds.length === 0) return
 
     setSelectedSessions(prev => {
@@ -1171,6 +1229,7 @@ function ExportPage() {
   }
 
   const openSingleExport = (session: SessionRow) => {
+    if (!session.hasSession) return
     openExportDialog({
       scope: 'single',
       sessionIds: [session.username],
@@ -1180,7 +1239,8 @@ function ExportPage() {
   }
 
   const openBatchExport = () => {
-    const ids = Array.from(selectedSessions)
+    const selectable = new Set(sessions.filter(session => session.hasSession).map(session => session.username))
+    const ids = Array.from(selectedSessions).filter(id => selectable.has(id))
     if (ids.length === 0) return
     const nameMap = new Map(sessions.map(session => [session.username, session.displayName || session.username]))
     const names = ids.map(id => nameMap.get(id) || id)
@@ -1195,11 +1255,11 @@ function ExportPage() {
 
   const openContentExport = (contentType: ContentType) => {
     const ids = sessions
-      .filter(isContentScopeSession)
+      .filter(session => session.hasSession && isContentScopeSession(session))
       .map(session => session.username)
 
     const names = sessions
-      .filter(isContentScopeSession)
+      .filter(session => session.hasSession && isContentScopeSession(session))
       .map(session => session.displayName || session.username)
 
     openExportDialog({
@@ -1320,6 +1380,16 @@ function ExportPage() {
   }
 
   const renderActionCell = (session: SessionRow) => {
+    if (!session.hasSession) {
+      return (
+        <div className="row-action-cell">
+          <button className="row-export-btn no-session" disabled>
+            暂无会话
+          </button>
+        </div>
+      )
+    }
+
     const isRunning = runningSessionIds.has(session.username)
     const isQueued = queuedSessionIds.has(session.username)
     const recent = formatRecentExportTime(lastExportBySession[session.username], nowTick)
@@ -1347,22 +1417,24 @@ function ExportPage() {
     return (
       <tr>
         <th className="sticky-col">选择</th>
-        <th>会话名（头像/名称/微信号）</th>
+        <th>联系人（头像/名称/微信号）</th>
         <th className="sticky-right">操作</th>
       </tr>
     )
   }
 
   const renderRowCells = (session: SessionRow) => {
-    const checked = selectedSessions.has(session.username)
+    const selectable = session.hasSession
+    const checked = selectable && selectedSessions.has(session.username)
 
     return (
       <>
         <td className="sticky-col">
           <button
             className={`select-icon-btn ${checked ? 'checked' : ''}`}
+            disabled={!selectable}
             onClick={() => toggleSelectSession(session.username)}
-            title={checked ? '取消选择' : '选择会话'}
+            title={selectable ? (checked ? '取消选择' : '选择会话') : '该联系人暂无会话记录'}
           >
             {checked ? <CheckSquare size={16} /> : <Square size={16} />}
           </button>
@@ -1661,134 +1733,136 @@ function ExportPage() {
 
       {exportDialog.open && (
         <div className="export-dialog-overlay" onClick={closeExportDialog}>
-          <div className="export-dialog" onClick={(event) => event.stopPropagation()}>
+          <div className="export-dialog" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
             <div className="dialog-header">
               <h3>{exportDialog.title}</h3>
               <button className="close-icon-btn" onClick={closeExportDialog}><X size={16} /></button>
             </div>
 
-            <div className="dialog-section">
-              <h4>导出范围</h4>
-              <div className="scope-tag-row">
-                <span className="scope-tag">{scopeLabel}</span>
-                <span className="scope-count">{scopeCountLabel}</span>
-              </div>
-              <div className="scope-list">
-                {exportDialog.sessionNames.slice(0, 20).map(name => (
-                  <span key={name} className="scope-item">{name}</span>
-                ))}
-                {exportDialog.sessionNames.length > 20 && <span className="scope-item">... 还有 {exportDialog.sessionNames.length - 20} 个</span>}
-              </div>
-            </div>
-
-            <div className="dialog-section">
-              <h4>对话文本导出格式选择</h4>
-              <div className="format-grid">
-                {formatCandidateOptions.map(option => (
-                  <button
-                    key={option.value}
-                    className={`format-card ${options.format === option.value ? 'active' : ''}`}
-                    onClick={() => setOptions(prev => ({ ...prev, format: option.value }))}
-                  >
-                    <div className="format-label">{option.label}</div>
-                    <div className="format-desc">{option.desc}</div>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="dialog-section">
-              <h4>时间范围</h4>
-              <div className="switch-row">
-                <span>导出全部时间</span>
-                <label className="switch">
-                  <input
-                    type="checkbox"
-                    checked={options.useAllTime}
-                    onChange={(event) => setOptions(prev => ({ ...prev, useAllTime: event.target.checked }))}
-                  />
-                  <span className="switch-slider"></span>
-                </label>
+            <div className="dialog-body">
+              <div className="dialog-section">
+                <h4>导出范围</h4>
+                <div className="scope-tag-row">
+                  <span className="scope-tag">{scopeLabel}</span>
+                  <span className="scope-count">{scopeCountLabel}</span>
+                </div>
+                <div className="scope-list">
+                  {exportDialog.sessionNames.slice(0, 20).map(name => (
+                    <span key={name} className="scope-item">{name}</span>
+                  ))}
+                  {exportDialog.sessionNames.length > 20 && <span className="scope-item">... 还有 {exportDialog.sessionNames.length - 20} 个</span>}
+                </div>
               </div>
 
-              {!options.useAllTime && options.dateRange && (
-                <div className="date-range-row">
-                  <label>
-                    开始
+              <div className="dialog-section">
+                <h4>对话文本导出格式选择</h4>
+                <div className="format-grid">
+                  {formatCandidateOptions.map(option => (
+                    <button
+                      key={option.value}
+                      className={`format-card ${options.format === option.value ? 'active' : ''}`}
+                      onClick={() => setOptions(prev => ({ ...prev, format: option.value }))}
+                    >
+                      <div className="format-label">{option.label}</div>
+                      <div className="format-desc">{option.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="dialog-section">
+                <h4>时间范围</h4>
+                <div className="switch-row">
+                  <span>导出全部时间</span>
+                  <label className="switch">
                     <input
-                      type="date"
-                      value={formatDateInputValue(options.dateRange.start)}
-                      onChange={(event) => {
-                        const start = parseDateInput(event.target.value, false)
-                        setOptions(prev => ({
-                          ...prev,
-                          dateRange: prev.dateRange ? {
-                            start,
-                            end: prev.dateRange.end < start ? parseDateInput(event.target.value, true) : prev.dateRange.end
-                          } : { start, end: new Date() }
-                        }))
-                      }}
+                      type="checkbox"
+                      checked={options.useAllTime}
+                      onChange={(event) => setOptions(prev => ({ ...prev, useAllTime: event.target.checked }))}
                     />
-                  </label>
-                  <label>
-                    结束
-                    <input
-                      type="date"
-                      value={formatDateInputValue(options.dateRange.end)}
-                      onChange={(event) => {
-                        const end = parseDateInput(event.target.value, true)
-                        setOptions(prev => ({
-                          ...prev,
-                          dateRange: prev.dateRange ? {
-                            start: prev.dateRange.start > end ? parseDateInput(event.target.value, false) : prev.dateRange.start,
-                            end
-                          } : { start: new Date(), end }
-                        }))
-                      }}
-                    />
+                    <span className="switch-slider"></span>
                   </label>
                 </div>
-              )}
-            </div>
 
-            <div className="dialog-section">
-              <h4>媒体与头像</h4>
-              <div className="switch-row">
-                <span>导出媒体文件</span>
-                <label className="switch">
-                  <input
-                    type="checkbox"
-                    checked={options.exportMedia}
-                    onChange={(event) => setOptions(prev => ({ ...prev, exportMedia: event.target.checked }))}
-                  />
-                  <span className="switch-slider"></span>
-                </label>
+                {!options.useAllTime && options.dateRange && (
+                  <div className="date-range-row">
+                    <label>
+                      开始
+                      <input
+                        type="date"
+                        value={formatDateInputValue(options.dateRange.start)}
+                        onChange={(event) => {
+                          const start = parseDateInput(event.target.value, false)
+                          setOptions(prev => ({
+                            ...prev,
+                            dateRange: prev.dateRange ? {
+                              start,
+                              end: prev.dateRange.end < start ? parseDateInput(event.target.value, true) : prev.dateRange.end
+                            } : { start, end: new Date() }
+                          }))
+                        }}
+                      />
+                    </label>
+                    <label>
+                      结束
+                      <input
+                        type="date"
+                        value={formatDateInputValue(options.dateRange.end)}
+                        onChange={(event) => {
+                          const end = parseDateInput(event.target.value, true)
+                          setOptions(prev => ({
+                            ...prev,
+                            dateRange: prev.dateRange ? {
+                              start: prev.dateRange.start > end ? parseDateInput(event.target.value, false) : prev.dateRange.start,
+                              end
+                            } : { start: new Date(), end }
+                          }))
+                        }}
+                      />
+                    </label>
+                  </div>
+                )}
               </div>
 
-              <div className="media-check-grid">
-                <label><input type="checkbox" checked={options.exportImages} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportImages: event.target.checked }))} /> 图片</label>
-                <label><input type="checkbox" checked={options.exportVoices} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportVoices: event.target.checked }))} /> 语音</label>
-                <label><input type="checkbox" checked={options.exportVideos} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportVideos: event.target.checked }))} /> 视频</label>
-                <label><input type="checkbox" checked={options.exportEmojis} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportEmojis: event.target.checked }))} /> 表情包</label>
-                <label><input type="checkbox" checked={options.exportVoiceAsText} onChange={event => setOptions(prev => ({ ...prev, exportVoiceAsText: event.target.checked }))} /> 语音转文字</label>
-                <label><input type="checkbox" checked={options.exportAvatars} onChange={event => setOptions(prev => ({ ...prev, exportAvatars: event.target.checked }))} /> 导出头像</label>
-              </div>
-            </div>
-
-            <div className="dialog-section">
-              <h4>发送者名称显示</h4>
-              <div className="display-name-options">
-                {displayNameOptions.map(option => (
-                  <label key={option.value} className={`display-name-item ${options.displayNamePreference === option.value ? 'active' : ''}`}>
+              <div className="dialog-section">
+                <h4>媒体与头像</h4>
+                <div className="switch-row">
+                  <span>导出媒体文件</span>
+                  <label className="switch">
                     <input
-                      type="radio"
-                      checked={options.displayNamePreference === option.value}
-                      onChange={() => setOptions(prev => ({ ...prev, displayNamePreference: option.value }))}
+                      type="checkbox"
+                      checked={options.exportMedia}
+                      onChange={(event) => setOptions(prev => ({ ...prev, exportMedia: event.target.checked }))}
                     />
-                    <span>{option.label}</span>
-                    <small>{option.desc}</small>
+                    <span className="switch-slider"></span>
                   </label>
-                ))}
+                </div>
+
+                <div className="media-check-grid">
+                  <label><input type="checkbox" checked={options.exportImages} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportImages: event.target.checked }))} /> 图片</label>
+                  <label><input type="checkbox" checked={options.exportVoices} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportVoices: event.target.checked }))} /> 语音</label>
+                  <label><input type="checkbox" checked={options.exportVideos} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportVideos: event.target.checked }))} /> 视频</label>
+                  <label><input type="checkbox" checked={options.exportEmojis} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportEmojis: event.target.checked }))} /> 表情包</label>
+                  <label><input type="checkbox" checked={options.exportVoiceAsText} onChange={event => setOptions(prev => ({ ...prev, exportVoiceAsText: event.target.checked }))} /> 语音转文字</label>
+                  <label><input type="checkbox" checked={options.exportAvatars} onChange={event => setOptions(prev => ({ ...prev, exportAvatars: event.target.checked }))} /> 导出头像</label>
+                </div>
+              </div>
+
+              <div className="dialog-section">
+                <h4>发送者名称显示</h4>
+                <div className="display-name-options">
+                  {displayNameOptions.map(option => (
+                    <label key={option.value} className={`display-name-item ${options.displayNamePreference === option.value ? 'active' : ''}`}>
+                      <input
+                        type="radio"
+                        checked={options.displayNamePreference === option.value}
+                        onChange={() => setOptions(prev => ({ ...prev, displayNamePreference: option.value }))}
+                      />
+                      <span>{option.label}</span>
+                      <small>{option.desc}</small>
+                    </label>
+                  ))}
+                </div>
               </div>
             </div>
 

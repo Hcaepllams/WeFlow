@@ -655,6 +655,11 @@
   &.checked {
     color: var(--primary);
   }
+
+  &:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
 }
 
 .session-cell {
@@ -736,6 +741,12 @@
     &.running {
       background: color-mix(in srgb, var(--primary) 80%, #000);
     }
+
+    &.no-session {
+      background: var(--bg-secondary);
+      color: var(--text-tertiary);
+      border: 1px dashed var(--border-color);
+    }
   }
 
   .row-export-time {
@@ -816,17 +827,29 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 16px;
   z-index: 1000;
 }
 
 .export-dialog {
-  width: min(980px, calc(100vw - 40px));
-  max-height: calc(100vh - 60px);
-  overflow: auto;
+  width: min(1080px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
   background: var(--card-bg);
   border: 1px solid var(--border-color);
   border-radius: 14px;
-  padding: 16px;
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.dialog-body {
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 2px;
 }
 
 .dialog-header {
@@ -859,7 +882,6 @@
   border: 1px solid var(--border-color);
   border-radius: 10px;
   padding: 12px;
-  margin-bottom: 10px;
   background: var(--bg-secondary);
 
   h4 {
@@ -912,17 +934,23 @@
 
 .format-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(130px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 8px;
 }
 
 .format-card {
+  width: 100%;
+  min-height: 82px;
   border: 1px solid var(--border-color);
   border-radius: 10px;
   padding: 10px;
   text-align: left;
   background: var(--bg-primary);
   cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
 
   .format-label {
     font-size: 13px;
@@ -1033,9 +1061,13 @@
 
 .dialog-actions {
   margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-color);
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+  flex-shrink: 0;
+  background: var(--card-bg);
 }
 
 .primary-btn,
@@ -1132,7 +1164,7 @@
   }
 
   .format-grid {
-    grid-template-columns: repeat(2, minmax(120px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   }
 
   .display-name-options {
@@ -1141,5 +1173,25 @@
 
   .media-check-grid {
     grid-template-columns: repeat(2, minmax(120px, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .export-dialog-overlay {
+    padding: 10px;
+  }
+
+  .export-dialog {
+    width: calc(100vw - 20px);
+    max-height: calc(100vh - 20px);
+    padding: 12px 10px 10px;
+  }
+
+  .format-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .date-range-row {
+    grid-template-columns: 1fr;
   }
 }
