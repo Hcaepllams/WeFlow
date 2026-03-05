@@ -24,6 +24,30 @@ type HardlinkState = {
   dirTable?: string
 }
 
+// 额外的 monitor handlers（供其他服务如 httpService 使用）
+export type MonitorHandler = (type: string, json: string) => void
+const extraMonitorHandlers: MonitorHandler[] = []
+
+/**
+ * 注册额外的 monitor handler
+ * 供 httpService 等服务使用
+ */
+export function registerMonitorHandler(handler: MonitorHandler): void {
+  if (!extraMonitorHandlers.includes(handler)) {
+    extraMonitorHandlers.push(handler)
+  }
+}
+
+/**
+ * 移除 monitor handler
+ */
+export function unregisterMonitorHandler(handler: MonitorHandler): void {
+  const index = extraMonitorHandlers.indexOf(handler)
+  if (index > -1) {
+    extraMonitorHandlers.splice(index, 1)
+  }
+}
+
 export interface ChatSession {
   username: string
   type: number
@@ -363,6 +387,16 @@ class ChatService {
     // 这种方式更高效，且不占用 JS 线程，并能直接监听 session/message 目录变更
     wcdbService.setMonitor((type, json) => {
       this.handleSessionStatsMonitorChange(type, json)
+      
+      // 调用额外的 monitor handlers（如 httpService 的 webhook）
+      for (const handler of extraMonitorHandlers) {
+        try {
+          handler(type, json)
+        } catch (e) {
+          console.error('[ChatService] Monitor handler error:', e)
+        }
+      }
+      
       // 广播给所有渲染进程窗口
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) {

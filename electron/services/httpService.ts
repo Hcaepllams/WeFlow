@@ -1,8 +1,10 @@
 ﻿/**
  * HTTP API 服务
  * 提供 ChatLab 标准化格式的消息查询 API
+ * 支持 Webhook 推送功能
  */
 import * as http from 'http'
+import * as https from 'https'
 import * as fs from 'fs'
 import * as path from 'path'
 import { URL } from 'url'
@@ -11,6 +13,25 @@ import { wcdbService } from './wcdbService'
 import { ConfigService } from './config'
 import { videoService } from './videoService'
 import { imageDecryptService } from './imageDecryptService'
+import { registerMonitorHandler } from './chatService'
+import crypto from 'crypto'
+
+// Webhook 配置接口
+interface WebhookConfig {
+  enabled: boolean
+  url: string
+  secret: string
+  triggers: {
+    privateChat: boolean
+    privateChatUsers: string[]  // 空数组表示所有用户
+    privateChatKeywords: string[]  // 空数组表示所有消息
+    groupAt: boolean
+    groupAtKeywords: string[]  // @关键词
+    groupKeyword: boolean
+    groupKeywords: string[]  // 群消息关键词
+    targetGroups: string[]  // 空数组表示所有群
+  }
+}
 
 // ChatLab 格式定义
 interface ChatLabHeader {
@@ -103,6 +124,8 @@ class HttpService {
   private running: boolean = false
   private connections: Set<import('net').Socket> = new Set()
   private connectionMutex: boolean = false
+  private processedMessages: Map<string, number> = new Map()  // 用于 webhook 去重
+  private webhookConfig: WebhookConfig = this.getDefaultWebhookConfig()
 
   constructor() {
     this.configService = ConfigService.getInstance()
@@ -153,6 +176,10 @@ class HttpService {
       this.server.listen(this.port, '0.0.0.0', () => {
         this.running = true
         console.log(`[HttpService] HTTP API server started on http://0.0.0.0:${this.port}`)
+        
+        // 启动 webhook 监听（使用事件驱动的 monitor）
+        this.startWebhookMonitor()
+        
         resolve({ success: true, port: this.port })
       })
     })
@@ -988,7 +1015,324 @@ class HttpService {
     res.writeHead(code)
     res.end(JSON.stringify({ error: message }))
   }
+
+  // ==================== Webhook 功能 ====================
+
+  /**
+   * 获取 Webhook 配置
+   */
+  private getWebhookConfig(): WebhookConfig {
+    const defaultConfig: WebhookConfig = {
+      enabled: false,
+      url: '',
+      secret: '',
+      triggers: {
+        privateChat: false,
+        privateChatUsers: [],
+        privateChatKeywords: [],
+        groupAt: false,
+        groupAtKeywords: ['@所有人'],
+        groupKeyword: false,
+        groupKeywords: [],
+        targetGroups: []
+      }
+    }
+    
+    try {
+      const config = this.configService.get('webhook') as WebhookConfig | undefined
+      return config || defaultConfig
+    } catch {
+      return defaultConfig
+    }
+  }
+
+  /**
+   * 保存 Webhook 配置
+   */
+  public saveWebhookConfig(config: WebhookConfig): void {
+    this.configService.set('webhook', config)
+    console.log('[Webhook] 配置已保存')
+  }
+
+  /**
+   * 启动 Webhook 监听（事件驱动）
+   */
+  private startWebhookMonitor(): void {
+    const config = this.getWebhookConfig()
+    if (!config.enabled) {
+      console.log('[Webhook] 未启用')
+      return
+    }
+
+    console.log('[Webhook] 启动事件驱动监听')
+    
+    registerMonitorHandler((type: string, json: string) => {
+      this.handleMonitorEvent(type, json)
+    })
+  }
+
+  /**
+   * 处理 monitor 事件
+   */
+  private async handleMonitorEvent(type: string, json: string): Promise<void> {
+    try {
+      const config = this.getWebhookConfig()
+      if (!config.enabled || !config.url) return
+
+      // 解析事件数据
+      let eventData: any
+      try {
+        eventData = JSON.parse(json)
+      } catch {
+        return
+      }
+
+      const talkerId = eventData.talker || eventData.sessionId
+      if (!talkerId) return
+
+      // 延迟等待数据库写入完成
+      await new Promise(r => setTimeout(r, 100))
+
+      // 获取最新消息
+      const messages = await this.getLatestMessages(talkerId, 5)
+      if (!messages || messages.length === 0) return
+
+      // 处理新消息
+      for (const message of messages) {
+        const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
+        if (this.processedMessages.has(msgKey)) continue
+        this.processedMessages.set(msgKey, Date.now())
+
+        if (this.shouldSendWebhook(message, talkerId, config)) {
+          await this.sendWebhook(message, talkerId, config)
+        }
+      }
+
+      // 清理过期缓存
+      const cutoff = Date.now() - 300 * 1000
+      for (const [k, v] of this.processedMessages) {
+        if (v < cutoff) this.processedMessages.delete(k)
+      }
+    } catch (error) {
+      console.error('[Webhook] 处理事件失败:', error)
+    }
+  }
+
+  /**
+   * 获取最新消息
+   */
+  private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
+    try {
+      const url = `${this.configService.get('weflowApiUrl') || 'http://127.0.0.1:5031'}/api/v1/messages?talker=${talkerId}&limit=${limit}&chatlab=1`
+      const res = await this.request(url)
+      if (res.status === 200 && res.data.messages) {
+        return res.data.messages
+      }
+      return []
+    } catch (e) {
+      return []
+    }
+  }
+
+  /**
+   * 判断是否应该发送 Webhook
+   */
+  private shouldSendWebhook(message: any, talkerId: string, config: WebhookConfig): boolean {
+    const isGroup = talkerId.includes('@chatroom')
+    const content = message.content || ''
+    const senderName = message.accountName || ''
+
+    // 私聊检查
+    if (!isGroup && config.triggers.privateChat) {
+      if (config.triggers.privateChatUsers.length > 0) {
+        const isTarget = config.triggers.privateChatUsers.some(u =>
+          senderName.includes(u)
+        )
+        if (!isTarget) return false
+      }
+      if (config.triggers.privateChatKeywords.length > 0) {
+        const hasKeyword = config.triggers.privateChatKeywords.some(k =>
+          content.includes(k)
+        )
+        if (!hasKeyword) return false
+      }
+      return true
+    }
+
+    // 群聊检查
+    if (isGroup) {
+      if (config.triggers.targetGroups.length > 0) {
+        const isTarget = config.triggers.targetGroups.some(g =>
+          talkerId.includes(g)
+        )
+        if (!isTarget) return false
+      }
+
+      if (config.triggers.groupAt) {
+        const hasAt = config.triggers.groupAtKeywords.some(k =>
+          content.includes(k)
+        )
+        if (hasAt) return true
+      }
+
+      if (config.triggers.groupKeyword) {
+        const hasKeyword = config.triggers.groupKeywords.some(k =>
+          content.includes(k)
+        )
+        if (hasKeyword) return true
+      }
+    }
+
+    return false
+  }
+
+  /**
+   * 发送 Webhook
+   */
+  private async sendWebhook(message: any, talkerId: string, config: WebhookConfig): Promise<void> {
+    try {
+      const isGroup = talkerId.includes('@chatroom')
+
+      const payload = {
+        type: isGroup ? 'group' : 'private',
+        timestamp: Date.now(),
+        wechatTimestamp: message.timestamp,
+        session: {
+          id: talkerId,
+          name: message.accountName || talkerId,
+          isGroup
+        },
+        sender: {
+          id: message.sender,
+          name: message.accountName,
+          groupNickname: message.groupNickname,
+        },
+        message: {
+          content: message.content,
+          type: message.type
+        }
+      }
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json'
+      }
+
+      if (config.secret) {
+        const signature = crypto
+          .createHmac('sha256', config.secret)
+          .update(JSON.stringify(payload))
+          .digest('hex')
+        headers['X-Webhook-Signature'] = signature
+      }
+
+      await this.postRequest(config.url, payload, headers)
+      console.log(`[Webhook] 发送成功: ${talkerId}`)
+    } catch (error) {
+      console.error('[Webhook] 发送失败:', error)
+    }
+  }
+
+  /**
+   * POST 请求
+   */
+  private postRequest(url: string, payload: any, headers: Record<string, string>): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const parsed = new URL(url)
+      const client = parsed.protocol === 'https:' ? https : http
+      const data = JSON.stringify(payload)
+
+      const req = client.request(url, {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'Content-Length': Buffer.byteLength(data)
+        },
+        timeout: 10000
+      }, (res) => {
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+          resolve()
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}`))
+        }
+      })
+
+      req.on('error', reject)
+      req.on('timeout', () => {
+        req.destroy()
+        reject(new Error('Timeout'))
+      })
+
+      req.write(data)
+      req.end()
+    })
+  }
+
+  /**
+   * 保存 Webhook 配置
+   */
+  public saveWebhookConfig(config: WebhookConfig): void {
+    this.configService.set('webhook', config)
+    console.log('[Webhook] 配置已保存')
+  }
+
+  /**
+   * 获取 Webhook 状态
+   */
+  public getWebhookStatus(): { enabled: boolean; url: string } {
+    const config = this.getWebhookConfig()
+    return {
+      enabled: config.enabled,
+      url: config.url
+    }
+  }
+
+  /**
+   * 获取默认 Webhook 配置
+   */
+  private getDefaultWebhookConfig(): WebhookConfig {
+    return {
+      enabled: false,
+      url: '',
+      secret: '',
+      triggers: {
+        privateChat: false,
+        privateChatUsers: [],
+        privateChatKeywords: [],
+        groupAt: false,
+        groupAtKeywords: ['@所有人'],
+        groupKeyword: false,
+        groupKeywords: [],
+        targetGroups: []
+      }
+    }
+  }
+
+  /**
+   * 获取 Webhook 配置
+   */
+  private getWebhookConfig(): WebhookConfig {
+    try {
+      const config = this.configService.get('webhook') as WebhookConfig | undefined
+      return config || this.getDefaultWebhookConfig()
+    } catch {
+      return this.getDefaultWebhookConfig()
+    }
+  }
+
+  /**
+   * 判断是否应发送 Webhook
+   */
+  private shouldSendWebhook(message: Message, session: any, config: WebhookConfig): boolean {
+    const isGroup = session.username.endsWith('@chatroom')
+    const content = message.parsedContent || message.rawContent || ''
+    const senderName = message.senderUsername || ''
+
+    // 1. 私聊检查
+    if (!isGroup && config.triggers.privateChat) {
+      // 检查特定用户
+      if (config.triggers.privateChatUsers.length > 0) {
+        const isTargetUser = config.triggers.privateChatUsers.some(user => 
+
 }
 
 export const httpService = new HttpService()
-
