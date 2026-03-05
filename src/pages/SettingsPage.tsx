@@ -163,6 +163,16 @@ function SettingsPage() {
   const [isTogglingApi, setIsTogglingApi] = useState(false)
   const [showApiWarning, setShowApiWarning] = useState(false)
 
+  // Webhook 设置 state
+  const [webhookEnabled, setWebhookEnabled] = useState(false)
+  const [webhookUrl, setWebhookUrl] = useState('')
+  const [webhookSecret, setWebhookSecret] = useState('')
+  const [webhookPrivateChat, setWebhookPrivateChat] = useState(false)
+  const [webhookGroupAt, setWebhookGroupAt] = useState(false)
+  const [webhookGroupKeyword, setWebhookGroupKeyword] = useState(false)
+  const [webhookAtKeywords, setWebhookAtKeywords] = useState<string[]>(['@所有人'])
+  const [webhookAtKeywordsInput, setWebhookAtKeywordsInput] = useState('')
+
   const isClearingCache = isClearingAnalyticsCache || isClearingImageCache || isClearingAllCache
 
   // 检查 Hello 可用性
@@ -342,6 +352,16 @@ function SettingsPage() {
       const savedExcludeWords = await configService.getWordCloudExcludeWords()
       setWordCloudExcludeWords(savedExcludeWords)
       setExcludeWordsInput(savedExcludeWords.join('\n'))
+
+      // 加载 Webhook 配置
+      const webhookConfig = await configService.getWebhookConfig()
+      setWebhookEnabled(webhookConfig.enabled)
+      setWebhookUrl(webhookConfig.url)
+      setWebhookSecret(webhookConfig.secret)
+      setWebhookPrivateChat(webhookConfig.triggers.privateChat)
+      setWebhookGroupAt(webhookConfig.triggers.groupAt)
+      setWebhookGroupKeyword(webhookConfig.triggers.groupKeyword)
+      setWebhookAtKeywords(webhookConfig.triggers.groupAtKeywords)
 
       // 如果语言列表为空，保存默认值
       if (!savedTranscribeLanguages || savedTranscribeLanguages.length === 0) {
@@ -1956,6 +1976,173 @@ function SettingsPage() {
           readOnly
         />
       </div>
+
+      {/* Webhook 配置 */}
+      <div className="divider" />
+      <div className="form-group">
+        <label>Webhook 推送</label>
+        <span className="form-hint">当有新消息时自动推送到指定地址</span>
+        <div className="log-toggle-line">
+          <span className="log-status">{webhookEnabled ? '已启用' : '已关闭'}</span>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={webhookEnabled}
+              onChange={async (e) => {
+                const enabled = e.target.checked
+                setWebhookEnabled(enabled)
+                const config = await configService.getWebhookConfig()
+                await configService.setWebhookConfig({ ...config, enabled })
+                showMessage(enabled ? 'Webhook 已启用' : 'Webhook 已关闭', true)
+              }}
+            />
+            <span className="switch-slider" />
+          </label>
+        </div>
+      </div>
+
+      {webhookEnabled && (
+        <>
+          <div className="form-group">
+            <label>推送地址</label>
+            <span className="form-hint">接收消息推送的 HTTP 地址</span>
+            <input
+              type="url"
+              placeholder="http://example.com/webhook"
+              value={webhookUrl}
+              onChange={async (e) => {
+                const url = e.target.value
+                setWebhookUrl(url)
+                const config = await configService.getWebhookConfig()
+                await configService.setWebhookConfig({ ...config, url })
+              }}
+            />
+          </div>
+
+          <div className="form-group">
+            <label>签名密钥 <span className="optional">(可选)</span></label>
+            <span className="form-hint">用于验证推送请求的签名</span>
+            <input
+              type="password"
+              placeholder="留空不启用签名验证"
+              value={webhookSecret}
+              onChange={async (e) => {
+                const secret = e.target.value
+                setWebhookSecret(secret)
+                const config = await configService.getWebhookConfig()
+                await configService.setWebhookConfig({ ...config, secret })
+              }}
+            />
+          </div>
+
+          <div className="form-group">
+            <label className="toggle" style={{ marginBottom: '8px' }}>
+              <input
+                type="checkbox"
+                checked={webhookPrivateChat}
+                onChange={async (e) => {
+                  const checked = e.target.checked
+                  setWebhookPrivateChat(checked)
+                  const config = await configService.getWebhookConfig()
+                  await configService.setWebhookConfig({
+                    ...config,
+                    triggers: { ...config.triggers, privateChat: checked }
+                  })
+                }}
+              />
+              <span className="toggle-label">监听私聊消息</span>
+            </label>
+          </div>
+
+          <div className="form-group">
+            <label className="toggle" style={{ marginBottom: '8px' }}>
+              <input
+                type="checkbox"
+                checked={webhookGroupAt}
+                onChange={async (e) => {
+                  const checked = e.target.checked
+                  setWebhookGroupAt(checked)
+                  const config = await configService.getWebhookConfig()
+                  await configService.setWebhookConfig({
+                    ...config,
+                    triggers: { ...config.triggers, groupAt: checked }
+                  })
+                }}
+              />
+              <span className="toggle-label">监听群 @ 消息</span>
+            </label>
+            {webhookGroupAt && (
+              <div style={{ marginLeft: '60px', marginTop: '8px' }}>
+                <label style={{ fontSize: '12px', color: '#888', marginBottom: '4px', display: 'block' }}>
+                  @ 触发关键词（回车添加）
+                </label>
+                <div className="tag-list" style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '8px' }}>
+                  {webhookAtKeywords.map((keyword, idx) => (
+                    <span key={idx} className="tag" style={{ background: '#e9ecef', padding: '2px 8px', borderRadius: '12px', fontSize: '12px' }}>
+                      {keyword}
+                      <span
+                        style={{ marginLeft: '4px', cursor: 'pointer', color: '#666' }}
+                        onClick={async () => {
+                          const newKeywords = webhookAtKeywords.filter((_, i) => i !== idx)
+                          setWebhookAtKeywords(newKeywords)
+                          const config = await configService.getWebhookConfig()
+                          await configService.setWebhookConfig({
+                            ...config,
+                            triggers: { ...config.triggers, groupAtKeywords: newKeywords }
+                          })
+                        }}
+                      >
+                        ×
+                      </span>
+                    </span>
+                  ))}
+                </div>
+                <input
+                  type="text"
+                  placeholder="输入关键词后回车"
+                  value={webhookAtKeywordsInput}
+                  onChange={(e) => setWebhookAtKeywordsInput(e.target.value)}
+                  onKeyDown={async (e) => {
+                    if (e.key === 'Enter') {
+                      const value = webhookAtKeywordsInput.trim()
+                      if (value && !webhookAtKeywords.includes(value)) {
+                        const newKeywords = [...webhookAtKeywords, value]
+                        setWebhookAtKeywords(newKeywords)
+                        setWebhookAtKeywordsInput('')
+                        const config = await configService.getWebhookConfig()
+                        await configService.setWebhookConfig({
+                          ...config,
+                          triggers: { ...config.triggers, groupAtKeywords: newKeywords }
+                        })
+                      }
+                    }
+                  }}
+                  style={{ width: '200px' }}
+                />
+              </div>
+            )}
+          </div>
+
+          <div className="form-group">
+            <label className="toggle" style={{ marginBottom: '8px' }}>
+              <input
+                type="checkbox"
+                checked={webhookGroupKeyword}
+                onChange={async (e) => {
+                  const checked = e.target.checked
+                  setWebhookGroupKeyword(checked)
+                  const config = await configService.getWebhookConfig()
+                  await configService.setWebhookConfig({
+                    ...config,
+                    triggers: { ...config.triggers, groupKeyword: checked }
+                  })
+                }}
+              />
+              <span className="toggle-label">监听群关键词</span>
+            </label>
+          </div>
+        </>
+      )}
 
       {showApiWarning && (
         <div className="modal-overlay" onClick={() => setShowApiWarning(false)}>

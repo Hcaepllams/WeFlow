@@ -64,7 +64,10 @@ export const CONFIG_KEYS = {
   WORD_CLOUD_EXCLUDE_WORDS: 'wordCloudExcludeWords',
 
   // 数据收集
-  ANALYTICS_CONSENT: 'analyticsConsent'
+  ANALYTICS_CONSENT: 'analyticsConsent',
+
+  // Webhook
+  WEBHOOK: 'webhook'
 } as const
 
 export interface WxidConfig {
@@ -1097,4 +1100,67 @@ export async function getAnalyticsConsent(): Promise<boolean | null> {
 // 设置数据收集同意状态
 export async function setAnalyticsConsent(consent: boolean): Promise<void> {
   await config.set(CONFIG_KEYS.ANALYTICS_CONSENT, consent)
+}
+
+// === Webhook 相关 ===
+
+export interface WebhookConfig {
+  enabled: boolean
+  url: string
+  secret: string
+  triggers: {
+    privateChat: boolean
+    privateChatUsers: string[]
+    privateChatKeywords: string[]
+    groupAt: boolean
+    groupAtKeywords: string[]
+    groupKeyword: boolean
+    groupKeywords: string[]
+    targetGroups: string[]
+  }
+}
+
+const defaultWebhookConfig: WebhookConfig = {
+  enabled: false,
+  url: '',
+  secret: '',
+  triggers: {
+    privateChat: false,
+    privateChatUsers: [],
+    privateChatKeywords: [],
+    groupAt: false,
+    groupAtKeywords: ['@所有人'],
+    groupKeyword: false,
+    groupKeywords: [],
+    targetGroups: []
+  }
+}
+
+// 获取 Webhook 配置
+export async function getWebhookConfig(): Promise<WebhookConfig> {
+  const value = await config.get(CONFIG_KEYS.WEBHOOK)
+  if (value && typeof value === 'object') {
+    const raw = value as any
+    return {
+      enabled: raw.enabled === true,
+      url: String(raw.url || ''),
+      secret: String(raw.secret || ''),
+      triggers: {
+        privateChat: raw.triggers?.privateChat === true,
+        privateChatUsers: Array.isArray(raw.triggers?.privateChatUsers) ? raw.triggers.privateChatUsers : [],
+        privateChatKeywords: Array.isArray(raw.triggers?.privateChatKeywords) ? raw.triggers.privateChatKeywords : [],
+        groupAt: raw.triggers?.groupAt === true,
+        groupAtKeywords: Array.isArray(raw.triggers?.groupAtKeywords) ? raw.triggers.groupAtKeywords : ['@所有人'],
+        groupKeyword: raw.triggers?.groupKeyword === true,
+        groupKeywords: Array.isArray(raw.triggers?.groupKeywords) ? raw.triggers.groupKeywords : [],
+        targetGroups: Array.isArray(raw.triggers?.targetGroups) ? raw.triggers.targetGroups : []
+      }
+    }
+  }
+  return defaultWebhookConfig
+}
+
+// 设置 Webhook 配置
+export async function setWebhookConfig(webhookConfig: WebhookConfig): Promise<void> {
+  await config.set(CONFIG_KEYS.WEBHOOK, webhookConfig)
 }

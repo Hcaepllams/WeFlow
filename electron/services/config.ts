@@ -51,6 +51,23 @@ interface ConfigSchema {
   notificationFilterMode: 'all' | 'whitelist' | 'blacklist'
   notificationFilterList: string[]
   wordCloudExcludeWords: string[]
+
+  // Webhook 配置
+  webhook: {
+    enabled: boolean
+    url: string
+    secret: string
+    triggers: {
+      privateChat: boolean
+      privateChatUsers: string[]
+      privateChatKeywords: string[]
+      groupAt: boolean
+      groupAtKeywords: string[]
+      groupKeyword: boolean
+      groupKeywords: string[]
+      targetGroups: string[]
+    }
+  }
 }
 
 // 需要 safeStorage 加密的字段（普通模式）
@@ -116,7 +133,22 @@ export class ConfigService {
         notificationPosition: 'top-right',
         notificationFilterMode: 'all',
         notificationFilterList: [],
-        wordCloudExcludeWords: []
+        wordCloudExcludeWords: [],
+        webhook: {
+          enabled: false,
+          url: '',
+          secret: '',
+          triggers: {
+            privateChat: false,
+            privateChatUsers: [],
+            privateChatKeywords: [],
+            groupAt: false,
+            groupAtKeywords: ['@所有人'],
+            groupKeyword: false,
+            groupKeywords: [],
+            targetGroups: []
+          }
+        }
       }
     })
     this.migrateAuthFields()
