@@ -7,11 +7,14 @@ export interface ChatSession {
   sortTimestamp: number  // 用于排序
   lastTimestamp: number  // 用于显示时间
   lastMsgType: number
+  messageCountHint?: number // 会话总消息数提示（若底层直接可取）
   displayName?: string
   avatarUrl?: string
   lastMsgSender?: string
   lastSenderDisplayName?: string
   selfWxid?: string // Helper field to avoid extra API calls
+  isFolded?: boolean  // 是否已折叠进"折叠的群聊"
+  isMuted?: boolean   // 是否开启免打扰
 }
 
 // 联系人
@@ -31,6 +34,7 @@ export interface ContactInfo {
   displayName: string
   remark?: string
   nickname?: string
+  alias?: string
   avatarUrl?: string
   type: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
 }
@@ -51,6 +55,7 @@ export interface Message {
   imageDatName?: string
   emojiCdnUrl?: string
   emojiMd5?: string
+  emojiLocalPath?: string   // 本地缓存路径（转发表情包无 CDN URL 时使用）
   voiceDurationSeconds?: number
   videoMd5?: string
   // 引用消息
@@ -64,12 +69,39 @@ export interface Message {
   fileSize?: number         // 文件大小
   fileExt?: string          // 文件扩展名
   xmlType?: string          // XML 中的 type 字段
+  appMsgKind?: string       // 归一化 appmsg 类型
+  appMsgDesc?: string
+  appMsgAppName?: string
+  appMsgSourceName?: string
+  appMsgSourceUsername?: string
+  appMsgThumbUrl?: string
+  appMsgMusicUrl?: string
+  appMsgDataUrl?: string
+  appMsgLocationLabel?: string
+  finderNickname?: string
+  finderUsername?: string
+  finderCoverUrl?: string   // 视频号封面图
+  finderAvatar?: string     // 视频号作者头像
+  finderDuration?: number   // 视频号时长(秒)
+  // 位置消息
+  locationLat?: number      // 纬度
+  locationLng?: number      // 经度
+  locationPoiname?: string  // 地点名称
+  locationLabel?: string    // 详细地址
+  // 音乐消息
+  musicAlbumUrl?: string    // 专辑封面
+  musicUrl?: string         // 播放链接
+  // 礼物消息
+  giftImageUrl?: string     // 礼物商品图
+  giftWish?: string         // 祝福语
+  giftPrice?: string        // 价格(分)
   // 转账消息
   transferPayerUsername?: string    // 转账付款方 wxid
   transferReceiverUsername?: string // 转账收款方 wxid
   // 名片消息
   cardUsername?: string     // 名片的微信ID
   cardNickname?: string     // 名片的昵称
+  cardAvatarUrl?: string    // 名片头像 URL
   // 聊天记录
   chatRecordTitle?: string  // 聊天记录标题
   chatRecordList?: ChatRecordItem[]  // 聊天记录列表

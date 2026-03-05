@@ -218,6 +218,10 @@ export class WcdbService {
     return this.callWorker('getMessageCount', { sessionId })
   }
 
+  async getMessageCounts(sessionIds: string[]): Promise<{ success: boolean; counts?: Record<string, number>; error?: string }> {
+    return this.callWorker('getMessageCounts', { sessionIds })
+  }
+
   /**
    * 获取联系人昵称
    */
@@ -288,6 +292,13 @@ export class WcdbService {
    */
   async getContact(username: string): Promise<{ success: boolean; contact?: any; error?: string }> {
     return this.callWorker('getContact', { username })
+  }
+
+  /**
+   * 批量获取联系人 extra_buffer 状态（isFolded/isMuted）
+   */
+  async getContactStatus(usernames: string[]): Promise<{ success: boolean; map?: Record<string, { isFolded: boolean; isMuted: boolean }>; error?: string }> {
+    return this.callWorker('getContactStatus', { usernames })
   }
 
   /**
@@ -417,6 +428,34 @@ export class WcdbService {
   }
 
   /**
+   * 安装朋友圈删除拦截
+   */
+  async installSnsBlockDeleteTrigger(): Promise<{ success: boolean; alreadyInstalled?: boolean; error?: string }> {
+    return this.callWorker('installSnsBlockDeleteTrigger')
+  }
+
+  /**
+   * 卸载朋友圈删除拦截
+   */
+  async uninstallSnsBlockDeleteTrigger(): Promise<{ success: boolean; error?: string }> {
+    return this.callWorker('uninstallSnsBlockDeleteTrigger')
+  }
+
+  /**
+   * 查询朋友圈删除拦截是否已安装
+   */
+  async checkSnsBlockDeleteTrigger(): Promise<{ success: boolean; installed?: boolean; error?: string }> {
+    return this.callWorker('checkSnsBlockDeleteTrigger')
+  }
+
+  /**
+   * 从数据库直接删除朋友圈记录
+   */
+  async deleteSnsPost(postId: string): Promise<{ success: boolean; error?: string }> {
+    return this.callWorker('deleteSnsPost', { postId })
+  }
+
+  /**
    * 获取 DLL 内部日志
    */
   async getLogs(): Promise<{ success: boolean; logs?: string[]; error?: string }> {
@@ -442,6 +481,27 @@ export class WcdbService {
    */
   async deleteMessage(sessionId: string, localId: number, createTime: number, dbPathHint?: string): Promise<{ success: boolean; error?: string }> {
     return this.callWorker('deleteMessage', { sessionId, localId, createTime, dbPathHint })
+  }
+
+  /**
+   * 数据收集：初始化
+   */
+  async cloudInit(intervalSeconds: number): Promise<{ success: boolean; error?: string }> {
+    return this.callWorker('cloudInit', { intervalSeconds })
+  }
+
+  /**
+   * 数据收集：上报数据
+   */
+  async cloudReport(statsJson: string): Promise<{ success: boolean; error?: string }> {
+    return this.callWorker('cloudReport', { statsJson })
+  }
+
+  /**
+   * 数据收集：停止
+   */
+  cloudStop(): Promise<{ success: boolean; error?: string }> {
+    return this.callWorker('cloudStop', {})
   }
 
 

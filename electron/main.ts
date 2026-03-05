@@ -3,7 +3,7 @@ import { app, BrowserWindow, ipcMain, nativeTheme, session } from 'electron'
 import { Worker } from 'worker_threads'
 import { join, dirname } from 'path'
 import { autoUpdater } from 'electron-updater'
-import { readFile, writeFile, mkdir } from 'fs/promises'
+import { readFile, writeFile, mkdir, rm, readdir } from 'fs/promises'
 import { existsSync } from 'fs'
 import { ConfigService } from './services/config'
 import { dbPathService } from './services/dbPathService'
@@ -21,6 +21,8 @@ import { videoService } from './services/videoService'
 import { snsService, isVideoUrl } from './services/snsService'
 import { contactExportService } from './services/contactExportService'
 import { windowsHelloService } from './services/windowsHelloService'
+import { exportCardDiagnosticsService } from './services/exportCardDiagnosticsService'
+import { cloudControlService } from './services/cloudControlService'
 
 import { registerNotificationHandlers, showNotification } from './windows/notificationWindow'
 import { httpService } from './services/httpService'
@@ -82,6 +84,9 @@ let configService: ConfigService | null = null
 // 协议窗口实例
 let agreementWindow: BrowserWindow | null = null
 let onboardingWindow: BrowserWindow | null = null
+// Splash 启动窗口
+let splashWindow: BrowserWindow | null = null
+const sessionChatWindows = new Map<string, BrowserWindow>()
 const keyService = new KeyService()
 
 let mainWindowReady = false
@@ -91,6 +96,98 @@ let shouldShowMain = true
 let isDownloadInProgress = false
 let downloadProgressHandler: ((progress: any) => void) | null = null
 let downloadedHandler: (() => void) | null = null
+
+type AnnualReportYearsLoadStrategy = 'cache' | 'native' | 'hybrid'
+type AnnualReportYearsLoadPhase = 'cache' | 'native' | 'scan' | 'done'
+
+interface AnnualReportYearsProgressPayload {
+  years?: number[]
+  done: boolean
+  error?: string
+  canceled?: boolean
+  strategy?: AnnualReportYearsLoadStrategy
+  phase?: AnnualReportYearsLoadPhase
+  statusText?: string
+  nativeElapsedMs?: number
+  scanElapsedMs?: number
+  totalElapsedMs?: number
+  switched?: boolean
+  nativeTimedOut?: boolean
+}
+
+interface AnnualReportYearsTaskState {
+  cacheKey: string
+  canceled: boolean
+  done: boolean
+  snapshot: AnnualReportYearsProgressPayload
+  updatedAt: number
+}
+
+const annualReportYearsLoadTasks = new Map<string, AnnualReportYearsTaskState>()
+const annualReportYearsTaskByCacheKey = new Map<string, string>()
+const annualReportYearsSnapshotCache = new Map<string, { snapshot: AnnualReportYearsProgressPayload; updatedAt: number; taskId: string }>()
+const annualReportYearsSnapshotTtlMs = 10 * 60 * 1000
+
+const normalizeAnnualReportYearsSnapshot = (snapshot: AnnualReportYearsProgressPayload): AnnualReportYearsProgressPayload => {
+  const years = Array.isArray(snapshot.years) ? [...snapshot.years] : []
+  return { ...snapshot, years }
+}
+
+const buildAnnualReportYearsCacheKey = (dbPath: string, wxid: string): string => {
+  return `${String(dbPath || '').trim()}\u0001${String(wxid || '').trim()}`
+}
+
+const pruneAnnualReportYearsSnapshotCache = (): void => {
+  const now = Date.now()
+  for (const [cacheKey, entry] of annualReportYearsSnapshotCache.entries()) {
+    if (now - entry.updatedAt > annualReportYearsSnapshotTtlMs) {
+      annualReportYearsSnapshotCache.delete(cacheKey)
+    }
+  }
+}
+
+const persistAnnualReportYearsSnapshot = (
+  cacheKey: string,
+  taskId: string,
+  snapshot: AnnualReportYearsProgressPayload
+): void => {
+  annualReportYearsSnapshotCache.set(cacheKey, {
+    taskId,
+    snapshot: normalizeAnnualReportYearsSnapshot(snapshot),
+    updatedAt: Date.now()
+  })
+  pruneAnnualReportYearsSnapshotCache()
+}
+
+const getAnnualReportYearsSnapshot = (
+  cacheKey: string
+): { taskId: string; snapshot: AnnualReportYearsProgressPayload } | null => {
+  pruneAnnualReportYearsSnapshotCache()
+  const entry = annualReportYearsSnapshotCache.get(cacheKey)
+  if (!entry) return null
+  return {
+    taskId: entry.taskId,
+    snapshot: normalizeAnnualReportYearsSnapshot(entry.snapshot)
+  }
+}
+
+const broadcastAnnualReportYearsProgress = (
+  taskId: string,
+  payload: AnnualReportYearsProgressPayload
+): void => {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue
+    win.webContents.send('annualReport:availableYearsProgress', {
+      taskId,
+      ...payload
+    })
+  }
+}
+
+const isYearsLoadCanceled = (taskId: string): boolean => {
+  const task = annualReportYearsLoadTasks.get(taskId)
+  return task?.canceled === true
+}
 
 function createWindow(options: { autoShow?: boolean } = {}) {
   // 获取图标路径 - 打包后在 resources 目录
@@ -122,9 +219,10 @@ function createWindow(options: { autoShow?: boolean } = {}) {
   })
 
   // 窗口准备好后显示
+  // Splash 模式下不在这里 show，由启动流程统一控制
   win.once('ready-to-show', () => {
     mainWindowReady = true
-    if (autoShow || shouldShowMain) {
+    if (autoShow && !splashWindow) {
       win.show()
     }
   })
@@ -248,6 +346,73 @@ function createAgreementWindow() {
   })
 
   return agreementWindow
+}
+
+/**
+ * 创建 Splash 启动窗口
+ * 使用纯 HTML 页面，不依赖 React，确保极速显示
+ */
+function createSplashWindow(): BrowserWindow {
+  const isDev = !!process.env.VITE_DEV_SERVER_URL
+  const iconPath = isDev
+    ? join(__dirname, '../public/icon.ico')
+    : join(process.resourcesPath, 'icon.ico')
+
+  splashWindow = new BrowserWindow({
+    width: 760,
+    height: 460,
+    resizable: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    hasShadow: false,
+    center: true,
+    skipTaskbar: false,
+    icon: iconPath,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false
+      // 不需要 preload —— 通过 executeJavaScript 单向推送进度
+    },
+    show: false
+  })
+
+  if (isDev) {
+    splashWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}splash.html`)
+  } else {
+    splashWindow.loadFile(join(__dirname, '../dist/splash.html'))
+  }
+
+  splashWindow.once('ready-to-show', () => {
+    splashWindow?.show()
+  })
+
+  splashWindow.on('closed', () => {
+    splashWindow = null
+  })
+
+  return splashWindow
+}
+
+/**
+ * 向 Splash 窗口发送进度更新
+ */
+function updateSplashProgress(percent: number, text: string, indeterminate = false) {
+  if (splashWindow && !splashWindow.isDestroyed()) {
+    splashWindow.webContents
+      .executeJavaScript(`updateProgress(${percent}, ${JSON.stringify(text)}, ${indeterminate})`)
+      .catch(() => {})
+  }
+}
+
+/**
+ * 关闭 Splash 窗口
+ */
+function closeSplash() {
+  if (splashWindow && !splashWindow.isDestroyed()) {
+    splashWindow.close()
+    splashWindow = null
+  }
 }
 
 /**
@@ -520,10 +685,150 @@ function createChatHistoryWindow(sessionId: string, messageId: number) {
   return win
 }
 
+/**
+ * 创建独立的会话聊天窗口（单会话，复用聊天页右侧消息区域）
+ */
+function createSessionChatWindow(sessionId: string) {
+  const normalizedSessionId = String(sessionId || '').trim()
+  if (!normalizedSessionId) return null
+
+  const existing = sessionChatWindows.get(normalizedSessionId)
+  if (existing && !existing.isDestroyed()) {
+    if (existing.isMinimized()) {
+      existing.restore()
+    }
+    existing.focus()
+    return existing
+  }
+
+  const isDev = !!process.env.VITE_DEV_SERVER_URL
+  const iconPath = isDev
+    ? join(__dirname, '../public/icon.ico')
+    : join(process.resourcesPath, 'icon.ico')
+
+  const isDark = nativeTheme.shouldUseDarkColors
+
+  const win = new BrowserWindow({
+    width: 600,
+    height: 820,
+    minWidth: 420,
+    minHeight: 560,
+    icon: iconPath,
+    webPreferences: {
+      preload: join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false
+    },
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: '#00000000',
+      symbolColor: isDark ? '#ffffff' : '#1a1a1a',
+      height: 40
+    },
+    show: false,
+    backgroundColor: isDark ? '#1A1A1A' : '#F0F0F0',
+    autoHideMenuBar: true
+  })
+
+  const sessionParam = `sessionId=${encodeURIComponent(normalizedSessionId)}`
+  if (process.env.VITE_DEV_SERVER_URL) {
+    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/chat-window?${sessionParam}`)
+
+    win.webContents.on('before-input-event', (event, input) => {
+      if (input.key === 'F12' || (input.control && input.shift && input.key === 'I')) {
+        if (win.webContents.isDevToolsOpened()) {
+          win.webContents.closeDevTools()
+        } else {
+          win.webContents.openDevTools()
+        }
+        event.preventDefault()
+      }
+    })
+  } else {
+    win.loadFile(join(__dirname, '../dist/index.html'), {
+      hash: `/chat-window?${sessionParam}`
+    })
+  }
+
+  win.once('ready-to-show', () => {
+    win.show()
+    win.focus()
+  })
+
+  win.on('closed', () => {
+    const tracked = sessionChatWindows.get(normalizedSessionId)
+    if (tracked === win) {
+      sessionChatWindows.delete(normalizedSessionId)
+    }
+  })
+
+  sessionChatWindows.set(normalizedSessionId, win)
+  return win
+}
+
 function showMainWindow() {
   shouldShowMain = true
   if (mainWindowReady) {
     mainWindow?.show()
+  }
+}
+
+const normalizeAccountId = (value: string): string => {
+  const trimmed = String(value || '').trim()
+  if (!trimmed) return ''
+  if (trimmed.toLowerCase().startsWith('wxid_')) {
+    const match = trimmed.match(/^(wxid_[^_]+)/i)
+    return match?.[1] || trimmed
+  }
+  const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/)
+  return suffixMatch ? suffixMatch[1] : trimmed
+}
+
+const buildAccountNameMatcher = (wxidCandidates: string[]) => {
+  const loweredCandidates = wxidCandidates
+    .map((item) => String(item || '').trim().toLowerCase())
+    .filter(Boolean)
+  return (name: string): boolean => {
+    const loweredName = String(name || '').trim().toLowerCase()
+    if (!loweredName) return false
+    return loweredCandidates.some((candidate) => (
+      loweredName === candidate ||
+      loweredName.startsWith(`${candidate}_`) ||
+      loweredName.includes(candidate)
+    ))
+  }
+}
+
+const removePathIfExists = async (
+  targetPath: string,
+  removedPaths: string[],
+  warnings: string[]
+): Promise<void> => {
+  if (!targetPath || !existsSync(targetPath)) return
+  try {
+    await rm(targetPath, { recursive: true, force: true })
+    removedPaths.push(targetPath)
+  } catch (error) {
+    warnings.push(`${targetPath}: ${String(error)}`)
+  }
+}
+
+const removeMatchedEntriesInDir = async (
+  rootDir: string,
+  shouldRemove: (name: string) => boolean,
+  removedPaths: string[],
+  warnings: string[]
+): Promise<void> => {
+  if (!rootDir || !existsSync(rootDir)) return
+  try {
+    const entries = await readdir(rootDir, { withFileTypes: true })
+    for (const entry of entries) {
+      if (!shouldRemove(entry.name)) continue
+      const targetPath = join(rootDir, entry.name)
+      await removePathIfExists(targetPath, removedPaths, warnings)
+    }
+  } catch (error) {
+    warnings.push(`${rootDir}: ${String(error)}`)
   }
 }
 
@@ -593,6 +898,39 @@ function registerIpcHandlers() {
     } catch (e) {
       return { success: false, error: String(e) }
     }
+  })
+
+  ipcMain.handle('diagnostics:getExportCardLogs', async (_, options?: { limit?: number }) => {
+    return exportCardDiagnosticsService.snapshot(options?.limit)
+  })
+
+  ipcMain.handle('diagnostics:clearExportCardLogs', async () => {
+    exportCardDiagnosticsService.clear()
+    return { success: true }
+  })
+
+  ipcMain.handle('diagnostics:exportExportCardLogs', async (_, payload?: {
+    filePath?: string
+    frontendLogs?: unknown[]
+  }) => {
+    const filePath = typeof payload?.filePath === 'string' ? payload.filePath.trim() : ''
+    if (!filePath) {
+      return { success: false, error: '导出路径不能为空' }
+    }
+    return exportCardDiagnosticsService.exportCombinedLogs(filePath, payload?.frontendLogs || [])
+  })
+
+  // 数据收集服务
+  ipcMain.handle('cloud:init', async () => {
+    await cloudControlService.init()
+  })
+
+  ipcMain.handle('cloud:recordPage', (_, pageName: string) => {
+    cloudControlService.recordPage(pageName)
+  })
+
+  ipcMain.handle('cloud:getLogs', async () => {
+    return cloudControlService.getLogs()
   })
 
   ipcMain.handle('app:checkForUpdates', async () => {
@@ -732,6 +1070,12 @@ function registerIpcHandlers() {
     return true
   })
 
+  // 打开会话聊天窗口（同会话仅保留一个窗口并聚焦）
+  ipcMain.handle('window:openSessionChatWindow', (_, sessionId: string) => {
+    const win = createSessionChatWindow(sessionId)
+    return Boolean(win)
+  })
+
   // 根据视频尺寸调整窗口大小
   ipcMain.handle('window:resizeToFitVideo', (event, videoWidth: number, videoHeight: number) => {
     const win = BrowserWindow.fromWebContents(event.sender)
@@ -842,8 +1186,27 @@ function registerIpcHandlers() {
     return chatService.getSessions()
   })
 
-  ipcMain.handle('chat:enrichSessionsContactInfo', async (_, usernames: string[]) => {
-    return chatService.enrichSessionsContactInfo(usernames)
+  ipcMain.handle('chat:getSessionStatuses', async (_, usernames: string[]) => {
+    return chatService.getSessionStatuses(usernames)
+  })
+
+  ipcMain.handle('chat:getExportTabCounts', async () => {
+    return chatService.getExportTabCounts()
+  })
+
+  ipcMain.handle('chat:getContactTypeCounts', async () => {
+    return chatService.getContactTypeCounts()
+  })
+
+  ipcMain.handle('chat:getSessionMessageCounts', async (_, sessionIds: string[]) => {
+    return chatService.getSessionMessageCounts(sessionIds)
+  })
+
+  ipcMain.handle('chat:enrichSessionsContactInfo', async (_, usernames: string[], options?: {
+    skipDisplayName?: boolean
+    onlyMissingAvatar?: boolean
+  }) => {
+    return chatService.enrichSessionsContactInfo(usernames, options)
   })
 
   ipcMain.handle('chat:getMessages', async (_, sessionId: string, offset?: number, limit?: number, startTime?: number, endTime?: number, ascending?: boolean) => {
@@ -900,8 +1263,159 @@ function registerIpcHandlers() {
     return true
   })
 
+  ipcMain.handle('chat:clearCurrentAccountData', async (_, options?: { clearCache?: boolean; clearExports?: boolean }) => {
+    const cfg = configService
+    if (!cfg) return { success: false, error: '配置服务未初始化' }
+
+    const clearCache = options?.clearCache === true
+    const clearExports = options?.clearExports === true
+    if (!clearCache && !clearExports) {
+      return { success: false, error: '请至少选择一项清理范围' }
+    }
+
+    const rawWxid = String(cfg.get('myWxid') || '').trim()
+    if (!rawWxid) {
+      return { success: false, error: '当前账号未登录或未识别，无法清理' }
+    }
+    const normalizedWxid = normalizeAccountId(rawWxid)
+    const wxidCandidates = Array.from(new Set([rawWxid, normalizedWxid].filter(Boolean)))
+    const isMatchedAccountName = buildAccountNameMatcher(wxidCandidates)
+    const removedPaths: string[] = []
+    const warnings: string[] = []
+
+    try {
+      wcdbService.close()
+      chatService.close()
+    } catch (error) {
+      warnings.push(`关闭数据库连接失败: ${String(error)}`)
+    }
+
+    if (clearCache) {
+      const [analyticsResult, imageResult] = await Promise.all([
+        analyticsService.clearCache(),
+        imageDecryptService.clearCache()
+      ])
+      const chatResult = chatService.clearCaches()
+      const cleanupResults = [analyticsResult, imageResult, chatResult]
+      for (const result of cleanupResults) {
+        if (!result.success && result.error) warnings.push(result.error)
+      }
+
+      const configuredCachePath = String(cfg.get('cachePath') || '').trim()
+      const documentsWeFlowDir = join(app.getPath('documents'), 'WeFlow')
+      const userDataCacheDir = join(app.getPath('userData'), 'cache')
+      const cacheRootCandidates = [
+        configuredCachePath,
+        join(documentsWeFlowDir, 'Images'),
+        join(documentsWeFlowDir, 'Voices'),
+        join(documentsWeFlowDir, 'Emojis'),
+        userDataCacheDir
+      ].filter(Boolean)
+
+      for (const wxid of wxidCandidates) {
+        if (configuredCachePath) {
+          await removePathIfExists(join(configuredCachePath, wxid), removedPaths, warnings)
+          await removePathIfExists(join(configuredCachePath, 'Images', wxid), removedPaths, warnings)
+          await removePathIfExists(join(configuredCachePath, 'Voices', wxid), removedPaths, warnings)
+          await removePathIfExists(join(configuredCachePath, 'Emojis', wxid), removedPaths, warnings)
+        }
+        await removePathIfExists(join(documentsWeFlowDir, 'Images', wxid), removedPaths, warnings)
+        await removePathIfExists(join(documentsWeFlowDir, 'Voices', wxid), removedPaths, warnings)
+        await removePathIfExists(join(documentsWeFlowDir, 'Emojis', wxid), removedPaths, warnings)
+        await removePathIfExists(join(userDataCacheDir, wxid), removedPaths, warnings)
+      }
+
+      for (const cacheRoot of cacheRootCandidates) {
+        await removeMatchedEntriesInDir(cacheRoot, isMatchedAccountName, removedPaths, warnings)
+      }
+    }
+
+    if (clearExports) {
+      const configuredExportPath = String(cfg.get('exportPath') || '').trim()
+      const documentsWeFlowDir = join(app.getPath('documents'), 'WeFlow')
+      const exportRootCandidates = [
+        configuredExportPath,
+        join(documentsWeFlowDir, 'exports'),
+        join(documentsWeFlowDir, 'Exports')
+      ].filter(Boolean)
+
+      for (const exportRoot of exportRootCandidates) {
+        await removeMatchedEntriesInDir(exportRoot, isMatchedAccountName, removedPaths, warnings)
+      }
+
+      const resetConfigKeys = [
+        'exportSessionRecordMap',
+        'exportLastSessionRunMap',
+        'exportLastContentRunMap',
+        'exportSessionMessageCountCacheMap',
+        'exportSessionContentMetricCacheMap',
+        'exportSnsStatsCacheMap',
+        'snsPageCacheMap',
+        'contactsListCacheMap',
+        'contactsAvatarCacheMap',
+        'lastSession'
+      ]
+      for (const key of resetConfigKeys) {
+        const defaultValue = key === 'lastSession' ? '' : {}
+        cfg.set(key as any, defaultValue as any)
+      }
+    }
+
+    if (clearCache) {
+      try {
+        const wxidConfigsRaw = cfg.get('wxidConfigs') as Record<string, any> | undefined
+        if (wxidConfigsRaw && typeof wxidConfigsRaw === 'object') {
+          const nextConfigs: Record<string, any> = { ...wxidConfigsRaw }
+          for (const key of Object.keys(nextConfigs)) {
+            if (isMatchedAccountName(key) || normalizeAccountId(key) === normalizedWxid) {
+              delete nextConfigs[key]
+            }
+          }
+          cfg.set('wxidConfigs' as any, nextConfigs as any)
+        }
+        cfg.set('myWxid' as any, '')
+        cfg.set('decryptKey' as any, '')
+        cfg.set('imageXorKey' as any, 0)
+        cfg.set('imageAesKey' as any, '')
+        cfg.set('dbPath' as any, '')
+        cfg.set('lastOpenedDb' as any, '')
+        cfg.set('onboardingDone' as any, false)
+        cfg.set('lastSession' as any, '')
+      } catch (error) {
+        warnings.push(`清理账号配置失败: ${String(error)}`)
+      }
+    }
+
+    return {
+      success: true,
+      removedPaths,
+      warning: warnings.length > 0 ? warnings.join('; ') : undefined
+    }
+  })
+
   ipcMain.handle('chat:getSessionDetail', async (_, sessionId: string) => {
     return chatService.getSessionDetail(sessionId)
+  })
+
+  ipcMain.handle('chat:getSessionDetailFast', async (_, sessionId: string) => {
+    return chatService.getSessionDetailFast(sessionId)
+  })
+
+  ipcMain.handle('chat:getSessionDetailExtra', async (_, sessionId: string) => {
+    return chatService.getSessionDetailExtra(sessionId)
+  })
+
+  ipcMain.handle('chat:getExportSessionStats', async (_, sessionIds: string[], options?: {
+    includeRelations?: boolean
+    forceRefresh?: boolean
+    allowStaleCache?: boolean
+    preferAccurateSpecialTypes?: boolean
+  }) => {
+    return chatService.getExportSessionStats(sessionIds, options)
+  })
+
+  ipcMain.handle('chat:getGroupMyMessageCountHint', async (_, chatroomId: string) => {
+    return chatService.getGroupMyMessageCountHint(chatroomId)
   })
 
   ipcMain.handle('chat:getImageData', async (_, sessionId: string, msgId: string) => {
@@ -914,8 +1428,14 @@ function registerIpcHandlers() {
   ipcMain.handle('chat:getAllVoiceMessages', async (_, sessionId: string) => {
     return chatService.getAllVoiceMessages(sessionId)
   })
+  ipcMain.handle('chat:getAllImageMessages', async (_, sessionId: string) => {
+    return chatService.getAllImageMessages(sessionId)
+  })
   ipcMain.handle('chat:getMessageDates', async (_, sessionId: string) => {
     return chatService.getMessageDates(sessionId)
+  })
+  ipcMain.handle('chat:getMessageDateCounts', async (_, sessionId: string) => {
+    return chatService.getMessageDateCounts(sessionId)
   })
   ipcMain.handle('chat:resolveVoiceCache', async (_, sessionId: string, msgId: string) => {
     return chatService.resolveVoiceCache(sessionId, msgId)
@@ -941,6 +1461,14 @@ function registerIpcHandlers() {
 
   ipcMain.handle('sns:getSnsUsernames', async () => {
     return snsService.getSnsUsernames()
+  })
+
+  ipcMain.handle('sns:getExportStats', async () => {
+    return snsService.getExportStats()
+  })
+
+  ipcMain.handle('sns:getExportStatsFast', async () => {
+    return snsService.getExportStatsFast()
   })
 
   ipcMain.handle('sns:debugResource', async (_, url: string) => {
@@ -990,11 +1518,17 @@ function registerIpcHandlers() {
   })
 
   ipcMain.handle('sns:exportTimeline', async (event, options: any) => {
-    return snsService.exportTimeline(options, (progress) => {
-      if (!event.sender.isDestroyed()) {
-        event.sender.send('sns:exportProgress', progress)
+    const exportOptions = { ...(options || {}) }
+    delete exportOptions.taskId
+
+    return snsService.exportTimeline(
+      exportOptions,
+      (progress) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('sns:exportProgress', progress)
+        }
       }
-    })
+    )
   })
 
   ipcMain.handle('sns:selectExportDir', async () => {
@@ -1007,6 +1541,26 @@ function registerIpcHandlers() {
       return { canceled: true }
     }
     return { canceled: false, filePath: result.filePaths[0] }
+  })
+
+  ipcMain.handle('sns:installBlockDeleteTrigger', async () => {
+    return snsService.installSnsBlockDeleteTrigger()
+  })
+
+  ipcMain.handle('sns:uninstallBlockDeleteTrigger', async () => {
+    return snsService.uninstallSnsBlockDeleteTrigger()
+  })
+
+  ipcMain.handle('sns:checkBlockDeleteTrigger', async () => {
+    return snsService.checkSnsBlockDeleteTrigger()
+  })
+
+  ipcMain.handle('sns:deleteSnsPost', async (_, postId: string) => {
+    return snsService.deleteSnsPost(postId)
+  })
+
+  ipcMain.handle('sns:downloadEmoji', async (_, params: { url: string; encryptUrl?: string; aesKey?: string }) => {
+    return snsService.downloadSnsEmoji(params.url, params.encryptUrl, params.aesKey)
   })
 
   // 私聊克隆
@@ -1031,7 +1585,65 @@ function registerIpcHandlers() {
       ? mainWindow
       : (BrowserWindow.fromWebContents(event.sender) || undefined)
 
-    return windowsHelloService.verify(message, targetWin)
+    const result = await windowsHelloService.verify(message, targetWin)
+
+    // Hello 验证成功后，自动用 authHelloSecret 中的密码解锁密钥
+    if (result && configService) {
+      const secret = configService.getHelloSecret()
+      if (secret && configService.isLockMode()) {
+        configService.unlock(secret)
+      }
+    }
+
+    return result
+  })
+
+  // 验证应用锁状态（检测 lock: 前缀，防篡改）
+  ipcMain.handle('auth:verifyEnabled', async () => {
+    return configService?.verifyAuthEnabled() ?? false
+  })
+
+  // 密码解锁（验证 + 解密密钥到内存）
+  ipcMain.handle('auth:unlock', async (_event, password: string) => {
+    if (!configService) return { success: false, error: '配置服务未初始化' }
+    return configService.unlock(password)
+  })
+
+  // 开启应用锁
+  ipcMain.handle('auth:enableLock', async (_event, password: string) => {
+    if (!configService) return { success: false, error: '配置服务未初始化' }
+    return configService.enableLock(password)
+  })
+
+  // 关闭应用锁
+  ipcMain.handle('auth:disableLock', async (_event, password: string) => {
+    if (!configService) return { success: false, error: '配置服务未初始化' }
+    return configService.disableLock(password)
+  })
+
+  // 修改密码
+  ipcMain.handle('auth:changePassword', async (_event, oldPassword: string, newPassword: string) => {
+    if (!configService) return { success: false, error: '配置服务未初始化' }
+    return configService.changePassword(oldPassword, newPassword)
+  })
+
+  // 设置 Hello Secret
+  ipcMain.handle('auth:setHelloSecret', async (_event, password: string) => {
+    if (!configService) return { success: false }
+    configService.setHelloSecret(password)
+    return { success: true }
+  })
+
+  // 清除 Hello Secret
+  ipcMain.handle('auth:clearHelloSecret', async () => {
+    if (!configService) return { success: false }
+    configService.clearHelloSecret()
+    return { success: true }
+  })
+
+  // 检查是否处于 lock: 模式
+  ipcMain.handle('auth:isLockMode', async () => {
+    return configService?.isLockMode() ?? false
   })
 
   // 导出相关
@@ -1045,6 +1657,7 @@ function registerIpcHandlers() {
         event.sender.send('export:progress', progress)
       }
     }
+
     return exportService.exportSessions(sessionIds, outputDir, options, onProgress)
   })
 
@@ -1134,6 +1747,16 @@ function registerIpcHandlers() {
     return groupAnalyticsService.getGroupMembers(chatroomId)
   })
 
+  ipcMain.handle(
+    'groupAnalytics:getGroupMembersPanelData',
+    async (_, chatroomId: string, options?: { forceRefresh?: boolean; includeMessageCounts?: boolean } | boolean) => {
+      const normalizedOptions = typeof options === 'boolean'
+        ? { forceRefresh: options }
+        : options
+      return groupAnalyticsService.getGroupMembersPanelData(chatroomId, normalizedOptions)
+    }
+  )
+
   ipcMain.handle('groupAnalytics:getGroupMessageRanking', async (_, chatroomId: string, limit?: number, startTime?: number, endTime?: number) => {
     return groupAnalyticsService.getGroupMessageRanking(chatroomId, limit, startTime, endTime)
   })
@@ -1212,6 +1835,194 @@ function registerIpcHandlers() {
       decryptKey: cfg.get('decryptKey'),
       wxid: cfg.get('myWxid')
     })
+  })
+
+  ipcMain.handle('annualReport:startAvailableYearsLoad', async (event) => {
+    const cfg = configService || new ConfigService()
+    configService = cfg
+
+    const dbPath = cfg.get('dbPath')
+    const decryptKey = cfg.get('decryptKey')
+    const wxid = cfg.get('myWxid')
+    const cacheKey = buildAnnualReportYearsCacheKey(dbPath, wxid)
+
+    const runningTaskId = annualReportYearsTaskByCacheKey.get(cacheKey)
+    if (runningTaskId) {
+      const runningTask = annualReportYearsLoadTasks.get(runningTaskId)
+      if (runningTask && !runningTask.done) {
+        return {
+          success: true,
+          taskId: runningTaskId,
+          reused: true,
+          snapshot: normalizeAnnualReportYearsSnapshot(runningTask.snapshot)
+        }
+      }
+      annualReportYearsTaskByCacheKey.delete(cacheKey)
+    }
+
+    const cachedSnapshot = getAnnualReportYearsSnapshot(cacheKey)
+    if (cachedSnapshot && cachedSnapshot.snapshot.done) {
+      return {
+        success: true,
+        taskId: cachedSnapshot.taskId,
+        reused: true,
+        snapshot: normalizeAnnualReportYearsSnapshot(cachedSnapshot.snapshot)
+      }
+    }
+
+    const taskId = `years_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const initialSnapshot: AnnualReportYearsProgressPayload = cachedSnapshot?.snapshot && !cachedSnapshot.snapshot.done
+      ? {
+        ...normalizeAnnualReportYearsSnapshot(cachedSnapshot.snapshot),
+        done: false,
+        canceled: false,
+        error: undefined
+      }
+      : {
+        years: [],
+        done: false,
+        strategy: 'native',
+        phase: 'native',
+        statusText: '准备使用原生快速模式加载年份...',
+        nativeElapsedMs: 0,
+        scanElapsedMs: 0,
+        totalElapsedMs: 0,
+        switched: false,
+        nativeTimedOut: false
+      }
+
+    const updateTaskSnapshot = (payload: AnnualReportYearsProgressPayload): AnnualReportYearsProgressPayload | null => {
+      const task = annualReportYearsLoadTasks.get(taskId)
+      if (!task) return null
+
+      const hasPayloadYears = Array.isArray(payload.years)
+      const nextYears = (hasPayloadYears && (payload.done || (payload.years || []).length > 0))
+        ? [...(payload.years || [])]
+        : Array.isArray(task.snapshot.years) ? [...task.snapshot.years] : []
+
+      const nextSnapshot: AnnualReportYearsProgressPayload = normalizeAnnualReportYearsSnapshot({
+        ...task.snapshot,
+        ...payload,
+        years: nextYears
+      })
+      task.snapshot = nextSnapshot
+      task.done = nextSnapshot.done === true
+      task.updatedAt = Date.now()
+      annualReportYearsLoadTasks.set(taskId, task)
+      persistAnnualReportYearsSnapshot(task.cacheKey, taskId, nextSnapshot)
+      return nextSnapshot
+    }
+
+    annualReportYearsLoadTasks.set(taskId, {
+      cacheKey,
+      canceled: false,
+      done: false,
+      snapshot: normalizeAnnualReportYearsSnapshot(initialSnapshot),
+      updatedAt: Date.now()
+    })
+    annualReportYearsTaskByCacheKey.set(cacheKey, taskId)
+    persistAnnualReportYearsSnapshot(cacheKey, taskId, initialSnapshot)
+
+    void (async () => {
+      try {
+        const result = await annualReportService.getAvailableYears({
+          dbPath,
+          decryptKey,
+          wxid,
+          nativeTimeoutMs: 5000,
+          onProgress: (progress) => {
+            if (isYearsLoadCanceled(taskId)) return
+            const snapshot = updateTaskSnapshot({
+              ...progress,
+              done: false
+            })
+            if (!snapshot) return
+            broadcastAnnualReportYearsProgress(taskId, snapshot)
+          },
+          shouldCancel: () => isYearsLoadCanceled(taskId)
+        })
+
+        const canceled = isYearsLoadCanceled(taskId)
+        if (canceled) {
+          const snapshot = updateTaskSnapshot({
+            done: true,
+            canceled: true,
+            phase: 'done',
+            statusText: '已取消年份加载'
+          })
+          if (snapshot) {
+            broadcastAnnualReportYearsProgress(taskId, snapshot)
+          }
+          return
+        }
+
+        const completionPayload: AnnualReportYearsProgressPayload = result.success
+          ? {
+            years: result.data || [],
+            done: true,
+            strategy: result.meta?.strategy,
+            phase: 'done',
+            statusText: result.meta?.statusText || '年份数据加载完成',
+            nativeElapsedMs: result.meta?.nativeElapsedMs,
+            scanElapsedMs: result.meta?.scanElapsedMs,
+            totalElapsedMs: result.meta?.totalElapsedMs,
+            switched: result.meta?.switched,
+            nativeTimedOut: result.meta?.nativeTimedOut
+          }
+          : {
+            years: result.data || [],
+            done: true,
+            error: result.error || '加载年度数据失败',
+            strategy: result.meta?.strategy,
+            phase: 'done',
+            statusText: result.meta?.statusText || '年份数据加载失败',
+            nativeElapsedMs: result.meta?.nativeElapsedMs,
+            scanElapsedMs: result.meta?.scanElapsedMs,
+            totalElapsedMs: result.meta?.totalElapsedMs,
+            switched: result.meta?.switched,
+            nativeTimedOut: result.meta?.nativeTimedOut
+          }
+
+        const snapshot = updateTaskSnapshot(completionPayload)
+        if (snapshot) {
+          broadcastAnnualReportYearsProgress(taskId, snapshot)
+        }
+      } catch (e) {
+        const snapshot = updateTaskSnapshot({
+          done: true,
+          error: String(e),
+          phase: 'done',
+          statusText: '年份数据加载失败',
+          strategy: 'hybrid'
+        })
+        if (snapshot) {
+          broadcastAnnualReportYearsProgress(taskId, snapshot)
+        }
+      } finally {
+        const task = annualReportYearsLoadTasks.get(taskId)
+        if (task) {
+          annualReportYearsTaskByCacheKey.delete(task.cacheKey)
+        }
+        annualReportYearsLoadTasks.delete(taskId)
+      }
+    })()
+
+    return {
+      success: true,
+      taskId,
+      reused: false,
+      snapshot: normalizeAnnualReportYearsSnapshot(initialSnapshot)
+    }
+  })
+
+  ipcMain.handle('annualReport:cancelAvailableYearsLoad', async (_, taskId: string) => {
+    const key = String(taskId || '').trim()
+    if (!key) return { success: false, error: '任务ID不能为空' }
+    const task = annualReportYearsLoadTasks.get(key)
+    if (!task) return { success: true }
+    task.canceled = true
+    annualReportYearsLoadTasks.set(key, task)
+    return { success: true }
   })
 
   ipcMain.handle('annualReport:generateReport', async (_, year: number) => {
@@ -1377,13 +2188,19 @@ function registerIpcHandlers() {
 
   // 密钥获取
   ipcMain.handle('key:autoGetDbKey', async (event) => {
-    return keyService.autoGetDbKey(60_000, (message, level) => {
+    return keyService.autoGetDbKey(180_000, (message, level) => {
       event.sender.send('key:dbKeyStatus', { message, level })
     })
   })
 
-  ipcMain.handle('key:autoGetImageKey', async (event, manualDir?: string) => {
+  ipcMain.handle('key:autoGetImageKey', async (event, manualDir?: string, wxid?: string) => {
     return keyService.autoGetImageKey(manualDir, (message) => {
+      event.sender.send('key:imageKeyStatus', { message })
+    }, wxid)
+  })
+
+  ipcMain.handle('key:scanImageKeyFromMemory', async (event, userDir: string) => {
+    return keyService.autoGetImageKeyByMemoryScan(userDir, (message) => {
       event.sender.send('key:imageKeyStatus', { message })
     })
   })
@@ -1447,26 +2264,70 @@ function checkForUpdatesOnStartup() {
   }, 3000)
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // 立即创建 Splash 窗口，确保用户尽快看到反馈
+  createSplashWindow()
+
+  // 等待 Splash 页面加载完成后再推送进度
+  if (splashWindow) {
+    await new Promise<void>((resolve) => {
+      if (splashWindow!.webContents.isLoading()) {
+        splashWindow!.webContents.once('did-finish-load', () => resolve())
+      } else {
+        resolve()
+      }
+    })
+    splashWindow.webContents
+      .executeJavaScript(`setVersion(${JSON.stringify(app.getVersion())})`)
+      .catch(() => {})
+  }
+
+  const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  // 初始化配置服务
+  updateSplashProgress(5, '正在加载配置...')
   configService = new ConfigService()
+
+  // 将用户主题配置推送给 Splash 窗口
+  if (splashWindow && !splashWindow.isDestroyed()) {
+    const themeId = configService.get('themeId') || 'cloud-dancer'
+    const themeMode = configService.get('theme') || 'system'
+    splashWindow.webContents
+      .executeJavaScript(`applyTheme(${JSON.stringify(themeId)}, ${JSON.stringify(themeMode)})`)
+      .catch(() => {})
+  }
+  await delay(200)
+
+  // 设置资源路径
+  updateSplashProgress(10, '正在初始化...')
   const candidateResources = app.isPackaged
     ? join(process.resourcesPath, 'resources')
     : join(app.getAppPath(), 'resources')
   const fallbackResources = join(process.cwd(), 'resources')
   const resourcesPath = existsSync(candidateResources) ? candidateResources : fallbackResources
   const userDataPath = app.getPath('userData')
+  await delay(200)
+
+  // 初始化数据库服务
+  updateSplashProgress(18, '正在初始化...')
   wcdbService.setPaths(resourcesPath, userDataPath)
   wcdbService.setLogEnabled(configService.get('logEnabled') === true)
+  await delay(200)
+
+  // 注册 IPC 处理器
+  updateSplashProgress(25, '正在初始化...')
   registerIpcHandlers()
+  await delay(200)
+
+  // 检查配置状态
   const onboardingDone = configService.get('onboardingDone')
   shouldShowMain = onboardingDone === true
-  mainWindow = createWindow({ autoShow: shouldShowMain })
 
-  if (!onboardingDone) {
-    createOnboardingWindow()
-  }
+  // 创建主窗口（不显示，由启动流程统一控制）
+  updateSplashProgress(30, '正在加载界面...')
+  mainWindow = createWindow({ autoShow: false })
 
-  // 解决朋友圈图片无法加载问题（添加 Referer）
+  // 配置网络服务
   session.defaultSession.webRequest.onBeforeSendHeaders(
     {
       urls: ['*://*.qpic.cn/*', '*://*.wx.qq.com/*']
@@ -1477,7 +2338,31 @@ app.whenReady().then(() => {
     }
   )
 
-  // 启动时检测更新
+  // 等待主窗口加载完成（真正耗时阶段，进度条末端呼吸光点）
+  updateSplashProgress(30, '正在加载界面...', true)
+  await new Promise<void>((resolve) => {
+    if (mainWindowReady) {
+      resolve()
+    } else {
+      mainWindow!.once('ready-to-show', () => {
+        mainWindowReady = true
+        resolve()
+      })
+    }
+  })
+
+  // 加载完成，收尾
+  updateSplashProgress(100, '启动完成')
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  closeSplash()
+
+  if (!onboardingDone) {
+    createOnboardingWindow()
+  } else {
+    mainWindow?.show()
+  }
+
+  // 启动时检测更新（不阻塞启动）
   checkForUpdatesOnStartup()
 
   app.on('activate', () => {

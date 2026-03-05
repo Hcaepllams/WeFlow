@@ -1,4 +1,4 @@
-import { join, dirname, basename, extname } from 'path'
+﻿import { join, dirname, basename, extname } from 'path'
 import { existsSync, mkdirSync, readdirSync, statSync, readFileSync, writeFileSync, copyFileSync, unlinkSync, watch } from 'fs'
 import * as path from 'path'
 import * as fs from 'fs'
@@ -12,6 +12,9 @@ import { ConfigService } from './config'
 import { wcdbService } from './wcdbService'
 import { MessageCacheService } from './messageCacheService'
 import { ContactCacheService, ContactCacheEntry } from './contactCacheService'
+import { SessionStatsCacheService, SessionStatsCacheEntry, SessionStatsCacheStats } from './sessionStatsCacheService'
+import { GroupMyMessageCountCacheService, GroupMyMessageCountCacheEntry } from './groupMyMessageCountCacheService'
+import { exportCardDiagnosticsService } from './exportCardDiagnosticsService'
 import { voiceTranscribeService } from './voiceTranscribeService'
 import { LRUCache } from '../utils/LRUCache.js'
 
@@ -29,11 +32,14 @@ export interface ChatSession {
   sortTimestamp: number  // 用于排序
   lastTimestamp: number  // 用于显示时间
   lastMsgType: number
+  messageCountHint?: number
   displayName?: string
   avatarUrl?: string
   lastMsgSender?: string
   lastSenderDisplayName?: string
   selfWxid?: string
+  isFolded?: boolean  // 是否已折叠进"折叠的群聊"
+  isMuted?: boolean   // 是否开启免打扰
 }
 
 export interface Message {
@@ -73,9 +79,36 @@ export interface Message {
   fileSize?: number         // 文件大小
   fileExt?: string          // 文件扩展名
   xmlType?: string          // XML 中的 type 字段
+  appMsgKind?: string       // 归一化 appmsg 类型
+  appMsgDesc?: string
+  appMsgAppName?: string
+  appMsgSourceName?: string
+  appMsgSourceUsername?: string
+  appMsgThumbUrl?: string
+  appMsgMusicUrl?: string
+  appMsgDataUrl?: string
+  appMsgLocationLabel?: string
+  finderNickname?: string
+  finderUsername?: string
+  finderCoverUrl?: string
+  finderAvatar?: string
+  finderDuration?: number
+  // 位置消息
+  locationLat?: number
+  locationLng?: number
+  locationPoiname?: string
+  locationLabel?: string
+  // 音乐消息
+  musicAlbumUrl?: string
+  musicUrl?: string
+  // 礼物消息
+  giftImageUrl?: string
+  giftWish?: string
+  giftPrice?: string
   // 名片消息
   cardUsername?: string     // 名片的微信ID
   cardNickname?: string     // 名片的昵称
+  cardAvatarUrl?: string    // 名片头像 URL
   // 转账消息
   transferPayerUsername?: string   // 转账付款人
   transferReceiverUsername?: string // 转账收款人
@@ -103,13 +136,72 @@ export interface ContactInfo {
   displayName: string
   remark?: string
   nickname?: string
+  alias?: string
   avatarUrl?: string
   type: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
 }
 
+interface ExportSessionStats {
+  totalMessages: number
+  voiceMessages: number
+  imageMessages: number
+  videoMessages: number
+  emojiMessages: number
+  transferMessages: number
+  redPacketMessages: number
+  callMessages: number
+  firstTimestamp?: number
+  lastTimestamp?: number
+  privateMutualGroups?: number
+  groupMemberCount?: number
+  groupMyMessages?: number
+  groupActiveSpeakers?: number
+  groupMutualFriends?: number
+}
+
+interface ExportSessionStatsOptions {
+  includeRelations?: boolean
+  forceRefresh?: boolean
+  allowStaleCache?: boolean
+  preferAccurateSpecialTypes?: boolean
+}
+
+interface ExportSessionStatsCacheMeta {
+  updatedAt: number
+  stale: boolean
+  includeRelations: boolean
+  source: 'memory' | 'disk' | 'fresh'
+}
+
+interface ExportTabCounts {
+  private: number
+  group: number
+  official: number
+  former_friend: number
+}
+
+interface SessionDetailFast {
+  wxid: string
+  displayName: string
+  remark?: string
+  nickName?: string
+  alias?: string
+  avatarUrl?: string
+  messageCount: number
+}
+
+interface SessionDetailExtra {
+  firstMessageTime?: number
+  latestMessageTime?: number
+  messageTables: { dbName: string; tableName: string; count: number }[]
+}
+
+type SessionDetail = SessionDetailFast & SessionDetailExtra
+
 // 表情包缓存
 const emojiCache: Map<string, string> = new Map()
 const emojiDownloading: Map<string, Promise<string | null>> = new Map()
+const FRIEND_EXCLUDE_USERNAMES = new Set(['medianote', 'floatbottle', 'qmessage', 'qqmail', 'fmessage'])
 
 class ChatService {
   private configService: ConfigService
@@ -123,6 +215,8 @@ class ChatService {
   private hardlinkCache = new Map<string, HardlinkState>()
   private readonly contactCacheService: ContactCacheService
   private readonly messageCacheService: MessageCacheService
+  private readonly sessionStatsCacheService: SessionStatsCacheService
+  private readonly groupMyMessageCountCacheService: GroupMyMessageCountCacheService
   private voiceWavCache: LRUCache<string, Buffer>
   private voiceTranscriptCache: LRUCache<string, string>
   private voiceTranscriptPending = new Map<string, Promise<{ success: boolean; transcript?: string; error?: string }>>()
@@ -143,7 +237,35 @@ class ChatService {
   }>()
   // 缓存会话表信息，避免每次查询
   private sessionTablesCache = new Map<string, Array<{ tableName: string; dbPath: string }>>()
+  private messageTableColumnsCache = new Map<string, { columns: Set<string>; updatedAt: number }>()
   private readonly sessionTablesCacheTtl = 300000 // 5分钟
+  private readonly messageTableColumnsCacheTtlMs = 30 * 60 * 1000
+  private sessionMessageCountCache = new Map<string, { count: number; updatedAt: number }>()
+  private sessionMessageCountHintCache = new Map<string, number>()
+  private sessionMessageCountBatchCache: {
+    dbSignature: string
+    sessionIdsKey: string
+    counts: Record<string, number>
+    updatedAt: number
+  } | null = null
+  private sessionMessageCountCacheScope = ''
+  private readonly sessionMessageCountCacheTtlMs = 10 * 60 * 1000
+  private readonly sessionMessageCountBatchCacheTtlMs = 5 * 60 * 1000
+  private sessionDetailFastCache = new Map<string, { detail: SessionDetailFast; updatedAt: number }>()
+  private sessionDetailExtraCache = new Map<string, { detail: SessionDetailExtra; updatedAt: number }>()
+  private readonly sessionDetailFastCacheTtlMs = 60 * 1000
+  private readonly sessionDetailExtraCacheTtlMs = 5 * 60 * 1000
+  private sessionStatusCache = new Map<string, { isFolded?: boolean; isMuted?: boolean; updatedAt: number }>()
+  private readonly sessionStatusCacheTtlMs = 10 * 60 * 1000
+  private sessionStatsCacheScope = ''
+  private sessionStatsMemoryCache = new Map<string, SessionStatsCacheEntry>()
+  private sessionStatsPendingBasic = new Map<string, Promise<ExportSessionStats>>()
+  private sessionStatsPendingFull = new Map<string, Promise<ExportSessionStats>>()
+  private allGroupSessionIdsCache: { ids: string[]; updatedAt: number } | null = null
+  private readonly sessionStatsCacheTtlMs = 10 * 60 * 1000
+  private readonly allGroupSessionIdsCacheTtlMs = 5 * 60 * 1000
+  private groupMyMessageCountCacheScope = ''
+  private groupMyMessageCountMemoryCache = new Map<string, GroupMyMessageCountCacheEntry>()
 
   constructor() {
     this.configService = new ConfigService()
@@ -151,6 +273,8 @@ class ChatService {
     const persisted = this.contactCacheService.getAllEntries()
     this.avatarCache = new Map(Object.entries(persisted))
     this.messageCacheService = new MessageCacheService(this.configService.getCacheBasePath())
+    this.sessionStatsCacheService = new SessionStatsCacheService(this.configService.getCacheBasePath())
+    this.groupMyMessageCountCacheService = new GroupMyMessageCountCacheService(this.configService.getCacheBasePath())
     // 初始化LRU缓存，限制大小防止内存泄漏
     this.voiceWavCache = new LRUCache(this.voiceWavCacheMaxEntries)
     this.voiceTranscriptCache = new LRUCache(1000) // 最多缓存1000条转写记录
@@ -173,6 +297,18 @@ class ChatService {
     const cleaned = suffixMatch ? suffixMatch[1] : trimmed
 
     return cleaned
+  }
+
+  /**
+   * 判断头像 URL 是否可用，过滤历史缓存里的错误 hex 数据。
+   */
+  private isValidAvatarUrl(avatarUrl?: string): avatarUrl is string {
+    const normalized = String(avatarUrl || '').trim()
+    if (!normalized) return false
+    const normalizedLower = normalized.toLowerCase()
+    if (normalizedLower.includes('base64,ffd8')) return false
+    if (normalizedLower.startsWith('ffd8')) return false
+    return true
   }
 
   /**
@@ -226,6 +362,7 @@ class ChatService {
     // 使用 C++ DLL 内部的文件监控 (ReadDirectoryChangesW)
     // 这种方式更高效，且不占用 JS 线程，并能直接监听 session/message 目录变更
     wcdbService.setMonitor((type, json) => {
+      this.handleSessionStatsMonitorChange(type, json)
       // 广播给所有渲染进程窗口
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) {
@@ -313,6 +450,7 @@ class ChatService {
       if (!connectResult.success) {
         return { success: false, error: connectResult.error }
       }
+      this.refreshSessionMessageCountCacheScope()
 
       const result = await wcdbService.getSessions()
       if (!result.success || !result.sessions) {
@@ -328,7 +466,7 @@ class ChatService {
         return { success: false, error: `会话表异常: ${detail}${tableInfo}${tables}${columns}` }
       }
 
-      // 转换为 ChatSession（先加载缓存，但不等待数据库查询）
+      // 转换为 ChatSession（先加载缓存，但不等待额外状态查询）
       const sessions: ChatSession[] = []
       const now = Date.now()
       const myWxid = this.configService.get('myWxid')
@@ -366,6 +504,21 @@ class ChatService {
 
         const summary = this.cleanString(row.summary || row.digest || row.last_msg || row.lastMsg || '')
         const lastMsgType = parseInt(row.last_msg_type || row.lastMsgType || '0', 10)
+        const messageCountHintRaw =
+          row.message_count ??
+          row.messageCount ??
+          row.msg_count ??
+          row.msgCount ??
+          row.total_count ??
+          row.totalCount ??
+          row.n_msg ??
+          row.nMsg ??
+          row.message_num ??
+          row.messageNum
+        const parsedMessageCountHint = Number(messageCountHintRaw)
+        const messageCountHint = Number.isFinite(parsedMessageCountHint) && parsedMessageCountHint >= 0
+          ? Math.floor(parsedMessageCountHint)
+          : undefined
 
         // 先尝试从缓存获取联系人信息（快速路径）
         let displayName = username
@@ -376,7 +529,7 @@ class ChatService {
           avatarUrl = cached.avatarUrl
         }
 
-        sessions.push({
+        const nextSession: ChatSession = {
           username,
           type: parseInt(row.type || '0', 10),
           unreadCount: parseInt(row.unread_count || row.unreadCount || row.unreadcount || '0', 10),
@@ -384,12 +537,29 @@ class ChatService {
           sortTimestamp: sortTs,
           lastTimestamp: lastTs,
           lastMsgType,
+          messageCountHint,
           displayName,
           avatarUrl,
-          lastMsgSender: row.last_msg_sender, // 数据库返回字段
-          lastSenderDisplayName: row.last_sender_display_name, // 数据库返回字段
+          lastMsgSender: row.last_msg_sender,
+          lastSenderDisplayName: row.last_sender_display_name,
           selfWxid: myWxid
-        })
+        }
+
+        const cachedStatus = this.sessionStatusCache.get(username)
+        if (cachedStatus && now - cachedStatus.updatedAt <= this.sessionStatusCacheTtlMs) {
+          nextSession.isFolded = cachedStatus.isFolded
+          nextSession.isMuted = cachedStatus.isMuted
+        }
+
+        sessions.push(nextSession)
+
+        if (typeof messageCountHint === 'number') {
+          this.sessionMessageCountHintCache.set(username, messageCountHint)
+          this.sessionMessageCountCache.set(username, {
+            count: messageCountHint,
+            updatedAt: Date.now()
+          })
+        }
       }
 
       // 不等待联系人信息加载，直接返回基础会话列表
@@ -401,18 +571,70 @@ class ChatService {
     }
   }
 
+  async getSessionStatuses(usernames: string[]): Promise<{
+    success: boolean
+    map?: Record<string, { isFolded?: boolean; isMuted?: boolean }>
+    error?: string
+  }> {
+    try {
+      if (!Array.isArray(usernames) || usernames.length === 0) {
+        return { success: true, map: {} }
+      }
+
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error }
+      }
+
+      const result = await wcdbService.getContactStatus(usernames)
+      if (!result.success || !result.map) {
+        return { success: false, error: result.error || '获取会话状态失败' }
+      }
+
+      const now = Date.now()
+      for (const username of usernames) {
+        const state = result.map[username]
+        if (!state) continue
+        this.sessionStatusCache.set(username, {
+          isFolded: state.isFolded,
+          isMuted: state.isMuted,
+          updatedAt: now
+        })
+      }
+
+      return {
+        success: true,
+        map: result.map as Record<string, { isFolded?: boolean; isMuted?: boolean }>
+      }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
   /**
    * 异步补充会话列表的联系人信息（公开方法，供前端调用）
    */
-  async enrichSessionsContactInfo(usernames: string[]): Promise<{
+  async enrichSessionsContactInfo(
+    usernames: string[],
+    options?: { skipDisplayName?: boolean; onlyMissingAvatar?: boolean }
+  ): Promise<{
     success: boolean
     contacts?: Record<string, { displayName?: string; avatarUrl?: string }>
     error?: string
   }> {
     try {
-      if (usernames.length === 0) {
+      const normalizedUsernames = Array.from(
+        new Set(
+          (usernames || [])
+            .map((username) => String(username || '').trim())
+            .filter(Boolean)
+        )
+      )
+      if (normalizedUsernames.length === 0) {
         return { success: true, contacts: {} }
       }
+      const skipDisplayName = options?.skipDisplayName === true
+      const onlyMissingAvatar = options?.onlyMissingAvatar === true
 
       const connectResult = await this.ensureConnected()
       if (!connectResult.success) {
@@ -425,16 +647,23 @@ class ChatService {
       const updatedEntries: Record<string, ContactCacheEntry> = {}
 
       // 检查缓存
-      for (const username of usernames) {
+      for (const username of normalizedUsernames) {
         const cached = this.avatarCache.get(username)
+        const isValidAvatar = this.isValidAvatarUrl(cached?.avatarUrl)
+        const cachedAvatarUrl = isValidAvatar ? cached?.avatarUrl : undefined
+        if (onlyMissingAvatar && cachedAvatarUrl) {
+          result[username] = {
+            displayName: skipDisplayName ? undefined : cached?.displayName,
+            avatarUrl: cachedAvatarUrl
+          }
+          continue
+        }
         // 如果缓存有效且有头像，直接使用；如果没有头像，也需要重新尝试获取
         // 额外检查：如果头像是无效的 hex 格式（以 ffd8 开头），也需要重新获取
-        const isValidAvatar = cached?.avatarUrl &&
-          !cached.avatarUrl.includes('base64,ffd8') // 检测错误的 hex 格式
         if (cached && now - cached.updatedAt < this.avatarCacheTtlMs && isValidAvatar) {
           result[username] = {
-            displayName: cached.displayName,
-            avatarUrl: cached.avatarUrl
+            displayName: skipDisplayName ? undefined : cached.displayName,
+            avatarUrl: cachedAvatarUrl
           }
         } else {
           missing.push(username)
@@ -443,16 +672,19 @@ class ChatService {
 
       // 批量查询缺失的联系人信息
       if (missing.length > 0) {
-        const [displayNames, avatarUrls] = await Promise.all([
-          wcdbService.getDisplayNames(missing),
-          wcdbService.getAvatarUrls(missing)
-        ])
+        const displayNames = skipDisplayName
+          ? null
+          : await wcdbService.getDisplayNames(missing)
+        const avatarUrls = await wcdbService.getAvatarUrls(missing)
 
         // 收集没有头像 URL 的用户名
         const missingAvatars: string[] = []
 
         for (const username of missing) {
-          const displayName = displayNames.success && displayNames.map ? displayNames.map[username] : undefined
+          const previous = this.avatarCache.get(username)
+          const displayName = displayNames?.success && displayNames.map
+            ? displayNames.map[username]
+            : undefined
           let avatarUrl = avatarUrls.success && avatarUrls.map ? avatarUrls.map[username] : undefined
 
           // 如果没有头像 URL，记录下来稍后从 head_image.db 获取
@@ -461,11 +693,14 @@ class ChatService {
           }
 
           const cacheEntry: ContactCacheEntry = {
-            displayName: displayName || username,
+            displayName: displayName || previous?.displayName || username,
             avatarUrl,
             updatedAt: now
           }
-          result[username] = { displayName, avatarUrl }
+          result[username] = {
+            displayName: skipDisplayName ? undefined : (displayName || previous?.displayName),
+            avatarUrl
+          }
           // 更新缓存并记录持久化
           this.avatarCache.set(username, cacheEntry)
           updatedEntries[username] = cacheEntry
@@ -530,40 +765,52 @@ class ChatService {
 
       if (!headImageDbPath) return result
 
-      // 使用 wcdbService.execQuery 查询加密的 head_image.db
-      for (const username of usernames) {
-        try {
-          const escapedUsername = username.replace(/'/g, "''")
-          const queryResult = await wcdbService.execQuery(
-            'media',
-            headImageDbPath,
-            `SELECT image_buffer FROM head_image WHERE username = '${escapedUsername}' LIMIT 1`
-          )
+      const normalizedUsernames = Array.from(
+        new Set(
+          usernames
+            .map((username) => String(username || '').trim())
+            .filter(Boolean)
+        )
+      )
+      if (normalizedUsernames.length === 0) return result
 
-          if (queryResult.success && queryResult.rows && queryResult.rows.length > 0) {
-            const row = queryResult.rows[0] as any
-            if (row?.image_buffer) {
-              let base64Data: string
-              if (typeof row.image_buffer === 'string') {
-                // WCDB 返回的 BLOB 是十六进制字符串，需要转换为 base64
-                if (row.image_buffer.toLowerCase().startsWith('ffd8')) {
-                  const buffer = Buffer.from(row.image_buffer, 'hex')
-                  base64Data = buffer.toString('base64')
-                } else {
-                  base64Data = row.image_buffer
-                }
-              } else if (Buffer.isBuffer(row.image_buffer)) {
-                base64Data = row.image_buffer.toString('base64')
-              } else if (Array.isArray(row.image_buffer)) {
-                base64Data = Buffer.from(row.image_buffer).toString('base64')
-              } else {
-                continue
-              }
-              result[username] = `data:image/jpeg;base64,${base64Data}`
+      const batchSize = 320
+      for (let i = 0; i < normalizedUsernames.length; i += batchSize) {
+        const batch = normalizedUsernames.slice(i, i + batchSize)
+        if (batch.length === 0) continue
+        const usernamesExpr = batch.map((name) => `'${this.escapeSqlString(name)}'`).join(',')
+        const queryResult = await wcdbService.execQuery(
+          'media',
+          headImageDbPath,
+          `SELECT username, image_buffer FROM head_image WHERE username IN (${usernamesExpr})`
+        )
+
+        if (!queryResult.success || !queryResult.rows || queryResult.rows.length === 0) {
+          continue
+        }
+
+        for (const row of queryResult.rows as any[]) {
+          const username = String(row?.username || '').trim()
+          if (!username || !row?.image_buffer) continue
+
+          let base64Data: string | null = null
+          if (typeof row.image_buffer === 'string') {
+            // WCDB 返回的 BLOB 可能是十六进制字符串，需要转换为 base64
+            if (row.image_buffer.toLowerCase().startsWith('ffd8')) {
+              const buffer = Buffer.from(row.image_buffer, 'hex')
+              base64Data = buffer.toString('base64')
+            } else {
+              base64Data = row.image_buffer
             }
+          } else if (Buffer.isBuffer(row.image_buffer)) {
+            base64Data = row.image_buffer.toString('base64')
+          } else if (Array.isArray(row.image_buffer)) {
+            base64Data = Buffer.from(row.image_buffer).toString('base64')
           }
-        } catch {
-          // 静默处理单个用户的错误
+
+          if (base64Data) {
+            result[username] = `data:image/jpeg;base64,${base64Data}`
+          }
         }
       }
     } catch (e) {
@@ -596,6 +843,479 @@ class ChatService {
   }
 
   /**
+   * 获取联系人类型数量（好友、群聊、公众号、曾经的好友）
+   */
+  async getContactTypeCounts(): Promise<{ success: boolean; counts?: ExportTabCounts; error?: string }> {
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error }
+      }
+
+      const excludeExpr = Array.from(FRIEND_EXCLUDE_USERNAMES)
+        .map((username) => `'${this.escapeSqlString(username)}'`)
+        .join(',')
+
+      const countsSql = `
+        SELECT
+          SUM(CASE WHEN username LIKE '%@chatroom' THEN 1 ELSE 0 END) AS group_count,
+          SUM(CASE WHEN username LIKE 'gh_%' THEN 1 ELSE 0 END) AS official_count,
+          SUM(
+            CASE
+              WHEN username NOT LIKE '%@chatroom'
+                AND username NOT LIKE 'gh_%'
+                AND local_type = 1
+                AND username NOT IN (${excludeExpr})
+              THEN 1 ELSE 0
+            END
+          ) AS private_count,
+          SUM(
+            CASE
+              WHEN username NOT LIKE '%@chatroom'
+                AND username NOT LIKE 'gh_%'
+                AND local_type = 0
+                AND COALESCE(quan_pin, '') != ''
+              THEN 1 ELSE 0
+            END
+          ) AS former_friend_count
+        FROM contact
+        WHERE username IS NOT NULL
+          AND username != ''
+      `
+
+      const result = await wcdbService.execQuery('contact', null, countsSql)
+      if (!result.success || !result.rows || result.rows.length === 0) {
+        return { success: false, error: result.error || '获取联系人类型数量失败' }
+      }
+
+      const row = result.rows[0] as Record<string, any>
+      const counts: ExportTabCounts = {
+        private: this.getRowInt(row, ['private_count', 'privateCount'], 0),
+        group: this.getRowInt(row, ['group_count', 'groupCount'], 0),
+        official: this.getRowInt(row, ['official_count', 'officialCount'], 0),
+        former_friend: this.getRowInt(row, ['former_friend_count', 'formerFriendCount'], 0)
+      }
+
+      return { success: true, counts }
+    } catch (e) {
+      console.error('ChatService: 获取联系人类型数量失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  /**
+   * 获取导出页会话分类数量（轻量接口，优先用于顶部 Tab 数量展示）
+   */
+  async getExportTabCounts(): Promise<{ success: boolean; counts?: ExportTabCounts; error?: string }> {
+    return this.getContactTypeCounts()
+  }
+
+  private async listMessageDbPathsForCount(): Promise<{ success: boolean; dbPaths?: string[]; error?: string }> {
+    try {
+      const result = await wcdbService.listMessageDbs()
+      if (!result.success) {
+        return { success: false, error: result.error || '获取消息数据库列表失败' }
+      }
+      const normalized = Array.from(new Set(
+        (result.data || [])
+          .map(pathItem => String(pathItem || '').trim())
+          .filter(Boolean)
+      ))
+      return { success: true, dbPaths: normalized }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  private buildMessageDbSignature(dbPaths: string[]): string {
+    if (!Array.isArray(dbPaths) || dbPaths.length === 0) return 'empty'
+    const parts: string[] = []
+    const sortedPaths = [...dbPaths].sort()
+    for (const dbPath of sortedPaths) {
+      try {
+        const stat = statSync(dbPath)
+        parts.push(`${dbPath}:${stat.size}:${Math.floor(stat.mtimeMs)}`)
+      } catch {
+        parts.push(`${dbPath}:missing`)
+      }
+    }
+    return parts.join('|')
+  }
+
+  private buildSessionHashLookup(sessionIds: string[]): {
+    full32: Map<string, string>
+    short16: Map<string, string | null>
+  } {
+    const full32 = new Map<string, string>()
+    const short16 = new Map<string, string | null>()
+    for (const sessionId of sessionIds) {
+      const hash = crypto.createHash('md5').update(sessionId).digest('hex').toLowerCase()
+      full32.set(hash, sessionId)
+      const shortHash = hash.slice(0, 16)
+      const existing = short16.get(shortHash)
+      if (existing === undefined) {
+        short16.set(shortHash, sessionId)
+      } else if (existing !== sessionId) {
+        short16.set(shortHash, null)
+      }
+    }
+    return { full32, short16 }
+  }
+
+  private matchSessionIdByTableName(
+    tableName: string,
+    hashLookup: {
+      full32: Map<string, string>
+      short16: Map<string, string | null>
+    }
+  ): string | null {
+    const normalized = String(tableName || '').trim().toLowerCase()
+    if (!normalized.startsWith('msg_')) return null
+    const suffix = normalized.slice(4)
+
+    const directFull = hashLookup.full32.get(suffix)
+    if (directFull) return directFull
+
+    if (suffix.length >= 16) {
+      const shortCandidate = hashLookup.short16.get(suffix.slice(0, 16))
+      if (typeof shortCandidate === 'string') return shortCandidate
+    }
+
+    const hashMatch = normalized.match(/[a-f0-9]{32}|[a-f0-9]{16}/i)
+    if (!hashMatch || !hashMatch[0]) return null
+    const matchedHash = hashMatch[0].toLowerCase()
+    if (matchedHash.length >= 32) {
+      const full = hashLookup.full32.get(matchedHash)
+      if (full) return full
+    }
+    const short = hashLookup.short16.get(matchedHash.slice(0, 16))
+    return typeof short === 'string' ? short : null
+  }
+
+  private quoteSqlIdentifier(identifier: string): string {
+    return `"${String(identifier || '').replace(/"/g, '""')}"`
+  }
+
+  private async countSessionMessageCountsByTableScan(
+    sessionIds: string[],
+    traceId?: string
+  ): Promise<{
+    success: boolean
+    counts?: Record<string, number>
+    error?: string
+    dbSignature?: string
+  }> {
+    const normalizedSessionIds = Array.from(new Set(
+      (sessionIds || [])
+        .map(id => String(id || '').trim())
+        .filter(Boolean)
+    ))
+    if (normalizedSessionIds.length === 0) {
+      return { success: true, counts: {}, dbSignature: 'empty' }
+    }
+
+    const dbPathsResult = await this.listMessageDbPathsForCount()
+    if (!dbPathsResult.success) {
+      return { success: false, error: dbPathsResult.error || '获取消息数据库列表失败' }
+    }
+    const dbPaths = dbPathsResult.dbPaths || []
+    const dbSignature = this.buildMessageDbSignature(dbPaths)
+    if (dbPaths.length === 0) {
+      const emptyCounts = normalizedSessionIds.reduce<Record<string, number>>((acc, sessionId) => {
+        acc[sessionId] = 0
+        return acc
+      }, {})
+      return { success: true, counts: emptyCounts, dbSignature }
+    }
+
+    const hashLookup = this.buildSessionHashLookup(normalizedSessionIds)
+    const counts = normalizedSessionIds.reduce<Record<string, number>>((acc, sessionId) => {
+      acc[sessionId] = 0
+      return acc
+    }, {})
+    const unionChunkSize = 48
+    const queryCountKeys = ['count', 'COUNT(*)', 'cnt', 'CNT', 'table_count', 'tableCount']
+
+    for (const dbPath of dbPaths) {
+      const tablesResult = await wcdbService.execQuery(
+        'message',
+        dbPath,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+      )
+      if (!tablesResult.success || !tablesResult.rows || tablesResult.rows.length === 0) {
+        continue
+      }
+
+      const tableToSessionId = new Map<string, string>()
+      for (const row of tablesResult.rows as Record<string, any>[]) {
+        const tableName = String(this.getRowField(row, ['name', 'table_name', 'tableName']) || '').trim()
+        if (!tableName) continue
+        const sessionId = this.matchSessionIdByTableName(tableName, hashLookup)
+        if (!sessionId) continue
+        tableToSessionId.set(tableName, sessionId)
+      }
+
+      if (tableToSessionId.size === 0) {
+        continue
+      }
+
+      const matchedTables = Array.from(tableToSessionId.keys())
+      for (let i = 0; i < matchedTables.length; i += unionChunkSize) {
+        const chunk = matchedTables.slice(i, i + unionChunkSize)
+        if (chunk.length === 0) continue
+
+        const unionSql = chunk.map((tableName) => {
+          const tableAlias = tableName.replace(/'/g, "''")
+          return `SELECT '${tableAlias}' AS table_name, COUNT(*) AS count FROM ${this.quoteSqlIdentifier(tableName)}`
+        }).join(' UNION ALL ')
+
+        const unionResult = await wcdbService.execQuery('message', dbPath, unionSql)
+        if (unionResult.success && unionResult.rows) {
+          for (const row of unionResult.rows as Record<string, any>[]) {
+            const tableName = String(this.getRowField(row, ['table_name', 'tableName', 'name']) || '').trim()
+            const sessionId = tableToSessionId.get(tableName)
+            if (!sessionId) continue
+            const countValue = Math.max(0, Math.floor(this.getRowInt(row, queryCountKeys, 0)))
+            counts[sessionId] = (counts[sessionId] || 0) + countValue
+          }
+          continue
+        }
+
+        // 回退到逐表查询，避免单个 UNION 查询失败导致整批丢失。
+        for (const tableName of chunk) {
+          const sessionId = tableToSessionId.get(tableName)
+          if (!sessionId) continue
+          const countSql = `SELECT COUNT(*) AS count FROM ${this.quoteSqlIdentifier(tableName)}`
+          const singleResult = await wcdbService.execQuery('message', dbPath, countSql)
+          if (!singleResult.success || !singleResult.rows || singleResult.rows.length === 0) {
+            continue
+          }
+          const countValue = Math.max(0, Math.floor(this.getRowInt(singleResult.rows[0], queryCountKeys, 0)))
+          counts[sessionId] = (counts[sessionId] || 0) + countValue
+        }
+      }
+    }
+
+    this.logExportDiag({
+      traceId,
+      level: 'debug',
+      source: 'backend',
+      stepId: 'backend-get-session-message-counts-table-scan',
+      stepName: '会话消息总数表扫描',
+      status: 'done',
+      message: '按 Msg 表聚合统计完成',
+      data: {
+        dbCount: dbPaths.length,
+        requestedSessions: normalizedSessionIds.length
+      }
+    })
+
+    return { success: true, counts, dbSignature }
+  }
+
+  /**
+   * 批量获取会话消息总数（轻量接口，用于列表优先排序）
+   */
+  async getSessionMessageCounts(
+    sessionIds: string[],
+    options?: { preferHintCache?: boolean; bypassSessionCache?: boolean; traceId?: string }
+  ): Promise<{
+    success: boolean
+    counts?: Record<string, number>
+    error?: string
+  }> {
+    const traceId = this.normalizeExportDiagTraceId(options?.traceId)
+    const stepStartedAt = this.startExportDiagStep({
+      traceId,
+      stepId: 'backend-get-session-message-counts',
+      stepName: 'ChatService.getSessionMessageCounts',
+      message: '开始批量读取会话消息总数',
+      data: {
+        requestedSessions: Array.isArray(sessionIds) ? sessionIds.length : 0,
+        preferHintCache: options?.preferHintCache !== false,
+        bypassSessionCache: options?.bypassSessionCache === true
+      }
+    })
+    let success = false
+    let errorMessage = ''
+    let returnedCounts = 0
+
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        errorMessage = connectResult.error || '数据库未连接'
+        return { success: false, error: connectResult.error || '数据库未连接' }
+      }
+
+      const normalizedSessionIds = Array.from(
+        new Set(
+          (sessionIds || [])
+            .map((id) => String(id || '').trim())
+            .filter(Boolean)
+        )
+      )
+      if (normalizedSessionIds.length === 0) {
+        success = true
+        return { success: true, counts: {} }
+      }
+
+      const preferHintCache = options?.preferHintCache !== false
+      const bypassSessionCache = options?.bypassSessionCache === true
+
+      this.refreshSessionMessageCountCacheScope()
+      const counts: Record<string, number> = {}
+      const now = Date.now()
+      const pendingSessionIds: string[] = []
+      const sessionIdsKey = [...normalizedSessionIds].sort().join('\u0001')
+
+      for (const sessionId of normalizedSessionIds) {
+        if (!bypassSessionCache) {
+          const cached = this.sessionMessageCountCache.get(sessionId)
+          if (cached && now - cached.updatedAt <= this.sessionMessageCountCacheTtlMs) {
+            counts[sessionId] = cached.count
+            continue
+          }
+        }
+
+        if (preferHintCache) {
+          const hintCount = this.sessionMessageCountHintCache.get(sessionId)
+          if (typeof hintCount === 'number' && Number.isFinite(hintCount) && hintCount >= 0) {
+            counts[sessionId] = Math.floor(hintCount)
+            this.sessionMessageCountCache.set(sessionId, {
+              count: Math.floor(hintCount),
+              updatedAt: now
+            })
+            continue
+          }
+        }
+
+        pendingSessionIds.push(sessionId)
+      }
+
+      if (pendingSessionIds.length > 0) {
+        let tableScanSucceeded = false
+        const cachedBatch = this.sessionMessageCountBatchCache
+        const cachedBatchFresh = cachedBatch &&
+          now - cachedBatch.updatedAt <= this.sessionMessageCountBatchCacheTtlMs
+
+        if (cachedBatchFresh && cachedBatch.sessionIdsKey === sessionIdsKey) {
+          const dbPathsResult = await this.listMessageDbPathsForCount()
+          if (dbPathsResult.success) {
+            const currentDbSignature = this.buildMessageDbSignature(dbPathsResult.dbPaths || [])
+            if (currentDbSignature === cachedBatch.dbSignature) {
+              for (const sessionId of pendingSessionIds) {
+                const nextCountRaw = cachedBatch.counts[sessionId]
+                const nextCount = Number.isFinite(nextCountRaw) ? Math.max(0, Math.floor(nextCountRaw)) : 0
+                counts[sessionId] = nextCount
+                this.sessionMessageCountCache.set(sessionId, {
+                  count: nextCount,
+                  updatedAt: now
+                })
+              }
+              tableScanSucceeded = true
+            }
+          }
+        }
+
+        if (!tableScanSucceeded) {
+          const tableScanResult = await this.countSessionMessageCountsByTableScan(pendingSessionIds, traceId)
+          if (tableScanResult.success && tableScanResult.counts) {
+            const nowTs = Date.now()
+            for (const sessionId of pendingSessionIds) {
+              const nextCountRaw = tableScanResult.counts[sessionId]
+              const nextCount = Number.isFinite(nextCountRaw) ? Math.max(0, Math.floor(nextCountRaw)) : 0
+              counts[sessionId] = nextCount
+              this.sessionMessageCountCache.set(sessionId, {
+                count: nextCount,
+                updatedAt: nowTs
+              })
+            }
+            if (tableScanResult.dbSignature) {
+              this.sessionMessageCountBatchCache = {
+                dbSignature: tableScanResult.dbSignature,
+                sessionIdsKey,
+                counts: { ...counts },
+                updatedAt: nowTs
+              }
+            }
+            tableScanSucceeded = true
+          } else {
+            this.logExportDiag({
+              traceId,
+              level: 'warn',
+              source: 'backend',
+              stepId: 'backend-get-session-message-counts-table-scan',
+              stepName: '会话消息总数表扫描',
+              status: 'failed',
+              message: '按 Msg 表聚合统计失败，回退逐会话统计',
+              data: {
+                error: tableScanResult.error || '未知错误'
+              }
+            })
+          }
+        }
+
+        if (!tableScanSucceeded) {
+          const batchSize = 320
+          for (let i = 0; i < pendingSessionIds.length; i += batchSize) {
+            const batch = pendingSessionIds.slice(i, i + batchSize)
+            this.logExportDiag({
+              traceId,
+              level: 'debug',
+              source: 'backend',
+              stepId: 'backend-get-session-message-counts-batch',
+              stepName: '会话消息总数批次查询',
+              status: 'running',
+              message: `开始查询批次 ${Math.floor(i / batchSize) + 1}/${Math.ceil(pendingSessionIds.length / batchSize) || 1}`,
+              data: {
+                batchSize: batch.length
+              }
+            })
+            let batchCounts: Record<string, number> = {}
+            try {
+              const result = await wcdbService.getMessageCounts(batch)
+              if (result.success && result.counts) {
+                batchCounts = result.counts
+              }
+            } catch {
+              // noop
+            }
+
+            const nowTs = Date.now()
+            for (const sessionId of batch) {
+              const nextCountRaw = batchCounts[sessionId]
+              const nextCount = Number.isFinite(nextCountRaw) ? Math.max(0, Math.floor(nextCountRaw)) : 0
+              counts[sessionId] = nextCount
+              this.sessionMessageCountCache.set(sessionId, {
+                count: nextCount,
+                updatedAt: nowTs
+              })
+            }
+          }
+        }
+      }
+
+      returnedCounts = Object.keys(counts).length
+      success = true
+      return { success: true, counts }
+    } catch (e) {
+      console.error('ChatService: 批量获取会话消息总数失败:', e)
+      errorMessage = String(e)
+      return { success: false, error: String(e) }
+    } finally {
+      this.endExportDiagStep({
+        traceId,
+        stepId: 'backend-get-session-message-counts',
+        stepName: 'ChatService.getSessionMessageCounts',
+        startedAt: stepStartedAt,
+        success,
+        message: success ? '批量会话消息总数读取完成' : '批量会话消息总数读取失败',
+        data: success ? { returnedCounts } : { error: errorMessage || '未知错误' }
+      })
+    }
+  }
+
+  /**
    * 获取通讯录列表
    */
   async getContacts(): Promise<{ success: boolean; contacts?: ContactInfo[]; error?: string }> {
@@ -608,11 +1328,17 @@ class ChatService {
       // 使用execQuery直接查询加密的contact.db
       // kind='contact', path=null表示使用已打开的contact.db
       const contactQuery = `
-        SELECT username, remark, nick_name, alias, local_type, flag, quan_pin
+        SELECT username, remark, nick_name, alias, local_type, quan_pin
         FROM contact
+        WHERE username IS NOT NULL
+          AND username != ''
+          AND (
+            username LIKE '%@chatroom'
+            OR username LIKE 'gh_%'
+            OR local_type = 1
+            OR (local_type = 0 AND COALESCE(quan_pin, '') != '')
+          )
       `
-
-
       const contactResult = await wcdbService.execQuery('contact', null, contactQuery)
 
       if (!contactResult.success || !contactResult.rows) {
@@ -622,21 +1348,6 @@ class ChatService {
 
 
       const rows = contactResult.rows as Record<string, any>[]
-
-      // 调试：显示前5条数据样本
-
-      rows.slice(0, 5).forEach((row, idx) => {
-
-      })
-
-      // 调试：统计local_type分布
-      const localTypeStats = new Map<number, number>()
-      rows.forEach(row => {
-        const lt = row.local_type || 0
-        localTypeStats.set(lt, (localTypeStats.get(lt) || 0) + 1)
-      })
-
-
       // 获取会话表的最后联系时间用于排序
       const lastContactTimeMap = new Map<string, number>()
       const sessionResult = await wcdbService.getSessions()
@@ -652,25 +1363,24 @@ class ChatService {
 
       // 转换为ContactInfo
       const contacts: (ContactInfo & { lastContactTime: number })[] = []
+      const excludeNames = new Set(['medianote', 'floatbottle', 'qmessage', 'qqmail', 'fmessage'])
 
       for (const row of rows) {
-        const username = row.username || ''
+        const username = String(row.username || '').trim()
 
         if (!username) continue
 
-        const excludeNames = ['medianote', 'floatbottle', 'qmessage', 'qqmail', 'fmessage']
         let type: 'friend' | 'group' | 'official' | 'former_friend' | 'other' = 'other'
         const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], 0)
-        const flag = Number(row.flag ?? 0)
-        const quanPin = this.getRowField(row, ['quan_pin', 'quanPin', 'WCDB_CT_quan_pin']) || ''
+        const quanPin = String(this.getRowField(row, ['quan_pin', 'quanPin', 'WCDB_CT_quan_pin']) || '').trim()
 
-        if (username.includes('@chatroom')) {
+        if (username.endsWith('@chatroom')) {
           type = 'group'
         } else if (username.startsWith('gh_')) {
           type = 'official'
-        } else if (/^(?!.*(gh_|@chatroom)).*$/.test(username) && localType === 1 && !excludeNames.includes(username)) {
+        } else if (localType === 1 && !excludeNames.has(username)) {
           type = 'friend'
-        } else if (/^(?!.*(gh_|@chatroom)).*$/.test(username) && localType === 0 && quanPin) {
+        } else if (localType === 0 && quanPin) {
           type = 'former_friend'
         } else {
           continue
@@ -683,6 +1393,7 @@ class ChatService {
           displayName,
           remark: row.remark || undefined,
           nickname: row.nick_name || undefined,
+          alias: row.alias || undefined,
           avatarUrl: undefined,
           type,
           lastContactTime: lastContactTimeMap.get(username) || 0
@@ -726,6 +1437,7 @@ class ChatService {
     endTime: number = 0,
     ascending: boolean = false
   ): Promise<{ success: boolean; messages?: Message[]; hasMore?: boolean; error?: string }> {
+    let releaseMessageCursorMutex: (() => void) | null = null
     try {
       const connectResult = await this.ensureConnected()
       if (!connectResult.success) {
@@ -733,15 +1445,21 @@ class ChatService {
       }
 
       const batchSize = Math.max(1, limit || this.messageBatchDefault)
-      
+
       // 使用互斥锁保护游标状态访问
       while (this.messageCursorMutex) {
         await new Promise(resolve => setTimeout(resolve, 1))
       }
       this.messageCursorMutex = true
-      
+      let mutexReleased = false
+      releaseMessageCursorMutex = () => {
+        if (mutexReleased) return
+        this.messageCursorMutex = false
+        mutexReleased = true
+      }
+
       let state = this.messageCursors.get(sessionId)
-      
+
       // 只在以下情况重新创建游标:
       // 1. 没有游标状态
       // 2. offset 为 0 (重新加载会话)
@@ -777,8 +1495,8 @@ class ChatService {
 
         state = { cursor: cursorResult.cursor, fetched: 0, batchSize, startTime, endTime, ascending }
         this.messageCursors.set(sessionId, state)
-        this.messageCursorMutex = false
-        
+        releaseMessageCursorMutex?.()
+
         // 如果需要跳过消息(offset > 0),逐批获取但不返回
         // 注意：仅在 offset === 0 时重建游标最安全；
         // 当 startTime/endTime 变化导致重建时，offset 应由前端重置为 0
@@ -810,7 +1528,6 @@ class ChatService {
             }
 
             skipped += count
-            state.fetched += count
 
             // If satisfied offset, break
             if (skipped >= offset) break;
@@ -823,6 +1540,7 @@ class ChatService {
           if (attempts >= maxSkipAttempts) {
             console.error(`[ChatService] 跳过消息超过最大尝试次数: attempts=${attempts}`)
           }
+          state.fetched = offset
           console.log(`[ChatService] 跳过完成: skipped=${skipped}, fetched=${state.fetched}, buffered=${state.bufferedMessages?.length || 0}`)
         }
       }
@@ -848,7 +1566,6 @@ class ChatService {
         const nextBatch = await wcdbService.fetchMessageBatch(state.cursor)
         if (nextBatch.success && nextBatch.rows) {
           rows = rows.concat(nextBatch.rows)
-          state.fetched += nextBatch.rows.length
           actualHasMore = nextBatch.hasMore === true
         } else if (!nextBatch.success) {
           console.error('[ChatService] 获取消息批次失败:', nextBatch.error)
@@ -879,7 +1596,7 @@ class ChatService {
         // 群聊消息：senderUsername 是群成员，需要检查 _db_path 或上下文
         // 单聊消息：senderUsername 应该是 sessionId 或自己
         const isGroupChat = sessionId.includes('@chatroom')
-        
+
         if (isGroupChat) {
           // 群聊消息暂不验证（因为 senderUsername 是群成员，不是 sessionId）
           return true
@@ -915,14 +1632,15 @@ class ChatService {
       }
 
       state.fetched += rows.length
-      this.messageCursorMutex = false
-      
+      releaseMessageCursorMutex?.()
+
       this.messageCacheService.set(sessionId, filtered)
       return { success: true, messages: filtered, hasMore }
     } catch (e) {
-      this.messageCursorMutex = false
       console.error('ChatService: 获取消息失败:', e)
       return { success: false, error: String(e) }
+    } finally {
+      releaseMessageCursorMutex?.()
     }
   }
 
@@ -964,9 +1682,31 @@ class ChatService {
       }
 
       console.warn(`[ChatService] 表情包数据库未命中: md5=${msg.emojiMd5}, db=${dbPath}`)
+      // 数据库未命中时，尝试从本地 emoji 缓存目录查找（转发的表情包只有 md5，无 CDN URL）
+      this.findEmojiInLocalCache(msg)
 
     } catch (e) {
       console.error(`[ChatService] 恢复表情包失败: md5=${msg.emojiMd5}`, e)
+    }
+  }
+
+  /**
+   * 从本地 WeFlow emoji 缓存目录按 md5 查找文件
+   */
+  private findEmojiInLocalCache(msg: Message): void {
+    if (!msg.emojiMd5) return
+    const cacheDir = this.getEmojiCacheDir()
+    if (!existsSync(cacheDir)) return
+
+    const extensions = ['.gif', '.png', '.webp', '.jpg', '.jpeg']
+    for (const ext of extensions) {
+      const filePath = join(cacheDir, `${msg.emojiMd5}${ext}`)
+      if (existsSync(filePath)) {
+        msg.emojiLocalPath = filePath
+        // 同步写入内存缓存，避免重复查找
+        emojiCache.set(msg.emojiMd5, filePath)
+        return
+      }
     }
   }
 
@@ -995,7 +1735,7 @@ class ChatService {
   }
 
 
-  async getLatestMessages(sessionId: string, limit: number = this.messageBatchDefault): Promise<{ success: boolean; messages?: Message[]; error?: string }> {
+  async getLatestMessages(sessionId: string, limit: number = this.messageBatchDefault): Promise<{ success: boolean; messages?: Message[]; hasMore?: boolean; error?: string }> {
     try {
       const connectResult = await this.ensureConnected()
       if (!connectResult.success) {
@@ -1026,7 +1766,7 @@ class ChatService {
           await Promise.allSettled(fixPromises)
         }
 
-        return { success: true, messages: normalized }
+        return { success: true, messages: normalized, hasMore: batch.hasMore === true }
       } finally {
         await wcdbService.closeMessageCursor(cursorResult.cursor)
       }
@@ -1142,6 +1882,1066 @@ class ChatService {
     return Number.isFinite(parsed) ? parsed : NaN
   }
 
+  private buildIdentityKeys(raw: string): string[] {
+    const value = String(raw || '').trim()
+    if (!value) return []
+    const lowerRaw = value.toLowerCase()
+    const cleaned = this.cleanAccountDirName(value).toLowerCase()
+    if (cleaned && cleaned !== lowerRaw) {
+      return [cleaned, lowerRaw]
+    }
+    return [lowerRaw]
+  }
+
+  private extractGroupMemberUsername(member: any): string {
+    if (!member) return ''
+    if (typeof member === 'string') return member.trim()
+    return String(
+      member.username ||
+      member.userName ||
+      member.user_name ||
+      member.encryptUsername ||
+      member.encryptUserName ||
+      member.encrypt_username ||
+      member.originalName ||
+      ''
+    ).trim()
+  }
+
+  private async getFriendIdentitySet(): Promise<Set<string>> {
+    const identities = new Set<string>()
+    const contactResult = await wcdbService.execQuery(
+      'contact',
+      null,
+      'SELECT username, local_type, quan_pin FROM contact'
+    )
+    if (!contactResult.success || !contactResult.rows) {
+      return identities
+    }
+
+    for (const rowAny of contactResult.rows) {
+      const row = rowAny as Record<string, any>
+      const username = String(row.username || '').trim()
+      if (!username || username.includes('@chatroom') || username.startsWith('gh_')) continue
+      if (FRIEND_EXCLUDE_USERNAMES.has(username)) continue
+
+      const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], 0)
+      if (localType !== 1) continue
+
+      for (const key of this.buildIdentityKeys(username)) {
+        identities.add(key)
+      }
+    }
+    return identities
+  }
+
+  private async forEachWithConcurrency<T>(
+    items: T[],
+    limit: number,
+    worker: (item: T) => Promise<void>
+  ): Promise<void> {
+    if (items.length === 0) return
+    const concurrency = Math.max(1, Math.min(limit, items.length))
+    let index = 0
+
+    const runners = Array.from({ length: concurrency }, async () => {
+      while (true) {
+        const current = index
+        index += 1
+        if (current >= items.length) return
+        await worker(items[current])
+      }
+    })
+
+    await Promise.all(runners)
+  }
+
+  private normalizeExportDiagTraceId(traceId?: string): string {
+    const normalized = String(traceId || '').trim()
+    return normalized
+  }
+
+  private logExportDiag(input: {
+    traceId?: string
+    source?: 'backend' | 'main' | 'frontend' | 'worker'
+    level?: 'debug' | 'info' | 'warn' | 'error'
+    message: string
+    stepId?: string
+    stepName?: string
+    status?: 'running' | 'done' | 'failed' | 'timeout'
+    durationMs?: number
+    data?: Record<string, unknown>
+  }): void {
+    const traceId = this.normalizeExportDiagTraceId(input.traceId)
+    if (!traceId) return
+    exportCardDiagnosticsService.log({
+      traceId,
+      source: input.source || 'backend',
+      level: input.level || 'info',
+      message: input.message,
+      stepId: input.stepId,
+      stepName: input.stepName,
+      status: input.status,
+      durationMs: input.durationMs,
+      data: input.data
+    })
+  }
+
+  private startExportDiagStep(input: {
+    traceId?: string
+    stepId: string
+    stepName: string
+    message: string
+    data?: Record<string, unknown>
+  }): number {
+    const startedAt = Date.now()
+    const traceId = this.normalizeExportDiagTraceId(input.traceId)
+    if (traceId) {
+      exportCardDiagnosticsService.stepStart({
+        traceId,
+        stepId: input.stepId,
+        stepName: input.stepName,
+        source: 'backend',
+        message: input.message,
+        data: input.data
+      })
+    }
+    return startedAt
+  }
+
+  private endExportDiagStep(input: {
+    traceId?: string
+    stepId: string
+    stepName: string
+    startedAt: number
+    success: boolean
+    message?: string
+    data?: Record<string, unknown>
+  }): void {
+    const traceId = this.normalizeExportDiagTraceId(input.traceId)
+    if (!traceId) return
+    exportCardDiagnosticsService.stepEnd({
+      traceId,
+      stepId: input.stepId,
+      stepName: input.stepName,
+      source: 'backend',
+      status: input.success ? 'done' : 'failed',
+      message: input.message || (input.success ? `${input.stepName} 完成` : `${input.stepName} 失败`),
+      durationMs: Math.max(0, Date.now() - input.startedAt),
+      data: input.data
+    })
+  }
+
+  private refreshSessionMessageCountCacheScope(): void {
+    const dbPath = String(this.configService.get('dbPath') || '')
+    const myWxid = String(this.configService.get('myWxid') || '')
+    const scope = `${dbPath}::${myWxid}`
+    if (scope === this.sessionMessageCountCacheScope) {
+      this.refreshSessionStatsCacheScope(scope)
+      this.refreshGroupMyMessageCountCacheScope(scope)
+      return
+    }
+    this.sessionMessageCountCacheScope = scope
+    this.sessionMessageCountCache.clear()
+    this.sessionMessageCountHintCache.clear()
+    this.sessionMessageCountBatchCache = null
+    this.sessionDetailFastCache.clear()
+    this.sessionDetailExtraCache.clear()
+    this.sessionStatusCache.clear()
+    this.messageTableColumnsCache.clear()
+    this.refreshSessionStatsCacheScope(scope)
+    this.refreshGroupMyMessageCountCacheScope(scope)
+  }
+
+  private refreshGroupMyMessageCountCacheScope(scope: string): void {
+    if (scope === this.groupMyMessageCountCacheScope) return
+    this.groupMyMessageCountCacheScope = scope
+    this.groupMyMessageCountMemoryCache.clear()
+  }
+
+  private refreshSessionStatsCacheScope(scope: string): void {
+    if (scope === this.sessionStatsCacheScope) return
+    this.sessionStatsCacheScope = scope
+    this.sessionStatsMemoryCache.clear()
+    this.sessionStatsPendingBasic.clear()
+    this.sessionStatsPendingFull.clear()
+    this.allGroupSessionIdsCache = null
+  }
+
+  private buildScopedSessionStatsKey(sessionId: string): string {
+    return `${this.sessionStatsCacheScope}::${sessionId}`
+  }
+
+  private buildScopedGroupMyMessageCountKey(chatroomId: string): string {
+    return `${this.groupMyMessageCountCacheScope}::${chatroomId}`
+  }
+
+  private getGroupMyMessageCountHintEntry(
+    chatroomId: string
+  ): { entry: GroupMyMessageCountCacheEntry; source: 'memory' | 'disk' } | null {
+    const scopedKey = this.buildScopedGroupMyMessageCountKey(chatroomId)
+    const inMemory = this.groupMyMessageCountMemoryCache.get(scopedKey)
+    if (inMemory) {
+      return { entry: inMemory, source: 'memory' }
+    }
+
+    const persisted = this.groupMyMessageCountCacheService.get(this.groupMyMessageCountCacheScope, chatroomId)
+    if (!persisted) return null
+    this.groupMyMessageCountMemoryCache.set(scopedKey, persisted)
+    return { entry: persisted, source: 'disk' }
+  }
+
+  private setGroupMyMessageCountHintEntry(chatroomId: string, messageCount: number, updatedAt?: number): number {
+    const nextCount = Number.isFinite(messageCount) ? Math.max(0, Math.floor(messageCount)) : 0
+    const nextUpdatedAt = Number.isFinite(updatedAt) ? Math.max(0, Math.floor(updatedAt as number)) : Date.now()
+    const scopedKey = this.buildScopedGroupMyMessageCountKey(chatroomId)
+    const existing = this.groupMyMessageCountMemoryCache.get(scopedKey)
+    if (existing && existing.updatedAt > nextUpdatedAt) {
+      return existing.updatedAt
+    }
+
+    const entry: GroupMyMessageCountCacheEntry = {
+      updatedAt: nextUpdatedAt,
+      messageCount: nextCount
+    }
+    this.groupMyMessageCountMemoryCache.set(scopedKey, entry)
+    this.groupMyMessageCountCacheService.set(this.groupMyMessageCountCacheScope, chatroomId, entry)
+    return nextUpdatedAt
+  }
+
+  private toSessionStatsCacheStats(stats: ExportSessionStats): SessionStatsCacheStats {
+    const normalized: SessionStatsCacheStats = {
+      totalMessages: Number.isFinite(stats.totalMessages) ? Math.max(0, Math.floor(stats.totalMessages)) : 0,
+      voiceMessages: Number.isFinite(stats.voiceMessages) ? Math.max(0, Math.floor(stats.voiceMessages)) : 0,
+      imageMessages: Number.isFinite(stats.imageMessages) ? Math.max(0, Math.floor(stats.imageMessages)) : 0,
+      videoMessages: Number.isFinite(stats.videoMessages) ? Math.max(0, Math.floor(stats.videoMessages)) : 0,
+      emojiMessages: Number.isFinite(stats.emojiMessages) ? Math.max(0, Math.floor(stats.emojiMessages)) : 0,
+      transferMessages: Number.isFinite(stats.transferMessages) ? Math.max(0, Math.floor(stats.transferMessages)) : 0,
+      redPacketMessages: Number.isFinite(stats.redPacketMessages) ? Math.max(0, Math.floor(stats.redPacketMessages)) : 0,
+      callMessages: Number.isFinite(stats.callMessages) ? Math.max(0, Math.floor(stats.callMessages)) : 0
+    }
+
+    if (Number.isFinite(stats.firstTimestamp)) normalized.firstTimestamp = Math.max(0, Math.floor(stats.firstTimestamp as number))
+    if (Number.isFinite(stats.lastTimestamp)) normalized.lastTimestamp = Math.max(0, Math.floor(stats.lastTimestamp as number))
+    if (Number.isFinite(stats.privateMutualGroups)) normalized.privateMutualGroups = Math.max(0, Math.floor(stats.privateMutualGroups as number))
+    if (Number.isFinite(stats.groupMemberCount)) normalized.groupMemberCount = Math.max(0, Math.floor(stats.groupMemberCount as number))
+    if (Number.isFinite(stats.groupMyMessages)) normalized.groupMyMessages = Math.max(0, Math.floor(stats.groupMyMessages as number))
+    if (Number.isFinite(stats.groupActiveSpeakers)) normalized.groupActiveSpeakers = Math.max(0, Math.floor(stats.groupActiveSpeakers as number))
+    if (Number.isFinite(stats.groupMutualFriends)) normalized.groupMutualFriends = Math.max(0, Math.floor(stats.groupMutualFriends as number))
+
+    return normalized
+  }
+
+  private fromSessionStatsCacheStats(stats: SessionStatsCacheStats): ExportSessionStats {
+    return {
+      totalMessages: stats.totalMessages,
+      voiceMessages: stats.voiceMessages,
+      imageMessages: stats.imageMessages,
+      videoMessages: stats.videoMessages,
+      emojiMessages: stats.emojiMessages,
+      transferMessages: stats.transferMessages,
+      redPacketMessages: stats.redPacketMessages,
+      callMessages: stats.callMessages,
+      firstTimestamp: stats.firstTimestamp,
+      lastTimestamp: stats.lastTimestamp,
+      privateMutualGroups: stats.privateMutualGroups,
+      groupMemberCount: stats.groupMemberCount,
+      groupMyMessages: stats.groupMyMessages,
+      groupActiveSpeakers: stats.groupActiveSpeakers,
+      groupMutualFriends: stats.groupMutualFriends
+    }
+  }
+
+  private supportsRequestedRelation(entry: SessionStatsCacheEntry, includeRelations: boolean): boolean {
+    if (!includeRelations) return true
+    return entry.includeRelations
+  }
+
+  private getSessionStatsCacheEntry(sessionId: string): { entry: SessionStatsCacheEntry; source: 'memory' | 'disk' } | null {
+    const scopedKey = this.buildScopedSessionStatsKey(sessionId)
+    const inMemory = this.sessionStatsMemoryCache.get(scopedKey)
+    if (inMemory) {
+      return { entry: inMemory, source: 'memory' }
+    }
+
+    const persisted = this.sessionStatsCacheService.get(this.sessionStatsCacheScope, sessionId)
+    if (!persisted) return null
+    this.sessionStatsMemoryCache.set(scopedKey, persisted)
+    return { entry: persisted, source: 'disk' }
+  }
+
+  private setSessionStatsCacheEntry(sessionId: string, stats: ExportSessionStats, includeRelations: boolean): number {
+    const updatedAt = Date.now()
+    const normalizedStats = this.toSessionStatsCacheStats(stats)
+    const entry: SessionStatsCacheEntry = {
+      updatedAt,
+      includeRelations,
+      stats: normalizedStats
+    }
+    const scopedKey = this.buildScopedSessionStatsKey(sessionId)
+    this.sessionStatsMemoryCache.set(scopedKey, entry)
+    this.sessionStatsCacheService.set(this.sessionStatsCacheScope, sessionId, entry)
+    if (sessionId.endsWith('@chatroom') && Number.isFinite(normalizedStats.groupMyMessages)) {
+      this.setGroupMyMessageCountHintEntry(sessionId, normalizedStats.groupMyMessages as number, updatedAt)
+    }
+    return updatedAt
+  }
+
+  private deleteSessionStatsCacheEntry(sessionId: string): void {
+    const scopedKey = this.buildScopedSessionStatsKey(sessionId)
+    this.sessionStatsMemoryCache.delete(scopedKey)
+    this.sessionStatsPendingBasic.delete(scopedKey)
+    this.sessionStatsPendingFull.delete(scopedKey)
+    this.sessionStatsCacheService.delete(this.sessionStatsCacheScope, sessionId)
+  }
+
+  private clearSessionStatsCacheForScope(): void {
+    this.sessionStatsMemoryCache.clear()
+    this.sessionStatsPendingBasic.clear()
+    this.sessionStatsPendingFull.clear()
+    this.allGroupSessionIdsCache = null
+    this.sessionStatsCacheService.clearScope(this.sessionStatsCacheScope)
+  }
+
+  private collectSessionIdsFromPayload(payload: unknown): Set<string> {
+    const ids = new Set<string>()
+    const walk = (value: unknown, keyHint?: string) => {
+      if (Array.isArray(value)) {
+        for (const item of value) walk(item, keyHint)
+        return
+      }
+      if (value && typeof value === 'object') {
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+          walk(v, k)
+        }
+        return
+      }
+      if (typeof value !== 'string') return
+      const normalized = value.trim()
+      if (!normalized) return
+      const lowerKey = String(keyHint || '').toLowerCase()
+      const keyLooksLikeSession = (
+        lowerKey.includes('session') ||
+        lowerKey.includes('talker') ||
+        lowerKey.includes('username') ||
+        lowerKey.includes('chatroom')
+      )
+      if (!keyLooksLikeSession && !normalized.includes('@chatroom')) {
+        return
+      }
+      ids.add(normalized)
+    }
+    walk(payload)
+    return ids
+  }
+
+  private handleSessionStatsMonitorChange(type: string, json: string): void {
+    this.refreshSessionMessageCountCacheScope()
+    if (!this.sessionStatsCacheScope) return
+
+    const normalizedType = String(type || '').toLowerCase()
+    const maybeJson = String(json || '').trim()
+    let ids = new Set<string>()
+    if (maybeJson) {
+      try {
+        ids = this.collectSessionIdsFromPayload(JSON.parse(maybeJson))
+      } catch {
+        ids = this.collectSessionIdsFromPayload(maybeJson)
+      }
+    }
+
+    if (ids.size > 0) {
+      ids.forEach((sessionId) => this.deleteSessionStatsCacheEntry(sessionId))
+      if (Array.from(ids).some((id) => id.includes('@chatroom'))) {
+        this.allGroupSessionIdsCache = null
+      }
+      return
+    }
+
+    // 无法定位具体会话时，保守地仅在消息/群成员相关变更时清空当前 scope，避免展示过旧统计。
+    if (
+      normalizedType.includes('message') ||
+      normalizedType.includes('session') ||
+      normalizedType.includes('group') ||
+      normalizedType.includes('member') ||
+      normalizedType.includes('contact')
+    ) {
+      this.clearSessionStatsCacheForScope()
+    }
+  }
+
+  private async listAllGroupSessionIds(): Promise<string[]> {
+    const now = Date.now()
+    if (
+      this.allGroupSessionIdsCache &&
+      now - this.allGroupSessionIdsCache.updatedAt <= this.allGroupSessionIdsCacheTtlMs
+    ) {
+      return this.allGroupSessionIdsCache.ids
+    }
+
+    const result = await wcdbService.getSessions()
+    if (!result.success || !Array.isArray(result.sessions)) {
+      return []
+    }
+
+    const ids = new Set<string>()
+    for (const rowAny of result.sessions) {
+      const row = rowAny as Record<string, unknown>
+      const usernameRaw = row.username ?? row.userName ?? row.talker ?? row.sessionId
+      const username = String(usernameRaw || '').trim()
+      if (!username || !username.endsWith('@chatroom')) continue
+      ids.add(username)
+    }
+
+    const list = Array.from(ids)
+    this.allGroupSessionIdsCache = {
+      ids: list,
+      updatedAt: now
+    }
+    return list
+  }
+
+  private async getSessionMessageTables(sessionId: string): Promise<Array<{ tableName: string; dbPath: string }>> {
+    const cached = this.sessionTablesCache.get(sessionId)
+    if (cached && cached.length > 0) {
+      return cached
+    }
+
+    const tableStats = await wcdbService.getMessageTableStats(sessionId)
+    if (!tableStats.success || !tableStats.tables || tableStats.tables.length === 0) {
+      return []
+    }
+
+    const tables = tableStats.tables
+      .map(t => ({ tableName: t.table_name || t.name, dbPath: t.db_path }))
+      .filter(t => t.tableName && t.dbPath) as Array<{ tableName: string; dbPath: string }>
+
+    if (tables.length > 0) {
+      this.sessionTablesCache.set(sessionId, tables)
+      setTimeout(() => { this.sessionTablesCache.delete(sessionId) }, this.sessionTablesCacheTtl)
+    }
+    return tables
+  }
+
+  private async getMessageTableColumns(dbPath: string, tableName: string): Promise<Set<string>> {
+    const cacheKey = `${dbPath}\u0001${tableName}`
+    const now = Date.now()
+    const cached = this.messageTableColumnsCache.get(cacheKey)
+    if (cached && now - cached.updatedAt <= this.messageTableColumnsCacheTtlMs) {
+      return new Set<string>(cached.columns)
+    }
+
+    const pragmaSql = `PRAGMA table_info(${this.quoteSqlIdentifier(tableName)})`
+    const result = await wcdbService.execQuery('message', dbPath, pragmaSql)
+    if (!result.success || !result.rows || result.rows.length === 0) {
+      return new Set<string>()
+    }
+    const columns = new Set<string>()
+    for (const row of result.rows as Record<string, any>[]) {
+      const name = String(this.getRowField(row, ['name', 'column_name', 'columnName']) || '').trim().toLowerCase()
+      if (name) columns.add(name)
+    }
+    this.messageTableColumnsCache.set(cacheKey, {
+      columns: new Set<string>(columns),
+      updatedAt: now
+    })
+    return columns
+  }
+
+  private pickFirstColumn(columns: Set<string>, candidates: string[]): string | undefined {
+    for (const candidate of candidates) {
+      const normalized = candidate.toLowerCase()
+      if (columns.has(normalized)) return normalized
+    }
+    return undefined
+  }
+
+  private escapeSqlLiteral(value: string): string {
+    return String(value || '').replace(/'/g, "''")
+  }
+
+  private extractType49XmlTypeForStats(content: string): string {
+    if (!content) return ''
+
+    const appmsgMatch = /<appmsg[\s\S]*?>([\s\S]*?)<\/appmsg>/i.exec(content)
+    if (appmsgMatch) {
+      const appmsgInner = appmsgMatch[1]
+        .replace(/<refermsg[\s\S]*?<\/refermsg>/gi, '')
+        .replace(/<patMsg[\s\S]*?<\/patMsg>/gi, '')
+      const typeMatch = /<type>([\s\S]*?)<\/type>/i.exec(appmsgInner)
+      if (typeMatch) return String(typeMatch[1] || '').trim()
+    }
+
+    return this.extractXmlValue(content, 'type')
+  }
+
+  private async collectSpecialMessageCountsByCursorScan(sessionId: string): Promise<{
+    transferMessages: number
+    redPacketMessages: number
+    callMessages: number
+  }> {
+    const counters = {
+      transferMessages: 0,
+      redPacketMessages: 0,
+      callMessages: 0
+    }
+
+    const cursorResult = await wcdbService.openMessageCursorLite(sessionId, 500, false, 0, 0)
+    if (!cursorResult.success || !cursorResult.cursor) {
+      return counters
+    }
+
+    const cursor = cursorResult.cursor
+    try {
+      while (true) {
+        const batch = await wcdbService.fetchMessageBatch(cursor)
+        if (!batch.success) break
+        const rows = Array.isArray(batch.rows) ? batch.rows as Record<string, any>[] : []
+        for (const row of rows) {
+          const localType = this.getRowInt(row, ['local_type', 'localType', 'type', 'msg_type', 'msgType', 'WCDB_CT_local_type'], 1)
+          if (localType === 50) {
+            counters.callMessages += 1
+            continue
+          }
+          if (localType === 8589934592049) {
+            counters.transferMessages += 1
+            continue
+          }
+          if (localType === 8594229559345) {
+            counters.redPacketMessages += 1
+            continue
+          }
+          if (localType !== 49) continue
+
+          const rawMessageContent = this.getRowField(row, ['message_content', 'messageContent', 'msg_content', 'msgContent', 'content', 'WCDB_CT_message_content'])
+          const rawCompressContent = this.getRowField(row, ['compress_content', 'compressContent', 'compressed_content', 'compressedContent', 'WCDB_CT_compress_content'])
+          const content = this.decodeMessageContent(rawMessageContent, rawCompressContent)
+          const xmlType = this.extractType49XmlTypeForStats(content)
+          if (xmlType === '2000') counters.transferMessages += 1
+          if (xmlType === '2001') counters.redPacketMessages += 1
+        }
+
+        if (!batch.hasMore || rows.length === 0) break
+      }
+    } finally {
+      await wcdbService.closeMessageCursor(cursor)
+    }
+
+    return counters
+  }
+
+  private async collectSessionExportStatsByCursorScan(
+    sessionId: string,
+    selfIdentitySet: Set<string>
+  ): Promise<ExportSessionStats> {
+    const stats: ExportSessionStats = {
+      totalMessages: 0,
+      voiceMessages: 0,
+      imageMessages: 0,
+      videoMessages: 0,
+      emojiMessages: 0,
+      transferMessages: 0,
+      redPacketMessages: 0,
+      callMessages: 0
+    }
+    if (sessionId.endsWith('@chatroom')) {
+      stats.groupMyMessages = 0
+      stats.groupActiveSpeakers = 0
+    }
+
+    const senderIdentities = new Set<string>()
+    const cursorResult = await wcdbService.openMessageCursorLite(sessionId, 500, false, 0, 0)
+    if (!cursorResult.success || !cursorResult.cursor) {
+      return stats
+    }
+
+    const cursor = cursorResult.cursor
+    try {
+      while (true) {
+        const batch = await wcdbService.fetchMessageBatch(cursor)
+        if (!batch.success) {
+          break
+        }
+
+        const rows = Array.isArray(batch.rows) ? batch.rows as Record<string, any>[] : []
+        for (const row of rows) {
+          stats.totalMessages += 1
+
+          const localType = this.getRowInt(row, ['local_type', 'localType', 'type', 'msg_type', 'msgType', 'WCDB_CT_local_type'], 1)
+          if (localType === 34) stats.voiceMessages += 1
+          if (localType === 3) stats.imageMessages += 1
+          if (localType === 43) stats.videoMessages += 1
+          if (localType === 47) stats.emojiMessages += 1
+          if (localType === 50) stats.callMessages += 1
+          if (localType === 8589934592049) stats.transferMessages += 1
+          if (localType === 8594229559345) stats.redPacketMessages += 1
+          if (localType === 49) {
+            const rawMessageContent = this.getRowField(row, ['message_content', 'messageContent', 'msg_content', 'msgContent', 'content', 'WCDB_CT_message_content'])
+            const rawCompressContent = this.getRowField(row, ['compress_content', 'compressContent', 'compressed_content', 'compressedContent', 'WCDB_CT_compress_content'])
+            const content = this.decodeMessageContent(rawMessageContent, rawCompressContent)
+            const xmlType = this.extractType49XmlTypeForStats(content)
+            if (xmlType === '2000') stats.transferMessages += 1
+            if (xmlType === '2001') stats.redPacketMessages += 1
+          }
+
+          const createTime = this.getRowInt(
+            row,
+            ['create_time', 'createTime', 'createtime', 'msg_create_time', 'msgCreateTime', 'msg_time', 'msgTime', 'time', 'WCDB_CT_create_time'],
+            0
+          )
+          if (createTime > 0) {
+            if (stats.firstTimestamp === undefined || createTime < stats.firstTimestamp) {
+              stats.firstTimestamp = createTime
+            }
+            if (stats.lastTimestamp === undefined || createTime > stats.lastTimestamp) {
+              stats.lastTimestamp = createTime
+            }
+          }
+
+          if (sessionId.endsWith('@chatroom')) {
+            const sender = String(this.getRowField(row, ['sender_username', 'senderUsername', 'sender', 'WCDB_CT_sender_username']) || '').trim()
+            const senderKeys = this.buildIdentityKeys(sender)
+            if (senderKeys.length > 0) {
+              senderIdentities.add(senderKeys[0])
+              if (senderKeys.some((key) => selfIdentitySet.has(key))) {
+                stats.groupMyMessages = (stats.groupMyMessages || 0) + 1
+              }
+            } else {
+              const isSend = this.coerceRowNumber(this.getRowField(row, ['computed_is_send', 'computedIsSend', 'is_send', 'isSend', 'WCDB_CT_is_send']))
+              if (Number.isFinite(isSend) && isSend === 1) {
+                stats.groupMyMessages = (stats.groupMyMessages || 0) + 1
+              }
+            }
+          }
+        }
+
+        if (!batch.hasMore || rows.length === 0) {
+          break
+        }
+      }
+    } finally {
+      await wcdbService.closeMessageCursor(cursor)
+    }
+
+    if (sessionId.endsWith('@chatroom')) {
+      stats.groupActiveSpeakers = senderIdentities.size
+      if (Number.isFinite(stats.groupMyMessages)) {
+        this.setGroupMyMessageCountHintEntry(sessionId, stats.groupMyMessages as number)
+      }
+    }
+    return stats
+  }
+
+  private async collectSessionExportStats(
+    sessionId: string,
+    selfIdentitySet: Set<string>,
+    preferAccurateSpecialTypes: boolean = false
+  ): Promise<ExportSessionStats> {
+    const stats: ExportSessionStats = {
+      totalMessages: 0,
+      voiceMessages: 0,
+      imageMessages: 0,
+      videoMessages: 0,
+      emojiMessages: 0,
+      transferMessages: 0,
+      redPacketMessages: 0,
+      callMessages: 0
+    }
+    if (sessionId.endsWith('@chatroom')) {
+      stats.groupMyMessages = 0
+      stats.groupActiveSpeakers = 0
+    }
+
+    const tables = await this.getSessionMessageTables(sessionId)
+    if (tables.length === 0) {
+      return stats
+    }
+
+    const senderIdentities = new Set<string>()
+    let aggregatedTableCount = 0
+    const isGroup = sessionId.endsWith('@chatroom')
+    const escapedSelfKeys = Array.from(selfIdentitySet)
+      .filter(Boolean)
+      .map((key) => `'${this.escapeSqlLiteral(key.toLowerCase())}'`)
+
+    for (const { tableName, dbPath } of tables) {
+      const columnSet = await this.getMessageTableColumns(dbPath, tableName)
+      if (columnSet.size === 0) continue
+
+      const typeCol = this.pickFirstColumn(columnSet, ['local_type', 'type', 'msg_type', 'msgtype'])
+      const timeCol = this.pickFirstColumn(columnSet, ['create_time', 'createtime', 'msg_create_time', 'time'])
+      const senderCol = this.pickFirstColumn(columnSet, ['sender_username', 'senderusername', 'sender'])
+      const isSendCol = this.pickFirstColumn(columnSet, ['computed_is_send', 'computedissend', 'is_send', 'issend'])
+
+      const selectParts: string[] = [
+        'COUNT(*) AS total_messages',
+        typeCol ? `SUM(CASE WHEN ${this.quoteSqlIdentifier(typeCol)} = 34 THEN 1 ELSE 0 END) AS voice_messages` : '0 AS voice_messages',
+        typeCol ? `SUM(CASE WHEN ${this.quoteSqlIdentifier(typeCol)} = 3 THEN 1 ELSE 0 END) AS image_messages` : '0 AS image_messages',
+        typeCol ? `SUM(CASE WHEN ${this.quoteSqlIdentifier(typeCol)} = 43 THEN 1 ELSE 0 END) AS video_messages` : '0 AS video_messages',
+        typeCol ? `SUM(CASE WHEN ${this.quoteSqlIdentifier(typeCol)} = 47 THEN 1 ELSE 0 END) AS emoji_messages` : '0 AS emoji_messages',
+        typeCol ? `SUM(CASE WHEN ${this.quoteSqlIdentifier(typeCol)} = 50 THEN 1 ELSE 0 END) AS call_messages` : '0 AS call_messages',
+        typeCol ? `SUM(CASE WHEN ${this.quoteSqlIdentifier(typeCol)} = 8589934592049 THEN 1 ELSE 0 END) AS transfer_messages` : '0 AS transfer_messages',
+        typeCol ? `SUM(CASE WHEN ${this.quoteSqlIdentifier(typeCol)} = 8594229559345 THEN 1 ELSE 0 END) AS red_packet_messages` : '0 AS red_packet_messages',
+        timeCol ? `MIN(${this.quoteSqlIdentifier(timeCol)}) AS first_timestamp` : 'NULL AS first_timestamp',
+        timeCol ? `MAX(${this.quoteSqlIdentifier(timeCol)}) AS last_timestamp` : 'NULL AS last_timestamp'
+      ]
+
+      if (isGroup) {
+        if (senderCol) {
+          const normalizedSender = `LOWER(TRIM(CAST(${this.quoteSqlIdentifier(senderCol)} AS TEXT)))`
+          if (escapedSelfKeys.length > 0 && isSendCol) {
+            selectParts.push(
+              `SUM(CASE WHEN ${normalizedSender} != '' THEN CASE WHEN ${normalizedSender} IN (${escapedSelfKeys.join(', ')}) THEN 1 ELSE 0 END ELSE CASE WHEN ${this.quoteSqlIdentifier(isSendCol)} = 1 THEN 1 ELSE 0 END END) AS group_my_messages`
+            )
+          } else if (escapedSelfKeys.length > 0) {
+            selectParts.push(`SUM(CASE WHEN ${normalizedSender} IN (${escapedSelfKeys.join(', ')}) THEN 1 ELSE 0 END) AS group_my_messages`)
+          } else if (isSendCol) {
+            selectParts.push(`SUM(CASE WHEN ${this.quoteSqlIdentifier(isSendCol)} = 1 THEN 1 ELSE 0 END) AS group_my_messages`)
+          } else {
+            selectParts.push('0 AS group_my_messages')
+          }
+        } else if (isSendCol) {
+          selectParts.push(`SUM(CASE WHEN ${this.quoteSqlIdentifier(isSendCol)} = 1 THEN 1 ELSE 0 END) AS group_my_messages`)
+        } else {
+          selectParts.push('0 AS group_my_messages')
+        }
+
+        const aggregateSql = `SELECT ${selectParts.join(', ')} FROM ${this.quoteSqlIdentifier(tableName)}`
+        const aggregateResult = await wcdbService.execQuery('message', dbPath, aggregateSql)
+        if (!aggregateResult.success || !aggregateResult.rows || aggregateResult.rows.length === 0) {
+          continue
+        }
+
+        const aggregateRow = aggregateResult.rows[0] as Record<string, any>
+        aggregatedTableCount += 1
+        stats.totalMessages += this.getRowInt(aggregateRow, ['total_messages', 'totalMessages'], 0)
+        stats.voiceMessages += this.getRowInt(aggregateRow, ['voice_messages', 'voiceMessages'], 0)
+        stats.imageMessages += this.getRowInt(aggregateRow, ['image_messages', 'imageMessages'], 0)
+        stats.videoMessages += this.getRowInt(aggregateRow, ['video_messages', 'videoMessages'], 0)
+        stats.emojiMessages += this.getRowInt(aggregateRow, ['emoji_messages', 'emojiMessages'], 0)
+        stats.callMessages += this.getRowInt(aggregateRow, ['call_messages', 'callMessages'], 0)
+        stats.transferMessages += this.getRowInt(aggregateRow, ['transfer_messages', 'transferMessages'], 0)
+        stats.redPacketMessages += this.getRowInt(aggregateRow, ['red_packet_messages', 'redPacketMessages'], 0)
+
+        const firstTs = this.getRowInt(aggregateRow, ['first_timestamp', 'firstTimestamp'], 0)
+        if (firstTs > 0 && (stats.firstTimestamp === undefined || firstTs < stats.firstTimestamp)) {
+          stats.firstTimestamp = firstTs
+        }
+        const lastTs = this.getRowInt(aggregateRow, ['last_timestamp', 'lastTimestamp'], 0)
+        if (lastTs > 0 && (stats.lastTimestamp === undefined || lastTs > stats.lastTimestamp)) {
+          stats.lastTimestamp = lastTs
+        }
+        stats.groupMyMessages = (stats.groupMyMessages || 0) + this.getRowInt(aggregateRow, ['group_my_messages', 'groupMyMessages'], 0)
+
+        if (senderCol) {
+          const normalizedSender = `LOWER(TRIM(CAST(${this.quoteSqlIdentifier(senderCol)} AS TEXT)))`
+          const distinctSenderSql = `SELECT DISTINCT ${normalizedSender} AS sender_identity FROM ${this.quoteSqlIdentifier(tableName)} WHERE ${normalizedSender} != ''`
+          const senderResult = await wcdbService.execQuery('message', dbPath, distinctSenderSql)
+          if (senderResult.success && senderResult.rows) {
+            for (const row of senderResult.rows as Record<string, any>[]) {
+              const senderIdentity = String(this.getRowField(row, ['sender_identity', 'senderIdentity']) || '').trim()
+              if (!senderIdentity) continue
+              senderIdentities.add(senderIdentity)
+            }
+          }
+        }
+      } else {
+        const aggregateSql = `SELECT ${selectParts.join(', ')} FROM ${this.quoteSqlIdentifier(tableName)}`
+        const aggregateResult = await wcdbService.execQuery('message', dbPath, aggregateSql)
+        if (!aggregateResult.success || !aggregateResult.rows || aggregateResult.rows.length === 0) {
+          continue
+        }
+        const aggregateRow = aggregateResult.rows[0] as Record<string, any>
+        aggregatedTableCount += 1
+        stats.totalMessages += this.getRowInt(aggregateRow, ['total_messages', 'totalMessages'], 0)
+        stats.voiceMessages += this.getRowInt(aggregateRow, ['voice_messages', 'voiceMessages'], 0)
+        stats.imageMessages += this.getRowInt(aggregateRow, ['image_messages', 'imageMessages'], 0)
+        stats.videoMessages += this.getRowInt(aggregateRow, ['video_messages', 'videoMessages'], 0)
+        stats.emojiMessages += this.getRowInt(aggregateRow, ['emoji_messages', 'emojiMessages'], 0)
+        stats.callMessages += this.getRowInt(aggregateRow, ['call_messages', 'callMessages'], 0)
+        stats.transferMessages += this.getRowInt(aggregateRow, ['transfer_messages', 'transferMessages'], 0)
+        stats.redPacketMessages += this.getRowInt(aggregateRow, ['red_packet_messages', 'redPacketMessages'], 0)
+
+        const firstTs = this.getRowInt(aggregateRow, ['first_timestamp', 'firstTimestamp'], 0)
+        if (firstTs > 0 && (stats.firstTimestamp === undefined || firstTs < stats.firstTimestamp)) {
+          stats.firstTimestamp = firstTs
+        }
+        const lastTs = this.getRowInt(aggregateRow, ['last_timestamp', 'lastTimestamp'], 0)
+        if (lastTs > 0 && (stats.lastTimestamp === undefined || lastTs > stats.lastTimestamp)) {
+          stats.lastTimestamp = lastTs
+        }
+      }
+    }
+
+    if (aggregatedTableCount === 0) {
+      return this.collectSessionExportStatsByCursorScan(sessionId, selfIdentitySet)
+    }
+
+    if (preferAccurateSpecialTypes) {
+      try {
+        const preciseCounters = await this.collectSpecialMessageCountsByCursorScan(sessionId)
+        stats.transferMessages = preciseCounters.transferMessages
+        stats.redPacketMessages = preciseCounters.redPacketMessages
+        stats.callMessages = preciseCounters.callMessages
+      } catch {
+        // 保留聚合统计结果作为兜底
+      }
+    }
+
+    if (isGroup) {
+      stats.groupActiveSpeakers = senderIdentities.size
+      if (Number.isFinite(stats.groupMyMessages)) {
+        this.setGroupMyMessageCountHintEntry(sessionId, stats.groupMyMessages as number)
+      }
+    }
+    return stats
+  }
+
+  private async buildGroupRelationStats(
+    groupSessionIds: string[],
+    privateSessionIds: string[],
+    selfIdentitySet: Set<string>
+  ): Promise<{
+    privateMutualGroupMap: Record<string, number>
+    groupMutualFriendMap: Record<string, number>
+  }> {
+    const privateMutualGroupMap: Record<string, number> = {}
+    const groupMutualFriendMap: Record<string, number> = {}
+    if (groupSessionIds.length === 0) {
+      return { privateMutualGroupMap, groupMutualFriendMap }
+    }
+
+    const privateIndex = new Map<string, Set<string>>()
+    for (const sessionId of privateSessionIds) {
+      for (const key of this.buildIdentityKeys(sessionId)) {
+        const set = privateIndex.get(key) || new Set<string>()
+        set.add(sessionId)
+        privateIndex.set(key, set)
+      }
+      privateMutualGroupMap[sessionId] = 0
+    }
+
+    const friendIdentitySet = await this.getFriendIdentitySet()
+    await this.forEachWithConcurrency(groupSessionIds, 4, async (groupId) => {
+      const membersResult = await wcdbService.getGroupMembers(groupId)
+      if (!membersResult.success || !membersResult.members) {
+        groupMutualFriendMap[groupId] = 0
+        return
+      }
+
+      const touchedPrivateSessions = new Set<string>()
+      const friendMembers = new Set<string>()
+
+      for (const member of membersResult.members) {
+        const username = this.extractGroupMemberUsername(member)
+        const identityKeys = this.buildIdentityKeys(username)
+        if (identityKeys.length === 0) continue
+        const canonical = identityKeys[0]
+
+        if (!selfIdentitySet.has(canonical) && friendIdentitySet.has(canonical)) {
+          friendMembers.add(canonical)
+        }
+
+        for (const key of identityKeys) {
+          const linked = privateIndex.get(key)
+          if (!linked) continue
+          for (const sessionId of linked) {
+            touchedPrivateSessions.add(sessionId)
+          }
+        }
+      }
+
+      groupMutualFriendMap[groupId] = friendMembers.size
+      for (const sessionId of touchedPrivateSessions) {
+        privateMutualGroupMap[sessionId] = (privateMutualGroupMap[sessionId] || 0) + 1
+      }
+    })
+
+    return { privateMutualGroupMap, groupMutualFriendMap }
+  }
+
+  private buildEmptyExportSessionStats(sessionId: string, includeRelations: boolean): ExportSessionStats {
+    const isGroup = sessionId.endsWith('@chatroom')
+    const stats: ExportSessionStats = {
+      totalMessages: 0,
+      voiceMessages: 0,
+      imageMessages: 0,
+      videoMessages: 0,
+      emojiMessages: 0,
+      transferMessages: 0,
+      redPacketMessages: 0,
+      callMessages: 0
+    }
+    if (isGroup) {
+      stats.groupMyMessages = 0
+      stats.groupActiveSpeakers = 0
+      stats.groupMemberCount = 0
+      if (includeRelations) {
+        stats.groupMutualFriends = 0
+      }
+    } else if (includeRelations) {
+      stats.privateMutualGroups = 0
+    }
+    return stats
+  }
+
+  private async computeSessionExportStats(
+    sessionId: string,
+    selfIdentitySet: Set<string>,
+    includeRelations: boolean,
+    preferAccurateSpecialTypes: boolean = false
+  ): Promise<ExportSessionStats> {
+    const stats = await this.collectSessionExportStats(sessionId, selfIdentitySet, preferAccurateSpecialTypes)
+    const isGroup = sessionId.endsWith('@chatroom')
+
+    if (isGroup) {
+      const memberCountsResult = await wcdbService.getGroupMemberCounts([sessionId])
+      const memberCountMap = memberCountsResult.success && memberCountsResult.map ? memberCountsResult.map : {}
+      stats.groupMemberCount = typeof memberCountMap[sessionId] === 'number' ? Math.max(0, Math.floor(memberCountMap[sessionId])) : 0
+    }
+
+    if (includeRelations) {
+      if (isGroup) {
+        try {
+          const { groupMutualFriendMap } = await this.buildGroupRelationStats([sessionId], [], selfIdentitySet)
+          stats.groupMutualFriends = groupMutualFriendMap[sessionId] || 0
+        } catch {
+          stats.groupMutualFriends = 0
+        }
+      } else {
+        const allGroups = await this.listAllGroupSessionIds()
+        if (allGroups.length === 0) {
+          stats.privateMutualGroups = 0
+        } else {
+          try {
+            const { privateMutualGroupMap } = await this.buildGroupRelationStats(allGroups, [sessionId], selfIdentitySet)
+            stats.privateMutualGroups = privateMutualGroupMap[sessionId] || 0
+          } catch {
+            stats.privateMutualGroups = 0
+          }
+        }
+      }
+    }
+
+    return stats
+  }
+
+  private async computeSessionExportStatsBatch(
+    sessionIds: string[],
+    includeRelations: boolean,
+    selfIdentitySet: Set<string>,
+    preferAccurateSpecialTypes: boolean = false
+  ): Promise<Record<string, ExportSessionStats>> {
+    const normalizedSessionIds = Array.from(
+      new Set(
+        (sessionIds || [])
+          .map((id) => String(id || '').trim())
+          .filter(Boolean)
+      )
+    )
+    const result: Record<string, ExportSessionStats> = {}
+    if (normalizedSessionIds.length === 0) {
+      return result
+    }
+
+    const groupSessionIds = normalizedSessionIds.filter(sessionId => sessionId.endsWith('@chatroom'))
+    const privateSessionIds = normalizedSessionIds.filter(sessionId => !sessionId.endsWith('@chatroom'))
+
+    let memberCountMap: Record<string, number> = {}
+    if (groupSessionIds.length > 0) {
+      try {
+        const memberCountsResult = await wcdbService.getGroupMemberCounts(groupSessionIds)
+        memberCountMap = memberCountsResult.success && memberCountsResult.map ? memberCountsResult.map : {}
+      } catch {
+        memberCountMap = {}
+      }
+    }
+
+    let privateMutualGroupMap: Record<string, number> = {}
+    let groupMutualFriendMap: Record<string, number> = {}
+    if (includeRelations) {
+      let relationGroupSessionIds: string[] = []
+      if (privateSessionIds.length > 0) {
+        const allGroups = await this.listAllGroupSessionIds()
+        relationGroupSessionIds = Array.from(new Set([...allGroups, ...groupSessionIds]))
+      } else if (groupSessionIds.length > 0) {
+        relationGroupSessionIds = groupSessionIds
+      }
+
+      if (relationGroupSessionIds.length > 0) {
+        try {
+          const relation = await this.buildGroupRelationStats(
+            relationGroupSessionIds,
+            privateSessionIds,
+            selfIdentitySet
+          )
+          privateMutualGroupMap = relation.privateMutualGroupMap || {}
+          groupMutualFriendMap = relation.groupMutualFriendMap || {}
+        } catch {
+          privateMutualGroupMap = {}
+          groupMutualFriendMap = {}
+        }
+      }
+    }
+
+    await this.forEachWithConcurrency(normalizedSessionIds, 3, async (sessionId) => {
+      try {
+        const stats = await this.collectSessionExportStats(sessionId, selfIdentitySet, preferAccurateSpecialTypes)
+        if (sessionId.endsWith('@chatroom')) {
+          stats.groupMemberCount = typeof memberCountMap[sessionId] === 'number'
+            ? Math.max(0, Math.floor(memberCountMap[sessionId]))
+            : 0
+          if (includeRelations) {
+            stats.groupMutualFriends = typeof groupMutualFriendMap[sessionId] === 'number'
+              ? Math.max(0, Math.floor(groupMutualFriendMap[sessionId]))
+              : 0
+          }
+        } else if (includeRelations) {
+          stats.privateMutualGroups = typeof privateMutualGroupMap[sessionId] === 'number'
+            ? Math.max(0, Math.floor(privateMutualGroupMap[sessionId]))
+            : 0
+        }
+        result[sessionId] = stats
+      } catch {
+        result[sessionId] = this.buildEmptyExportSessionStats(sessionId, includeRelations)
+      }
+    })
+
+    return result
+  }
+
+  private async getOrComputeSessionExportStats(
+    sessionId: string,
+    includeRelations: boolean,
+    selfIdentitySet: Set<string>,
+    preferAccurateSpecialTypes: boolean = false
+  ): Promise<ExportSessionStats> {
+    if (preferAccurateSpecialTypes) {
+      return this.computeSessionExportStats(sessionId, selfIdentitySet, includeRelations, true)
+    }
+
+    const scopedKey = this.buildScopedSessionStatsKey(sessionId)
+
+    if (!includeRelations) {
+      const pendingFull = this.sessionStatsPendingFull.get(scopedKey)
+      if (pendingFull) return pendingFull
+      const pendingBasic = this.sessionStatsPendingBasic.get(scopedKey)
+      if (pendingBasic) return pendingBasic
+    } else {
+      const pendingFull = this.sessionStatsPendingFull.get(scopedKey)
+      if (pendingFull) return pendingFull
+    }
+
+    const targetMap = includeRelations ? this.sessionStatsPendingFull : this.sessionStatsPendingBasic
+    const pending = this.computeSessionExportStats(sessionId, selfIdentitySet, includeRelations, false)
+    targetMap.set(scopedKey, pending)
+    try {
+      return await pending
+    } finally {
+      targetMap.delete(scopedKey)
+    }
+  }
+
   /**
    * HTTP API 复用消息解析逻辑，确保和应用内展示一致。
    */
@@ -1224,9 +3024,33 @@ class ChatService {
       let fileSize: number | undefined
       let fileExt: string | undefined
       let xmlType: string | undefined
+      let appMsgKind: string | undefined
+      let appMsgDesc: string | undefined
+      let appMsgAppName: string | undefined
+      let appMsgSourceName: string | undefined
+      let appMsgSourceUsername: string | undefined
+      let appMsgThumbUrl: string | undefined
+      let appMsgMusicUrl: string | undefined
+      let appMsgDataUrl: string | undefined
+      let appMsgLocationLabel: string | undefined
+      let finderNickname: string | undefined
+      let finderUsername: string | undefined
+      let finderCoverUrl: string | undefined
+      let finderAvatar: string | undefined
+      let finderDuration: number | undefined
+      let locationLat: number | undefined
+      let locationLng: number | undefined
+      let locationPoiname: string | undefined
+      let locationLabel: string | undefined
+      let musicAlbumUrl: string | undefined
+      let musicUrl: string | undefined
+      let giftImageUrl: string | undefined
+      let giftWish: string | undefined
+      let giftPrice: string | undefined
       // 名片消息
       let cardUsername: string | undefined
       let cardNickname: string | undefined
+      let cardAvatarUrl: string | undefined
       // 转账消息
       let transferPayerUsername: string | undefined
       let transferReceiverUsername: string | undefined
@@ -1264,6 +3088,15 @@ class ChatService {
         const cardInfo = this.parseCardInfo(content)
         cardUsername = cardInfo.username
         cardNickname = cardInfo.nickname
+        cardAvatarUrl = cardInfo.avatarUrl
+      } else if (localType === 48 && content) {
+        // 位置消息
+        const latStr = this.extractXmlAttribute(content, 'location', 'x') || this.extractXmlAttribute(content, 'location', 'latitude')
+        const lngStr = this.extractXmlAttribute(content, 'location', 'y') || this.extractXmlAttribute(content, 'location', 'longitude')
+        if (latStr) { const v = parseFloat(latStr); if (Number.isFinite(v)) locationLat = v }
+        if (lngStr) { const v = parseFloat(lngStr); if (Number.isFinite(v)) locationLng = v }
+        locationLabel = this.extractXmlAttribute(content, 'location', 'label') || this.extractXmlValue(content, 'label') || undefined
+        locationPoiname = this.extractXmlAttribute(content, 'location', 'poiname') || this.extractXmlValue(content, 'poiname') || undefined
       } else if ((localType === 49 || localType === 8589934592049) && content) {
         // Type 49 消息（链接、文件、小程序、转账等），8589934592049 也是转账类型
         const type49Info = this.parseType49Message(content)
@@ -1278,10 +3111,54 @@ class ChatService {
         chatRecordList = type49Info.chatRecordList
         transferPayerUsername = type49Info.transferPayerUsername
         transferReceiverUsername = type49Info.transferReceiverUsername
+        // 引用消息（appmsg type=57）的 quotedContent/quotedSender
+        if (type49Info.quotedContent !== undefined) quotedContent = type49Info.quotedContent
+        if (type49Info.quotedSender !== undefined) quotedSender = type49Info.quotedSender
       } else if (localType === 244813135921 || (content && content.includes('<type>57</type>'))) {
         const quoteInfo = this.parseQuoteMessage(content)
         quotedContent = quoteInfo.content
         quotedSender = quoteInfo.sender
+      }
+
+      const looksLikeAppMsg = Boolean(content && (content.includes('<appmsg') || content.includes('&lt;appmsg')))
+      if (looksLikeAppMsg) {
+        const type49Info = this.parseType49Message(content)
+        xmlType = xmlType || type49Info.xmlType
+        linkTitle = linkTitle || type49Info.linkTitle
+        linkUrl = linkUrl || type49Info.linkUrl
+        linkThumb = linkThumb || type49Info.linkThumb
+        fileName = fileName || type49Info.fileName
+        fileSize = fileSize ?? type49Info.fileSize
+        fileExt = fileExt || type49Info.fileExt
+        appMsgKind = appMsgKind || type49Info.appMsgKind
+        appMsgDesc = appMsgDesc || type49Info.appMsgDesc
+        appMsgAppName = appMsgAppName || type49Info.appMsgAppName
+        appMsgSourceName = appMsgSourceName || type49Info.appMsgSourceName
+        appMsgSourceUsername = appMsgSourceUsername || type49Info.appMsgSourceUsername
+        appMsgThumbUrl = appMsgThumbUrl || type49Info.appMsgThumbUrl
+        appMsgMusicUrl = appMsgMusicUrl || type49Info.appMsgMusicUrl
+        appMsgDataUrl = appMsgDataUrl || type49Info.appMsgDataUrl
+        appMsgLocationLabel = appMsgLocationLabel || type49Info.appMsgLocationLabel
+        finderNickname = finderNickname || type49Info.finderNickname
+        finderUsername = finderUsername || type49Info.finderUsername
+        finderCoverUrl = finderCoverUrl || type49Info.finderCoverUrl
+        finderAvatar = finderAvatar || type49Info.finderAvatar
+        finderDuration = finderDuration ?? type49Info.finderDuration
+        locationLat = locationLat ?? type49Info.locationLat
+        locationLng = locationLng ?? type49Info.locationLng
+        locationPoiname = locationPoiname || type49Info.locationPoiname
+        locationLabel = locationLabel || type49Info.locationLabel
+        musicAlbumUrl = musicAlbumUrl || type49Info.musicAlbumUrl
+        musicUrl = musicUrl || type49Info.musicUrl
+        giftImageUrl = giftImageUrl || type49Info.giftImageUrl
+        giftWish = giftWish || type49Info.giftWish
+        giftPrice = giftPrice || type49Info.giftPrice
+        chatRecordTitle = chatRecordTitle || type49Info.chatRecordTitle
+        chatRecordList = chatRecordList || type49Info.chatRecordList
+        transferPayerUsername = transferPayerUsername || type49Info.transferPayerUsername
+        transferReceiverUsername = transferReceiverUsername || type49Info.transferReceiverUsername
+        if (!quotedContent && type49Info.quotedContent !== undefined) quotedContent = type49Info.quotedContent
+        if (!quotedSender && type49Info.quotedSender !== undefined) quotedSender = type49Info.quotedSender
       }
 
       messages.push({
@@ -1312,8 +3189,32 @@ class ChatService {
         fileSize,
         fileExt,
         xmlType,
+        appMsgKind,
+        appMsgDesc,
+        appMsgAppName,
+        appMsgSourceName,
+        appMsgSourceUsername,
+        appMsgThumbUrl,
+        appMsgMusicUrl,
+        appMsgDataUrl,
+        appMsgLocationLabel,
+        finderNickname,
+        finderUsername,
+        finderCoverUrl,
+        finderAvatar,
+        finderDuration,
+        locationLat,
+        locationLng,
+        locationPoiname,
+        locationLabel,
+        musicAlbumUrl,
+        musicUrl,
+        giftImageUrl,
+        giftWish,
+        giftPrice,
         cardUsername,
         cardNickname,
+        cardAvatarUrl,
         transferPayerUsername,
         transferReceiverUsername,
         chatRecordTitle,
@@ -1350,6 +3251,7 @@ class ChatService {
 
     // 检查 XML type，用于识别引用消息等
     const xmlType = this.extractXmlValue(content, 'type')
+    const looksLikeAppMsg = content.includes('<appmsg') || content.includes('&lt;appmsg')
 
     switch (localType) {
       case 1:
@@ -1364,8 +3266,14 @@ class ChatService {
         return '[视频]'
       case 47:
         return '[动画表情]'
-      case 48:
-        return '[位置]'
+      case 48: {
+        const label =
+          this.extractXmlAttribute(content, 'location', 'label') ||
+          this.extractXmlAttribute(content, 'location', 'poiname') ||
+          this.extractXmlValue(content, 'label') ||
+          this.extractXmlValue(content, 'poiname')
+        return label ? `[位置] ${label}` : '[位置]'
+      }
       case 49:
         return this.parseType49(content)
       case 50:
@@ -1400,6 +3308,10 @@ class ChatService {
           return title || '[引用消息]'
         }
 
+        if (looksLikeAppMsg) {
+          return this.parseType49(content)
+        }
+
         // 尝试从 XML 提取通用 title
         const genericTitle = this.extractXmlValue(content, 'title')
         if (genericTitle && genericTitle.length > 0 && genericTitle.length < 100) {
@@ -1415,7 +3327,34 @@ class ChatService {
 
   private parseType49(content: string): string {
     const title = this.extractXmlValue(content, 'title')
-    const type = this.extractXmlValue(content, 'type')
+    // 从 appmsg 直接子节点提取 type，避免匹配到 refermsg 内部的 <type>
+    let type = ''
+    const appmsgMatch = /<appmsg[\s\S]*?>([\s\S]*?)<\/appmsg>/i.exec(content)
+    if (appmsgMatch) {
+      const inner = appmsgMatch[1]
+        .replace(/<refermsg[\s\S]*?<\/refermsg>/gi, '')
+        .replace(/<patMsg[\s\S]*?<\/patMsg>/gi, '')
+      const typeMatch = /<type>([\s\S]*?)<\/type>/i.exec(inner)
+      if (typeMatch) type = typeMatch[1].trim()
+    }
+    if (!type) type = this.extractXmlValue(content, 'type')
+    const normalized = content.toLowerCase()
+    const locationLabel =
+      this.extractXmlAttribute(content, 'location', 'label') ||
+      this.extractXmlAttribute(content, 'location', 'poiname') ||
+      this.extractXmlValue(content, 'label') ||
+      this.extractXmlValue(content, 'poiname')
+    const isFinder =
+      type === '51' ||
+      normalized.includes('<finder') ||
+      normalized.includes('finderusername') ||
+      normalized.includes('finderobjectid')
+    const isRedPacket = type === '2001' || normalized.includes('hongbao')
+    const isMusic =
+      type === '3' ||
+      normalized.includes('<musicurl>') ||
+      normalized.includes('<playurl>') ||
+      normalized.includes('<dataurl>')
 
     // 群公告消息（type 87）特殊处理
     if (type === '87') {
@@ -1424,6 +3363,19 @@ class ChatService {
         return `[群公告] ${textAnnouncement}`
       }
       return '[群公告]'
+    }
+
+    if (isFinder) {
+      return title ? `[视频号] ${title}` : '[视频号]'
+    }
+    if (isRedPacket) {
+      return title ? `[红包] ${title}` : '[红包]'
+    }
+    if (locationLabel) {
+      return `[位置] ${locationLabel}`
+    }
+    if (isMusic) {
+      return title ? `[音乐] ${title}` : '[音乐]'
     }
 
     if (title) {
@@ -1443,6 +3395,8 @@ class ChatService {
           return title
         case '2000':
           return `[转账] ${title}`
+        case '2001':
+          return `[红包] ${title}`
         default:
           return title
       }
@@ -1459,6 +3413,13 @@ class ChatService {
         return '[小程序]'
       case '2000':
         return '[转账]'
+      case '2001':
+        return '[红包]'
+      case '3':
+        return '[音乐]'
+      case '5':
+      case '49':
+        return '[链接]'
       case '87':
         return '[群公告]'
       default:
@@ -1554,13 +3515,19 @@ class ChatService {
     if (!content) return undefined
 
     try {
-      // 提取 md5，这是用于查询 hardlink.db 的值
-      const md5 =
-        this.extractXmlAttribute(content, 'videomsg', 'md5') ||
-        this.extractXmlValue(content, 'md5') ||
-        undefined
+      // 优先取 md5 属性（收到的视频）
+      const md5 = this.extractXmlAttribute(content, 'videomsg', 'md5')
+      if (md5) return md5.toLowerCase()
 
-      return md5?.toLowerCase()
+      // 自己发的视频没有 md5，只有 rawmd5
+      const rawMd5 = this.extractXmlAttribute(content, 'videomsg', 'rawmd5')
+      if (rawMd5) return rawMd5.toLowerCase()
+
+      // 兜底：<md5> 标签
+      const tagMd5 = this.extractXmlValue(content, 'md5')
+      if (tagMd5) return tagMd5.toLowerCase()
+
+      return undefined
     } catch {
       return undefined
     }
@@ -1764,7 +3731,7 @@ class ChatService {
    * 解析名片消息
    * 格式: <msg username="wxid_xxx" nickname="昵称" ... />
    */
-  private parseCardInfo(content: string): { username?: string; nickname?: string } {
+  private parseCardInfo(content: string): { username?: string; nickname?: string; avatarUrl?: string } {
     try {
       if (!content) return {}
 
@@ -1774,7 +3741,11 @@ class ChatService {
       // 提取 nickname
       const nickname = this.extractXmlAttribute(content, 'msg', 'nickname') || undefined
 
-      return { username, nickname }
+      // 提取头像
+      const avatarUrl = this.extractXmlAttribute(content, 'msg', 'bigheadimgurl') ||
+        this.extractXmlAttribute(content, 'msg', 'smallheadimgurl') || undefined
+
+      return { username, nickname, avatarUrl }
     } catch (e) {
       console.error('[ChatService] 名片解析失败:', e)
       return {}
@@ -1787,9 +3758,35 @@ class ChatService {
    */
   private parseType49Message(content: string): {
     xmlType?: string
+    quotedContent?: string
+    quotedSender?: string
     linkTitle?: string
     linkUrl?: string
     linkThumb?: string
+    appMsgKind?: string
+    appMsgDesc?: string
+    appMsgAppName?: string
+    appMsgSourceName?: string
+    appMsgSourceUsername?: string
+    appMsgThumbUrl?: string
+    appMsgMusicUrl?: string
+    appMsgDataUrl?: string
+    appMsgLocationLabel?: string
+    finderNickname?: string
+    finderUsername?: string
+    finderCoverUrl?: string
+    finderAvatar?: string
+    finderDuration?: number
+    locationLat?: number
+    locationLng?: number
+    locationPoiname?: string
+    locationLabel?: string
+    musicAlbumUrl?: string
+    musicUrl?: string
+    giftImageUrl?: string
+    giftWish?: string
+    giftPrice?: string
+    cardAvatarUrl?: string
     fileName?: string
     fileSize?: number
     fileExt?: string
@@ -1807,8 +3804,20 @@ class ChatService {
     try {
       if (!content) return {}
 
-      // 提取 appmsg 中的 type
-      const xmlType = this.extractXmlValue(content, 'type')
+      // 提取 appmsg 直接子节点的 type，避免匹配到 refermsg 内部的 <type>
+      // 先尝试从 <appmsg>...</appmsg> 块内提取，再用正则跳过嵌套标签
+      let xmlType = ''
+      const appmsgMatch = /<appmsg[\s\S]*?>([\s\S]*?)<\/appmsg>/i.exec(content)
+      if (appmsgMatch) {
+        // 在 appmsg 内容中，找第一个 <type> 但跳过在子元素内部的（如 refermsg > type）
+        // 策略：去掉所有嵌套块（refermsg、patMsg 等），再提取 type
+        const appmsgInner = appmsgMatch[1]
+          .replace(/<refermsg[\s\S]*?<\/refermsg>/gi, '')
+          .replace(/<patMsg[\s\S]*?<\/patMsg>/gi, '')
+        const typeMatch = /<type>([\s\S]*?)<\/type>/i.exec(appmsgInner)
+        if (typeMatch) xmlType = typeMatch[1].trim()
+      }
+      if (!xmlType) xmlType = this.extractXmlValue(content, 'type')
       if (!xmlType) return {}
 
       const result: any = { xmlType }
@@ -1816,6 +3825,128 @@ class ChatService {
       // 提取通用字段
       const title = this.extractXmlValue(content, 'title')
       const url = this.extractXmlValue(content, 'url')
+      const desc = this.extractXmlValue(content, 'des') || this.extractXmlValue(content, 'description')
+      const appName = this.extractXmlValue(content, 'appname')
+      const sourceName = this.extractXmlValue(content, 'sourcename')
+      const sourceUsername = this.extractXmlValue(content, 'sourceusername')
+      const thumbUrl =
+        this.extractXmlValue(content, 'thumburl') ||
+        this.extractXmlValue(content, 'cdnthumburl') ||
+        this.extractXmlValue(content, 'cover') ||
+        this.extractXmlValue(content, 'coverurl') ||
+        this.extractXmlValue(content, 'thumb_url')
+      const musicUrl =
+        this.extractXmlValue(content, 'musicurl') ||
+        this.extractXmlValue(content, 'playurl') ||
+        this.extractXmlValue(content, 'songalbumurl')
+      const dataUrl = this.extractXmlValue(content, 'dataurl') || this.extractXmlValue(content, 'lowurl')
+      const locationLabel =
+        this.extractXmlAttribute(content, 'location', 'label') ||
+        this.extractXmlAttribute(content, 'location', 'poiname') ||
+        this.extractXmlValue(content, 'label') ||
+        this.extractXmlValue(content, 'poiname')
+      const finderUsername =
+        this.extractXmlValue(content, 'finderusername') ||
+        this.extractXmlValue(content, 'finder_username') ||
+        this.extractXmlValue(content, 'finderuser')
+      const finderNickname =
+        this.extractXmlValue(content, 'findernickname') ||
+        this.extractXmlValue(content, 'finder_nickname')
+      const normalized = content.toLowerCase()
+      const isFinder = xmlType === '51'
+      const isRedPacket = xmlType === '2001'
+      const isMusic = xmlType === '3'
+      const isLocation = Boolean(locationLabel)
+
+      result.linkTitle = title || undefined
+      result.linkUrl = url || undefined
+      result.linkThumb = thumbUrl || undefined
+      result.appMsgDesc = desc || undefined
+      result.appMsgAppName = appName || undefined
+      result.appMsgSourceName = sourceName || undefined
+      result.appMsgSourceUsername = sourceUsername || undefined
+      result.appMsgThumbUrl = thumbUrl || undefined
+      result.appMsgMusicUrl = musicUrl || undefined
+      result.appMsgDataUrl = dataUrl || undefined
+      result.appMsgLocationLabel = locationLabel || undefined
+      result.finderUsername = finderUsername || undefined
+      result.finderNickname = finderNickname || undefined
+
+      // 视频号封面/头像/时长
+      if (isFinder) {
+        const finderCover =
+          this.extractXmlValue(content, 'thumbUrl') ||
+          this.extractXmlValue(content, 'coverUrl') ||
+          this.extractXmlValue(content, 'thumburl') ||
+          this.extractXmlValue(content, 'coverurl')
+        if (finderCover) result.finderCoverUrl = finderCover
+        const finderAvatar = this.extractXmlValue(content, 'avatar')
+        if (finderAvatar) result.finderAvatar = finderAvatar
+        const durationStr = this.extractXmlValue(content, 'videoPlayDuration') || this.extractXmlValue(content, 'duration')
+        if (durationStr) {
+          const d = parseInt(durationStr, 10)
+          if (Number.isFinite(d) && d > 0) result.finderDuration = d
+        }
+      }
+
+      // 位置经纬度
+      if (isLocation) {
+        const latAttr = this.extractXmlAttribute(content, 'location', 'x') || this.extractXmlAttribute(content, 'location', 'latitude')
+        const lngAttr = this.extractXmlAttribute(content, 'location', 'y') || this.extractXmlAttribute(content, 'location', 'longitude')
+        if (latAttr) { const v = parseFloat(latAttr); if (Number.isFinite(v)) result.locationLat = v }
+        if (lngAttr) { const v = parseFloat(lngAttr); if (Number.isFinite(v)) result.locationLng = v }
+        result.locationPoiname = this.extractXmlAttribute(content, 'location', 'poiname') || locationLabel || undefined
+        result.locationLabel = this.extractXmlAttribute(content, 'location', 'label') || undefined
+      }
+
+      // 音乐专辑封面
+      if (isMusic) {
+        const albumUrl = this.extractXmlValue(content, 'songalbumurl')
+        if (albumUrl) result.musicAlbumUrl = albumUrl
+        result.musicUrl = musicUrl || dataUrl || url || undefined
+      }
+
+      // 礼物消息
+      const isGift = xmlType === '115'
+      if (isGift) {
+        result.giftWish = this.extractXmlValue(content, 'wishmessage') || undefined
+        result.giftImageUrl = this.extractXmlValue(content, 'skuimgurl') || undefined
+        result.giftPrice = this.extractXmlValue(content, 'skuprice') || undefined
+      }
+
+      if (isFinder) {
+        result.appMsgKind = 'finder'
+      } else if (isRedPacket) {
+        result.appMsgKind = 'red-packet'
+      } else if (isGift) {
+        result.appMsgKind = 'gift'
+      } else if (isLocation) {
+        result.appMsgKind = 'location'
+      } else if (isMusic) {
+        result.appMsgKind = 'music'
+      } else if (xmlType === '33' || xmlType === '36') {
+        result.appMsgKind = 'miniapp'
+      } else if (xmlType === '6') {
+        result.appMsgKind = 'file'
+      } else if (xmlType === '19') {
+        result.appMsgKind = 'chat-record'
+      } else if (xmlType === '2000') {
+        result.appMsgKind = 'transfer'
+      } else if (xmlType === '87') {
+        result.appMsgKind = 'announcement'
+      } else if (xmlType === '57') {
+        // 引用回复消息，解析 refermsg
+        result.appMsgKind = 'quote'
+        const quoteInfo = this.parseQuoteMessage(content)
+        result.quotedContent = quoteInfo.content
+        result.quotedSender = quoteInfo.sender
+      } else if ((xmlType === '5' || xmlType === '49') && (sourceUsername?.startsWith('gh_') || appName?.includes('公众号') || sourceName)) {
+        result.appMsgKind = 'official-link'
+      } else if (url) {
+        result.appMsgKind = 'link'
+      } else {
+        result.appMsgKind = 'card'
+      }
 
       switch (xmlType) {
         case '6': {
@@ -2472,15 +4603,16 @@ class ChatService {
   private shouldKeepSession(username: string): boolean {
     if (!username) return false
     const lowered = username.toLowerCase()
-    if (lowered.includes('@placeholder') || lowered.includes('foldgroup')) return false
+    // 排除所有 placeholder 会话（包括折叠群）
+    if (lowered.includes('@placeholder')) return false
     if (username.startsWith('gh_')) return false
 
     const excludeList = [
       'weixin', 'qqmail', 'fmessage', 'medianote', 'floatbottle',
       'newsapp', 'brandsessionholder', 'brandservicesessionholder',
       'notifymessage', 'opencustomerservicemsg', 'notification_messages',
-      'userexperience_alarm', 'helper_folders', 'placeholder_foldgroup',
-      '@helper_folders', '@placeholder_foldgroup'
+      'userexperience_alarm', 'helper_folders',
+      '@helper_folders'
     ]
 
     for (const prefix of excludeList) {
@@ -2499,11 +4631,27 @@ class ChatService {
       if (!connectResult.success) return null
       const result = await wcdbService.getContact(username)
       if (!result.success || !result.contact) return null
+      const contact = result.contact as Record<string, any>
+      let alias = String(contact.alias || contact.Alias || '')
+      // DLL 有时不返回 alias 字段，补一条直接 SQL 查询兜底
+      if (!alias) {
+        try {
+          const safe = username.replace(/'/g, "''")
+          const sqlResult = await wcdbService.execQuery('contact', null,
+            `SELECT alias FROM contact WHERE username = '${safe}' LIMIT 1`)
+          if (sqlResult.success && Array.isArray(sqlResult.rows) && sqlResult.rows.length > 0) {
+            alias = String(sqlResult.rows[0]?.alias || sqlResult.rows[0]?.Alias || '')
+          }
+        } catch {
+          // 兜底失败不影响主流程
+        }
+      }
       return {
-        username: result.contact.username || username,
-        alias: result.contact.alias || '',
-        remark: result.contact.remark || '',
-        nickName: result.contact.nickName || ''
+        username: String(contact.username || contact.user_name || contact.userName || username || ''),
+        alias,
+        remark: String(contact.remark || contact.Remark || ''),
+        // 兼容不同表结构字段，避免 nick_name 丢失导致侧边栏退化到 wxid。
+        nickName: String(contact.nickName || contact.nick_name || contact.nickname || contact.NickName || '')
       }
     } catch {
       return null
@@ -2521,7 +4669,7 @@ class ChatService {
       if (!connectResult.success) return null
       const cached = this.avatarCache.get(username)
       // 检查缓存是否有效，且头像不是错误的 hex 格式
-      const isValidAvatar = cached?.avatarUrl && !cached.avatarUrl.includes('base64,ffd8')
+      const isValidAvatar = this.isValidAvatarUrl(cached?.avatarUrl)
       if (cached && isValidAvatar && Date.now() - cached.updatedAt < this.avatarCacheTtlMs) {
         return { avatarUrl: cached.avatarUrl, displayName: cached.displayName }
       }
@@ -2691,6 +4839,16 @@ class ChatService {
       this.voiceWavCache.clear()
       this.voiceTranscriptCache.clear()
       this.voiceTranscriptPending.clear()
+    }
+
+    if (includeMessages || includeContacts) {
+      this.sessionStatsMemoryCache.clear()
+      this.sessionStatsPendingBasic.clear()
+      this.sessionStatsPendingFull.clear()
+      this.allGroupSessionIdsCache = null
+      this.sessionStatsCacheService.clearAll()
+      this.groupMyMessageCountMemoryCache.clear()
+      this.groupMyMessageCountCacheService.clearAll()
     }
 
     for (const state of this.hardlinkCache.values()) {
@@ -2911,20 +5069,9 @@ class ChatService {
   /**
    * 获取会话详情信息
    */
-  async getSessionDetail(sessionId: string): Promise<{
+  async getSessionDetailFast(sessionId: string): Promise<{
     success: boolean
-    detail?: {
-      wxid: string
-      displayName: string
-      remark?: string
-      nickName?: string
-      alias?: string
-      avatarUrl?: string
-      messageCount: number
-      firstMessageTime?: number
-      latestMessageTime?: number
-      messageTables: { dbName: string; tableName: string; count: number }[]
-    }
+    detail?: SessionDetailFast
     error?: string
   }> {
     try {
@@ -2932,53 +5079,164 @@ class ChatService {
       if (!connectResult.success) {
         return { success: false, error: connectResult.error || '数据库未连接' }
       }
+      this.refreshSessionMessageCountCacheScope()
 
-      let displayName = sessionId
+      const normalizedSessionId = String(sessionId || '').trim()
+      if (!normalizedSessionId) {
+        return { success: false, error: '会话ID不能为空' }
+      }
+
+      const now = Date.now()
+      const cachedDetail = this.sessionDetailFastCache.get(normalizedSessionId)
+      if (cachedDetail && now - cachedDetail.updatedAt <= this.sessionDetailFastCacheTtlMs) {
+        return { success: true, detail: cachedDetail.detail }
+      }
+
+      let displayName = normalizedSessionId
       let remark: string | undefined
       let nickName: string | undefined
       let alias: string | undefined
       let avatarUrl: string | undefined
-
-      const contactResult = await wcdbService.getContact(sessionId)
-      if (contactResult.success && contactResult.contact) {
-        remark = contactResult.contact.remark || undefined
-        nickName = contactResult.contact.nickName || undefined
-        alias = contactResult.contact.alias || undefined
-        displayName = remark || nickName || alias || sessionId
-      }
-      const avatarResult = await wcdbService.getAvatarUrls([sessionId])
-      if (avatarResult.success && avatarResult.map) {
-        avatarUrl = avatarResult.map[sessionId]
-      }
-
-      const countResult = await wcdbService.getMessageCount(sessionId)
-      const totalMessageCount = countResult.success && countResult.count ? countResult.count : 0
-
-      let firstMessageTime: number | undefined
-      let latestMessageTime: number | undefined
-
-      const earliestCursor = await wcdbService.openMessageCursor(sessionId, 1, true, 0, 0)
-      if (earliestCursor.success && earliestCursor.cursor) {
-        const batch = await wcdbService.fetchMessageBatch(earliestCursor.cursor)
-        if (batch.success && batch.rows && batch.rows.length > 0) {
-          firstMessageTime = parseInt(batch.rows[0].create_time || '0', 10) || undefined
+      const cachedContact = this.avatarCache.get(normalizedSessionId)
+      if (cachedContact) {
+        displayName = cachedContact.displayName || normalizedSessionId
+        if (this.isValidAvatarUrl(cachedContact.avatarUrl)) {
+          avatarUrl = cachedContact.avatarUrl
         }
-        await wcdbService.closeMessageCursor(earliestCursor.cursor)
       }
 
-      const latestCursor = await wcdbService.openMessageCursor(sessionId, 1, false, 0, 0)
-      if (latestCursor.success && latestCursor.cursor) {
-        const batch = await wcdbService.fetchMessageBatch(latestCursor.cursor)
-        if (batch.success && batch.rows && batch.rows.length > 0) {
-          latestMessageTime = parseInt(batch.rows[0].create_time || '0', 10) || undefined
+      const contactPromise = wcdbService.getContact(normalizedSessionId)
+      const avatarPromise = avatarUrl
+        ? Promise.resolve({ success: true, map: { [normalizedSessionId]: avatarUrl } })
+        : wcdbService.getAvatarUrls([normalizedSessionId])
+
+      let messageCount: number | undefined
+      const cachedCount = this.sessionMessageCountCache.get(normalizedSessionId)
+      if (cachedCount && now - cachedCount.updatedAt <= this.sessionMessageCountCacheTtlMs) {
+        messageCount = cachedCount.count
+      } else {
+        const hintCount = this.sessionMessageCountHintCache.get(normalizedSessionId)
+        if (typeof hintCount === 'number' && Number.isFinite(hintCount) && hintCount >= 0) {
+          messageCount = Math.floor(hintCount)
+          this.sessionMessageCountCache.set(normalizedSessionId, {
+            count: messageCount,
+            updatedAt: now
+          })
         }
-        await wcdbService.closeMessageCursor(latestCursor.cursor)
       }
+
+      const messageCountPromise = Number.isFinite(messageCount)
+        ? Promise.resolve<{ success: boolean; count?: number }>({
+          success: true,
+          count: Math.max(0, Math.floor(messageCount as number))
+        })
+        : wcdbService.getMessageCount(normalizedSessionId)
+
+      const [contactResult, avatarResult, messageCountResult] = await Promise.allSettled([
+        contactPromise,
+        avatarPromise,
+        messageCountPromise
+      ])
+
+      if (contactResult.status === 'fulfilled' && contactResult.value.success && contactResult.value.contact) {
+        remark = contactResult.value.contact.remark || undefined
+        nickName = contactResult.value.contact.nickName || undefined
+        alias = contactResult.value.contact.alias || undefined
+        displayName = remark || nickName || alias || displayName
+      }
+
+      if (avatarResult.status === 'fulfilled' && avatarResult.value.success && avatarResult.value.map) {
+        const avatarCandidate = avatarResult.value.map[normalizedSessionId]
+        if (this.isValidAvatarUrl(avatarCandidate)) {
+          avatarUrl = avatarCandidate
+        }
+      }
+
+      if (!Number.isFinite(messageCount)) {
+        messageCount = messageCountResult.status === 'fulfilled' &&
+          messageCountResult.value.success &&
+          Number.isFinite(messageCountResult.value.count)
+          ? Math.max(0, Math.floor(messageCountResult.value.count || 0))
+          : 0
+        this.sessionMessageCountCache.set(normalizedSessionId, {
+          count: messageCount,
+          updatedAt: Date.now()
+        })
+      }
+
+      const detail: SessionDetailFast = {
+        wxid: normalizedSessionId,
+        displayName,
+        remark,
+        nickName,
+        alias,
+        avatarUrl,
+        messageCount: Math.max(0, Math.floor(messageCount || 0))
+      }
+
+      this.sessionDetailFastCache.set(normalizedSessionId, {
+        detail,
+        updatedAt: Date.now()
+      })
+
+      return { success: true, detail }
+    } catch (e) {
+      console.error('ChatService: 获取会话详情快速信息失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  async getSessionDetailExtra(sessionId: string): Promise<{
+    success: boolean
+    detail?: SessionDetailExtra
+    error?: string
+  }> {
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error || '数据库未连接' }
+      }
+      this.refreshSessionMessageCountCacheScope()
+
+      const normalizedSessionId = String(sessionId || '').trim()
+      if (!normalizedSessionId) {
+        return { success: false, error: '会话ID不能为空' }
+      }
+
+      const now = Date.now()
+      const cachedDetail = this.sessionDetailExtraCache.get(normalizedSessionId)
+      if (cachedDetail && now - cachedDetail.updatedAt <= this.sessionDetailExtraCacheTtlMs) {
+        return { success: true, detail: cachedDetail.detail }
+      }
+
+      const [tableStatsResult, statsResult] = await Promise.allSettled([
+        wcdbService.getMessageTableStats(normalizedSessionId),
+        (async (): Promise<ExportSessionStats | null> => {
+          const cachedStats = this.getSessionStatsCacheEntry(normalizedSessionId)
+          if (cachedStats && this.supportsRequestedRelation(cachedStats.entry, false)) {
+            return this.fromSessionStatsCacheStats(cachedStats.entry.stats)
+          }
+          const myWxid = this.configService.get('myWxid') || ''
+          const selfIdentitySet = new Set<string>(this.buildIdentityKeys(myWxid))
+          const stats = await this.getOrComputeSessionExportStats(normalizedSessionId, false, selfIdentitySet)
+          this.setSessionStatsCacheEntry(normalizedSessionId, stats, false)
+          return stats
+        })()
+      ])
+
+      const statsSnapshot = statsResult.status === 'fulfilled'
+        ? statsResult.value
+        : null
+      const firstMessageTime = statsSnapshot && Number.isFinite(statsSnapshot.firstTimestamp)
+        ? Math.max(0, Math.floor(statsSnapshot.firstTimestamp as number))
+        : undefined
+      const latestMessageTime = statsSnapshot && Number.isFinite(statsSnapshot.lastTimestamp)
+        ? Math.max(0, Math.floor(statsSnapshot.lastTimestamp as number))
+        : undefined
 
       const messageTables: { dbName: string; tableName: string; count: number }[] = []
-      const tableStats = await wcdbService.getMessageTableStats(sessionId)
-      if (tableStats.success && tableStats.tables) {
-        for (const row of tableStats.tables) {
+      if (tableStatsResult.status === 'fulfilled' && tableStatsResult.value.success && tableStatsResult.value.tables) {
+        for (const row of tableStatsResult.value.tables) {
           messageTables.push({
             dbName: basename(row.db_path || ''),
             tableName: row.table_name || '',
@@ -2987,23 +5245,251 @@ class ChatService {
         }
       }
 
+      const detail: SessionDetailExtra = {
+        firstMessageTime,
+        latestMessageTime,
+        messageTables
+      }
+
+      this.sessionDetailExtraCache.set(normalizedSessionId, {
+        detail,
+        updatedAt: Date.now()
+      })
+
       return {
         success: true,
-        detail: {
-          wxid: sessionId,
-          displayName,
-          remark,
-          nickName,
-          alias,
-          avatarUrl,
-          messageCount: totalMessageCount,
-          firstMessageTime,
-          latestMessageTime,
-          messageTables
-        }
+        detail
       }
     } catch (e) {
+      console.error('ChatService: 获取会话详情补充统计失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  async getSessionDetail(sessionId: string): Promise<{
+    success: boolean
+    detail?: SessionDetail
+    error?: string
+  }> {
+    try {
+      const fastResult = await this.getSessionDetailFast(sessionId)
+      if (!fastResult.success || !fastResult.detail) {
+        return { success: false, error: fastResult.error || '获取会话详情失败' }
+      }
+
+      const extraResult = await this.getSessionDetailExtra(sessionId)
+      const detail: SessionDetail = {
+        ...fastResult.detail,
+        firstMessageTime: extraResult.success ? extraResult.detail?.firstMessageTime : undefined,
+        latestMessageTime: extraResult.success ? extraResult.detail?.latestMessageTime : undefined,
+        messageTables: extraResult.success && extraResult.detail?.messageTables
+          ? extraResult.detail.messageTables
+          : []
+      }
+
+      return { success: true, detail }
+    } catch (e) {
       console.error('ChatService: 获取会话详情失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  async getGroupMyMessageCountHint(chatroomId: string): Promise<{
+    success: boolean
+    count?: number
+    updatedAt?: number
+    source?: 'memory' | 'disk'
+    error?: string
+  }> {
+    try {
+      this.refreshSessionMessageCountCacheScope()
+      const normalizedChatroomId = String(chatroomId || '').trim()
+      if (!normalizedChatroomId || !normalizedChatroomId.endsWith('@chatroom')) {
+        return { success: false, error: '群聊ID无效' }
+      }
+
+      const cached = this.getGroupMyMessageCountHintEntry(normalizedChatroomId)
+      if (!cached) return { success: true }
+      return {
+        success: true,
+        count: cached.entry.messageCount,
+        updatedAt: cached.entry.updatedAt,
+        source: cached.source
+      }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  async setGroupMyMessageCountHint(
+    chatroomId: string,
+    messageCount: number,
+    updatedAt?: number
+  ): Promise<{ success: boolean; updatedAt?: number; error?: string }> {
+    try {
+      this.refreshSessionMessageCountCacheScope()
+      const normalizedChatroomId = String(chatroomId || '').trim()
+      if (!normalizedChatroomId || !normalizedChatroomId.endsWith('@chatroom')) {
+        return { success: false, error: '群聊ID无效' }
+      }
+      const savedAt = this.setGroupMyMessageCountHintEntry(normalizedChatroomId, messageCount, updatedAt)
+      return { success: true, updatedAt: savedAt }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  async getExportSessionStats(sessionIds: string[], options: ExportSessionStatsOptions = {}): Promise<{
+    success: boolean
+    data?: Record<string, ExportSessionStats>
+    cache?: Record<string, ExportSessionStatsCacheMeta>
+    needsRefresh?: string[]
+    error?: string
+  }> {
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error || '数据库未连接' }
+      }
+      this.refreshSessionMessageCountCacheScope()
+
+      const includeRelations = options.includeRelations ?? true
+      const forceRefresh = options.forceRefresh === true
+      const allowStaleCache = options.allowStaleCache === true
+      const preferAccurateSpecialTypes = options.preferAccurateSpecialTypes === true
+
+      const normalizedSessionIds = Array.from(
+        new Set(
+          (sessionIds || [])
+            .map((id) => String(id || '').trim())
+            .filter(Boolean)
+        )
+      )
+      if (normalizedSessionIds.length === 0) {
+        return { success: true, data: {}, cache: {} }
+      }
+
+      const resultMap: Record<string, ExportSessionStats> = {}
+      const cacheMeta: Record<string, ExportSessionStatsCacheMeta> = {}
+      const needsRefreshSet = new Set<string>()
+      const pendingSessionIds: string[] = []
+      const now = Date.now()
+
+      for (const sessionId of normalizedSessionIds) {
+        const groupMyMessagesHint = sessionId.endsWith('@chatroom')
+          ? this.getGroupMyMessageCountHintEntry(sessionId)
+          : null
+        const cachedResult = this.getSessionStatsCacheEntry(sessionId)
+        if (!forceRefresh && !preferAccurateSpecialTypes) {
+          if (cachedResult && this.supportsRequestedRelation(cachedResult.entry, includeRelations)) {
+            const stale = now - cachedResult.entry.updatedAt > this.sessionStatsCacheTtlMs
+            if (!stale || allowStaleCache) {
+              resultMap[sessionId] = this.fromSessionStatsCacheStats(cachedResult.entry.stats)
+              if (groupMyMessagesHint && Number.isFinite(groupMyMessagesHint.entry.messageCount)) {
+                resultMap[sessionId].groupMyMessages = groupMyMessagesHint.entry.messageCount
+              }
+              cacheMeta[sessionId] = {
+                updatedAt: cachedResult.entry.updatedAt,
+                stale,
+                includeRelations: cachedResult.entry.includeRelations,
+                source: cachedResult.source
+              }
+              if (stale) {
+                needsRefreshSet.add(sessionId)
+              }
+              continue
+            }
+          }
+          // allowStaleCache 仅对“已有缓存”生效；无缓存会话仍需进入计算流程。
+          if (allowStaleCache && cachedResult) {
+            needsRefreshSet.add(sessionId)
+            continue
+          }
+        }
+        pendingSessionIds.push(sessionId)
+      }
+
+      if (pendingSessionIds.length > 0) {
+        const myWxid = this.configService.get('myWxid') || ''
+        const selfIdentitySet = new Set<string>(this.buildIdentityKeys(myWxid))
+        let usedBatchedCompute = false
+        if (pendingSessionIds.length === 1) {
+          const sessionId = pendingSessionIds[0]
+          try {
+            const stats = await this.getOrComputeSessionExportStats(sessionId, includeRelations, selfIdentitySet, preferAccurateSpecialTypes)
+            resultMap[sessionId] = stats
+            const updatedAt = this.setSessionStatsCacheEntry(sessionId, stats, includeRelations)
+            cacheMeta[sessionId] = {
+              updatedAt,
+              stale: false,
+              includeRelations,
+              source: 'fresh'
+            }
+            usedBatchedCompute = true
+          } catch {
+            usedBatchedCompute = false
+          }
+        } else {
+          try {
+            const batchedStatsMap = await this.computeSessionExportStatsBatch(
+              pendingSessionIds,
+              includeRelations,
+              selfIdentitySet,
+              preferAccurateSpecialTypes
+            )
+            for (const sessionId of pendingSessionIds) {
+              const stats = batchedStatsMap[sessionId]
+              if (!stats) continue
+              resultMap[sessionId] = stats
+              const updatedAt = this.setSessionStatsCacheEntry(sessionId, stats, includeRelations)
+              cacheMeta[sessionId] = {
+                updatedAt,
+                stale: false,
+                includeRelations,
+                source: 'fresh'
+              }
+            }
+            usedBatchedCompute = true
+          } catch {
+            usedBatchedCompute = false
+          }
+        }
+
+        if (!usedBatchedCompute) {
+          await this.forEachWithConcurrency(pendingSessionIds, 3, async (sessionId) => {
+            try {
+              const stats = await this.getOrComputeSessionExportStats(sessionId, includeRelations, selfIdentitySet, preferAccurateSpecialTypes)
+              resultMap[sessionId] = stats
+              const updatedAt = this.setSessionStatsCacheEntry(sessionId, stats, includeRelations)
+              cacheMeta[sessionId] = {
+                updatedAt,
+                stale: false,
+                includeRelations,
+                source: 'fresh'
+              }
+            } catch {
+              resultMap[sessionId] = this.buildEmptyExportSessionStats(sessionId, includeRelations)
+            }
+          })
+        }
+      }
+
+      const response: {
+        success: boolean
+        data?: Record<string, ExportSessionStats>
+        cache?: Record<string, ExportSessionStatsCacheMeta>
+        needsRefresh?: string[]
+      } = {
+        success: true,
+        data: resultMap,
+        cache: cacheMeta
+      }
+      if (needsRefreshSet.size > 0) {
+        response.needsRefresh = Array.from(needsRefreshSet)
+      }
+      return response
+    } catch (e) {
+      console.error('ChatService: 获取导出会话统计失败:', e)
       return { success: false, error: String(e) }
     }
   }
@@ -3038,9 +5524,10 @@ class ChatService {
       const datPath = await this.findDatFile(actualAccountDir, baseName, sessionId)
       if (!datPath) return { success: false, error: '未找到图片源文件 (.dat)' }
 
-      // 4. 获取解密密钥
-      const xorKeyRaw = this.configService.get('imageXorKey')
-      const aesKeyRaw = this.configService.get('imageAesKey') || msg.aesKey
+      // 4. 获取解密密钥（优先使用当前 wxid 对应的密钥）
+      const imageKeys = this.configService.getImageKeysForCurrentWxid()
+      const xorKeyRaw = imageKeys.xorKey
+      const aesKeyRaw = imageKeys.aesKey || msg.aesKey
 
       if (!xorKeyRaw) return { success: false, error: '未配置图片 XOR 密钥，请在设置中自动获取' }
 
@@ -3820,6 +6307,36 @@ class ChatService {
   }
 
   /**
+   * 批量统计转写缓存命中数（按会话维度）。
+   * 仅基于本地 transcripts cache key 统计，用于导出前快速预估。
+   */
+  getCachedVoiceTranscriptCountMap(sessionIds: string[]): Record<string, number> {
+    this.loadTranscriptCacheIfNeeded()
+    const normalizedIds = Array.from(
+      new Set((sessionIds || []).map((id) => String(id || '').trim()).filter(Boolean))
+    )
+    const targetSet = new Set(normalizedIds)
+    const countMap: Record<string, number> = {}
+    for (const sessionId of normalizedIds) {
+      countMap[sessionId] = 0
+    }
+    if (targetSet.size === 0) return countMap
+
+    for (const key of this.voiceTranscriptCache.keys()) {
+      const rawKey = String(key || '')
+      if (!rawKey) continue
+      // cacheKey 形如 `${sessionId}_${createTime}`，createTime 为数字；兼容旧 key 时使用贪婪匹配。
+      const match = /^(.*)_(\d+)$/.exec(rawKey)
+      if (!match) continue
+      const sessionId = String(match[1] || '').trim()
+      if (!sessionId || !targetSet.has(sessionId)) continue
+      countMap[sessionId] = (countMap[sessionId] || 0) + 1
+    }
+
+    return countMap
+  }
+
+  /**
    * 获取某会话的所有语音消息（localType=34），用于批量转写
    */
   async getAllVoiceMessages(sessionId: string): Promise<{ success: boolean; messages?: Message[]; error?: string }> {
@@ -3884,6 +6401,74 @@ class ChatService {
    * 获取某会话中有消息的日期列表
    * 返回 YYYY-MM-DD 格式的日期字符串数组
    */
+  /**
+   * 获取某会话的全部图片消息（用于聊天页批量图片解密）
+   */
+  async getAllImageMessages(
+    sessionId: string
+  ): Promise<{ success: boolean; images?: { imageMd5?: string; imageDatName?: string; createTime?: number }[]; error?: string }> {
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error || '数据库未连接' }
+      }
+
+      let tables = this.sessionTablesCache.get(sessionId)
+      if (!tables) {
+        const tableStats = await wcdbService.getMessageTableStats(sessionId)
+        if (!tableStats.success || !tableStats.tables || tableStats.tables.length === 0) {
+          return { success: false, error: '未找到会话消息表' }
+        }
+        tables = tableStats.tables
+          .map(t => ({ tableName: t.table_name || t.name, dbPath: t.db_path }))
+          .filter(t => t.tableName && t.dbPath) as Array<{ tableName: string; dbPath: string }>
+        if (tables.length > 0) {
+          this.sessionTablesCache.set(sessionId, tables)
+          setTimeout(() => { this.sessionTablesCache.delete(sessionId) }, this.sessionTablesCacheTtl)
+        }
+      }
+
+      let allImages: Array<{ imageMd5?: string; imageDatName?: string; createTime?: number }> = []
+
+      for (const { tableName, dbPath } of tables) {
+        try {
+          const sql = `SELECT * FROM ${tableName} WHERE local_type = 3 ORDER BY create_time DESC`
+          const result = await wcdbService.execQuery('message', dbPath, sql)
+          if (result.success && result.rows && result.rows.length > 0) {
+            const mapped = this.mapRowsToMessages(result.rows as Record<string, any>[])
+            const images = mapped
+              .filter(msg => msg.localType === 3)
+              .map(msg => ({
+                imageMd5: msg.imageMd5 || undefined,
+                imageDatName: msg.imageDatName || undefined,
+                createTime: msg.createTime || undefined
+              }))
+              .filter(img => Boolean(img.imageMd5 || img.imageDatName))
+            allImages.push(...images)
+          }
+        } catch (e) {
+          console.error(`[ChatService] 查询图片消息失败 (${dbPath}):`, e)
+        }
+      }
+
+      allImages.sort((a, b) => (b.createTime || 0) - (a.createTime || 0))
+
+      const seen = new Set<string>()
+      allImages = allImages.filter(img => {
+        const key = img.imageMd5 || img.imageDatName || ''
+        if (!key || seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+
+      console.log(`[ChatService] 共找到 ${allImages.length} 条图片消息（去重后）`)
+      return { success: true, images: allImages }
+    } catch (e) {
+      console.error('[ChatService] 获取全部图片消息失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
   async getMessageDates(sessionId: string): Promise<{ success: boolean; dates?: string[]; error?: string }> {
     try {
       const connectResult = await this.ensureConnected()
@@ -3903,6 +6488,66 @@ class ChatService {
     } catch (e) {
       console.error('[ChatService] 获取消息日期失败:', e)
       return { success: false, error: String(e) }
+    }
+  }
+
+  async getMessageDateCounts(sessionId: string): Promise<{ success: boolean; counts?: Record<string, number>; error?: string }> {
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error || '数据库未连接' }
+      }
+
+      let tables = this.sessionTablesCache.get(sessionId)
+      if (!tables) {
+        const tableStats = await wcdbService.getMessageTableStats(sessionId)
+        if (!tableStats.success || !tableStats.tables || tableStats.tables.length === 0) {
+          return { success: false, error: '未找到会话消息表' }
+        }
+        tables = tableStats.tables
+          .map(t => ({ tableName: t.table_name || t.name, dbPath: t.db_path }))
+          .filter(t => t.tableName && t.dbPath) as Array<{ tableName: string; dbPath: string }>
+        if (tables.length > 0) {
+          this.sessionTablesCache.set(sessionId, tables)
+          setTimeout(() => {
+            this.sessionTablesCache.delete(sessionId)
+          }, this.sessionTablesCacheTtl)
+        }
+      }
+
+      const counts: Record<string, number> = {}
+      let hasAnySuccess = false
+
+      for (const { tableName, dbPath } of tables) {
+        try {
+          const escapedTableName = String(tableName).replace(/"/g, '""')
+          const sql = `SELECT strftime('%Y-%m-%d', CASE WHEN create_time > 10000000000 THEN create_time / 1000 ELSE create_time END, 'unixepoch', 'localtime') AS date_key, COUNT(*) AS message_count FROM "${escapedTableName}" WHERE create_time IS NOT NULL GROUP BY date_key`
+          const result = await wcdbService.execQuery('message', dbPath, sql)
+          if (!result.success || !Array.isArray(result.rows)) {
+            console.warn(`[ChatService] 查询每日消息数失败 (${dbPath}):`, result.error)
+            continue
+          }
+          hasAnySuccess = true
+          result.rows.forEach((row: Record<string, unknown>) => {
+            const date = String(row.date_key || '').trim()
+            const count = Number(row.message_count || 0)
+            if (!date || !Number.isFinite(count) || count <= 0) return
+            counts[date] = (counts[date] || 0) + count
+          })
+        } catch (error) {
+          console.warn(`[ChatService] 聚合每日消息数失败 (${dbPath}):`, error)
+        }
+      }
+
+      if (!hasAnySuccess) {
+        return { success: false, error: '查询每日消息数失败' }
+      }
+
+      console.log(`[ChatService] 会话 ${sessionId} 获取到 ${Object.keys(counts).length} 个日期的消息计数`)
+      return { success: true, counts }
+    } catch (error) {
+      console.error('[ChatService] 获取每日消息数失败:', error)
+      return { success: false, error: String(error) }
     }
   }
 
@@ -4017,6 +6662,15 @@ class ChatService {
       msg.emojiThumbUrl = emojiInfo.thumbUrl
       msg.emojiEncryptUrl = emojiInfo.encryptUrl
       msg.emojiAesKey = emojiInfo.aesKey
+    } else if (msg.localType === 42) {
+      const cardInfo = this.parseCardInfo(rawContent)
+      msg.cardUsername = cardInfo.username
+      msg.cardNickname = cardInfo.nickname
+      msg.cardAvatarUrl = cardInfo.avatarUrl
+    }
+
+    if (rawContent && (rawContent.includes('<appmsg') || rawContent.includes('&lt;appmsg'))) {
+      Object.assign(msg, this.parseType49Message(rawContent))
     }
 
     return msg

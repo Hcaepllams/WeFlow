@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from 'electron'
+﻿import { app, BrowserWindow } from 'electron'
 import { basename, dirname, extname, join } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, appendFileSync } from 'fs'
@@ -11,27 +11,35 @@ import { wcdbService } from './wcdbService'
 // 获取 ffmpeg-static 的路径
 function getStaticFfmpegPath(): string | null {
   try {
-    // 优先处理打包后的路径
+    // 方法1: 直接 require ffmpeg-static
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const ffmpegStatic = require('ffmpeg-static')
+
+    if (typeof ffmpegStatic === 'string') {
+      // 修复：如果路径包含 app.asar（打包后），自动替换为 app.asar.unpacked
+      let fixedPath = ffmpegStatic
+      if (fixedPath.includes('app.asar') && !fixedPath.includes('app.asar.unpacked')) {
+        fixedPath = fixedPath.replace('app.asar', 'app.asar.unpacked')
+      }
+
+      if (existsSync(fixedPath)) {
+        return fixedPath
+      }
+    }
+
+    // 方法2: 手动构建路径（开发环境）
+    const devPath = join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg.exe')
+    if (existsSync(devPath)) {
+      return devPath
+    }
+
+    // 方法3: 打包后的路径
     if (app.isPackaged) {
       const resourcesPath = process.resourcesPath
       const packedPath = join(resourcesPath, 'app.asar.unpacked', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe')
       if (existsSync(packedPath)) {
         return packedPath
       }
-    }
-
-    // 方法1: 直接 require ffmpeg-static（开发环境）
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const ffmpegStatic = require('ffmpeg-static')
-
-    if (typeof ffmpegStatic === 'string' && existsSync(ffmpegStatic)) {
-      return ffmpegStatic
-    }
-
-    // 方法2: 手动构建路径（开发环境备用）
-    const devPath = join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg.exe')
-    if (existsSync(devPath)) {
-      return devPath
     }
 
     return null
@@ -45,7 +53,6 @@ type DecryptResult = {
   localPath?: string
   error?: string
   isThumb?: boolean  // 是否是缩略图（没有高清图时返回缩略图）
-  liveVideoPath?: string  // 实况照片的视频路径
 }
 
 type HardlinkState = {
@@ -62,7 +69,6 @@ export class ImageDecryptService {
   private cacheIndexed = false
   private cacheIndexing: Promise<void> | null = null
   private updateFlags = new Map<string, boolean>()
-  private noLiveSet = new Set<string>() // 已确认无 live 视频的图片路径
 
   private logInfo(message: string, meta?: Record<string, unknown>): void {
     if (!this.configService.get('logEnabled')) return
@@ -118,9 +124,8 @@ export class ImageDecryptService {
         } else {
           this.updateFlags.delete(key)
         }
-        const liveVideoPath = isThumb ? undefined : this.checkLiveVideoCache(cached)
         this.emitCacheResolved(payload, key, dataUrl || this.filePathToUrl(cached))
-        return { success: true, localPath: dataUrl || this.filePathToUrl(cached), hasUpdate, liveVideoPath }
+        return { success: true, localPath: dataUrl || this.filePathToUrl(cached), hasUpdate }
       }
       if (cached && !this.isImageFile(cached)) {
         this.resolvedCache.delete(key)
@@ -139,9 +144,8 @@ export class ImageDecryptService {
         } else {
           this.updateFlags.delete(key)
         }
-        const liveVideoPath = isThumb ? undefined : this.checkLiveVideoCache(existing)
         this.emitCacheResolved(payload, key, dataUrl || this.filePathToUrl(existing))
-        return { success: true, localPath: dataUrl || this.filePathToUrl(existing), hasUpdate, liveVideoPath }
+        return { success: true, localPath: dataUrl || this.filePathToUrl(existing), hasUpdate }
       }
     }
     this.logInfo('未找到缓存', { md5: payload.imageMd5, datName: payload.imageDatName })
@@ -160,9 +164,8 @@ export class ImageDecryptService {
       if (cached && existsSync(cached) && this.isImageFile(cached)) {
         const dataUrl = this.fileToDataUrl(cached)
         const localPath = dataUrl || this.filePathToUrl(cached)
-        const liveVideoPath = this.isThumbnailPath(cached) ? undefined : this.checkLiveVideoCache(cached)
         this.emitCacheResolved(payload, cacheKey, localPath)
-        return { success: true, localPath, liveVideoPath }
+        return { success: true, localPath }
       }
       if (cached && !this.isImageFile(cached)) {
         this.resolvedCache.delete(cacheKey)
@@ -240,13 +243,14 @@ export class ImageDecryptService {
           const dataUrl = this.fileToDataUrl(existing)
           const localPath = dataUrl || this.filePathToUrl(existing)
           const isThumb = this.isThumbnailPath(existing)
-          const liveVideoPath = isThumb ? undefined : this.checkLiveVideoCache(existing)
           this.emitCacheResolved(payload, cacheKey, localPath)
-          return { success: true, localPath, isThumb, liveVideoPath }
+          return { success: true, localPath, isThumb }
         }
       }
 
-      const xorKeyRaw = this.configService.get('imageXorKey') as unknown
+      // 优先使用当前 wxid 对应的密钥，找不到则回退到全局配置
+      const imageKeys = this.configService.getImageKeysForCurrentWxid()
+      const xorKeyRaw = imageKeys.xorKey
       // 支持十六进制格式（如 0x53）和十进制格式
       let xorKey: number
       if (typeof xorKeyRaw === 'number') {
@@ -263,7 +267,7 @@ export class ImageDecryptService {
         return { success: false, error: '未配置图片解密密钥' }
       }
 
-      const aesKeyRaw = this.configService.get('imageAesKey')
+      const aesKeyRaw = imageKeys.aesKey
       const aesKey = this.resolveAesKey(aesKeyRaw)
 
       this.logInfo('开始解密DAT文件', { datPath, xorKey, hasAesKey: !!aesKey })
@@ -286,14 +290,14 @@ export class ImageDecryptService {
       await writeFile(outputPath, decrypted)
       this.logInfo('解密成功', { outputPath, size: decrypted.length })
 
-      // 对于 hevc 格式，返回错误提示
       if (finalExt === '.hevc') {
         return {
           success: false,
-          error: '此图片为微信新格式(wxgf)，需要安装 ffmpeg 才能显示',
+          error: '此图片为微信新格式(wxgf)，ffmpeg 转换失败，请检查日志',
           isThumb: this.isThumbnailPath(datPath)
         }
       }
+
       const isThumb = this.isThumbnailPath(datPath)
       this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, outputPath)
       if (!isThumb) {
@@ -302,15 +306,7 @@ export class ImageDecryptService {
       const dataUrl = this.bufferToDataUrl(decrypted, finalExt)
       const localPath = dataUrl || this.filePathToUrl(outputPath)
       this.emitCacheResolved(payload, cacheKey, localPath)
-
-      // 检测实况照片（Motion Photo）
-      let liveVideoPath: string | undefined
-      if (!isThumb && (finalExt === '.jpg' || finalExt === '.jpeg')) {
-        const videoPath = await this.extractMotionPhotoVideo(outputPath, decrypted)
-        if (videoPath) liveVideoPath = this.filePathToUrl(videoPath)
-      }
-
-      return { success: true, localPath, isThumb, liveVideoPath }
+      return { success: true, localPath, isThumb }
     } catch (e) {
       this.logError('解密失败', e, { md5: payload.imageMd5, datName: payload.imageDatName })
       return { success: false, error: String(e) }
@@ -395,7 +391,7 @@ export class ImageDecryptService {
 
     const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/)
     const cleaned = suffixMatch ? suffixMatch[1] : trimmed
-    
+
     return cleaned
   }
 
@@ -409,13 +405,34 @@ export class ImageDecryptService {
     const allowThumbnail = options?.allowThumbnail ?? true
     const skipResolvedCache = options?.skipResolvedCache ?? false
     this.logInfo('[ImageDecrypt] resolveDatPath', {
-      accountDir,
       imageMd5,
       imageDatName,
-      sessionId,
       allowThumbnail,
       skipResolvedCache
     })
+
+    if (!skipResolvedCache) {
+      if (imageMd5) {
+        const cached = this.resolvedCache.get(imageMd5)
+        if (cached && existsSync(cached)) return cached
+      }
+      if (imageDatName) {
+        const cached = this.resolvedCache.get(imageDatName)
+        if (cached && existsSync(cached)) return cached
+      }
+    }
+
+    // 1. 通过 MD5 快速定位 (MsgAttach 目录)
+    if (imageMd5) {
+      const res = await this.fastProbabilisticSearch(accountDir, imageMd5, allowThumbnail)
+      if (res) return res
+    }
+
+    // 2. 如果 imageDatName 看起来像 MD5，也尝试快速定位
+    if (!imageMd5 && imageDatName && this.looksLikeMd5(imageDatName)) {
+      const res = await this.fastProbabilisticSearch(accountDir, imageDatName, allowThumbnail)
+      if (res) return res
+    }
 
     // 优先通过 hardlink.db 查询
     if (imageMd5) {
@@ -597,9 +614,7 @@ export class ImageDecryptService {
     }).catch(() => { })
   }
 
-  private looksLikeMd5(value: string): boolean {
-    return /^[a-fA-F0-9]{16,32}$/.test(value)
-  }
+
 
   private resolveHardlinkDbPath(accountDir: string): string | null {
     const wxid = this.configService.get('myWxid')
@@ -815,7 +830,7 @@ export class ImageDecryptService {
    * 包含：1. 微信旧版结构 filename.substr(0, 2)/...
    *       2. 微信新版结构 msg/attach/{hash}/{YYYY-MM}/Img/filename
    */
-  private async fastProbabilisticSearch(root: string, datName: string): Promise<string | null> {
+  private async fastProbabilisticSearch(root: string, datName: string, _allowThumbnail?: boolean): Promise<string | null> {
     const { promises: fs } = require('fs')
     const { join } = require('path')
 
@@ -851,7 +866,7 @@ export class ImageDecryptService {
         } catch { }
       }
 
-      // --- 策略 B: 新版 Session 哈希路径猜测 ---
+      // --- 绛栫暐 B: 鏂扮増 Session 鍝堝笇璺緞鐚滄祴 ---
       try {
         const entries = await fs.readdir(root, { withFileTypes: true })
         const sessionDirs = entries
@@ -904,7 +919,7 @@ export class ImageDecryptService {
 
   /**
    * 在同一目录下查找高清图变体
-   * 缩略图: xxx_t.dat -> 高清图: xxx_h.dat 或 xxx.dat
+   * 缩略图 xxx_t.dat -> 高清图 xxx_h.dat 或 xxx.dat
    */
   private findHdVariantInSameDir(thumbPath: string): string | null {
     try {
@@ -986,55 +1001,6 @@ export class ImageDecryptService {
     })
   }
 
-  private matchesDatName(fileName: string, datName: string): boolean {
-    const lower = fileName.toLowerCase()
-    const base = lower.endsWith('.dat') ? lower.slice(0, -4) : lower
-    const normalizedBase = this.normalizeDatBase(base)
-    const normalizedTarget = this.normalizeDatBase(datName.toLowerCase())
-    if (normalizedBase === normalizedTarget) return true
-    const pattern = new RegExp(`^${datName}(?:[._][a-z])?\\.dat$`, 'i')
-    if (pattern.test(lower)) return true
-    return lower.endsWith('.dat') && lower.includes(datName)
-  }
-
-  private scoreDatName(fileName: string): number {
-    if (fileName.includes('.t.dat') || fileName.includes('_t.dat')) return 1
-    if (fileName.includes('.c.dat') || fileName.includes('_c.dat')) return 1
-    return 2
-  }
-
-  private isThumbnailDat(fileName: string): boolean {
-    return fileName.includes('.t.dat') || fileName.includes('_t.dat')
-  }
-
-  private hasXVariant(baseLower: string): boolean {
-    return /[._][a-z]$/.test(baseLower)
-  }
-
-  private isThumbnailPath(filePath: string): boolean {
-    const lower = basename(filePath).toLowerCase()
-    if (this.isThumbnailDat(lower)) return true
-    const ext = extname(lower)
-    const base = ext ? lower.slice(0, -ext.length) : lower
-    // 支持新命名 _thumb 和旧命名 _t
-    return base.endsWith('_t') || base.endsWith('_thumb')
-  }
-
-  private isHdPath(filePath: string): boolean {
-    const lower = basename(filePath).toLowerCase()
-    const ext = extname(lower)
-    const base = ext ? lower.slice(0, -ext.length) : lower
-    return base.endsWith('_hd') || base.endsWith('_h')
-  }
-
-  private hasImageVariantSuffix(baseLower: string): boolean {
-    return /[._][a-z]$/.test(baseLower)
-  }
-
-  private isLikelyImageDatBase(baseLower: string): boolean {
-    return this.hasImageVariantSuffix(baseLower) || this.looksLikeMd5(baseLower)
-  }
-
   private normalizeDatBase(name: string): string {
     let base = name.toLowerCase()
     if (base.endsWith('.dat') || base.endsWith('.jpg')) {
@@ -1046,26 +1012,15 @@ export class ImageDecryptService {
     return base
   }
 
-  private sanitizeDirName(name: string): string {
-    const trimmed = name.trim()
-    if (!trimmed) return 'unknown'
-    return trimmed.replace(/[<>:"/\\|?*]/g, '_')
+  private hasImageVariantSuffix(baseLower: string): boolean {
+    return /[._][a-z]$/.test(baseLower)
   }
 
-  private resolveTimeDir(datPath: string): string {
-    const parts = datPath.split(/[\\/]+/)
-    for (const part of parts) {
-      if (/^\d{4}-\d{2}$/.test(part)) return part
-    }
-    try {
-      const stat = statSync(datPath)
-      const year = stat.mtime.getFullYear()
-      const month = String(stat.mtime.getMonth() + 1).padStart(2, '0')
-      return `${year}-${month}`
-    } catch {
-      return 'unknown-time'
-    }
+  private isLikelyImageDatBase(baseLower: string): boolean {
+    return this.hasImageVariantSuffix(baseLower) || this.looksLikeMd5(baseLower)
   }
+
+
 
   private findCachedOutput(cacheKey: string, preferHd: boolean = false, sessionId?: string): string | null {
     const allRoots = this.getAllCacheRoots()
@@ -1301,14 +1256,14 @@ export class ImageDecryptService {
   private async ensureCacheIndexed(): Promise<void> {
     if (this.cacheIndexed) return
     if (this.cacheIndexing) return this.cacheIndexing
-    this.cacheIndexing = new Promise((resolve) => {
+    this.cacheIndexing = (async () => {
       // 扫描所有可能的缓存根目录
       const allRoots = this.getAllCacheRoots()
       this.logInfo('开始索引缓存', { roots: allRoots.length })
 
       for (const root of allRoots) {
         try {
-          this.indexCacheDir(root, 3, 0) // 增加深度到3，支持 sessionId/YYYY-MM 结构
+          this.indexCacheDir(root, 3, 0) // 增加深度到 3，支持 sessionId/YYYY-MM 结构
         } catch (e) {
           this.logError('索引目录失败', e, { root })
         }
@@ -1317,8 +1272,7 @@ export class ImageDecryptService {
       this.logInfo('缓存索引完成', { entries: this.resolvedCache.size })
       this.cacheIndexed = true
       this.cacheIndexing = null
-      resolve()
-    })
+    })()
     return this.cacheIndexing
   }
 
@@ -1521,14 +1475,14 @@ export class ImageDecryptService {
 
   private bytesToInt32(bytes: Buffer): number {
     if (bytes.length !== 4) {
-      throw new Error('需要4个字节')
+      throw new Error('需要 4 个字节')
     }
     return bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)
   }
 
   asciiKey16(keyString: string): Buffer {
     if (keyString.length < 16) {
-      throw new Error('AES密钥至少需要16个字符')
+      throw new Error('AES密钥至少需要 16 个字符')
     }
     return Buffer.from(keyString, 'ascii').subarray(0, 16)
   }
@@ -1696,76 +1650,6 @@ export class ImageDecryptService {
   }
 
   /**
-   * 检查图片对应的 live 视频缓存，返回 file:// URL 或 undefined
-   * 已确认无 live 的路径会被记录，下次直接跳过
-   */
-  private checkLiveVideoCache(imagePath: string): string | undefined {
-    if (this.noLiveSet.has(imagePath)) return undefined
-    const livePath = imagePath.replace(/\.(jpg|jpeg|png)$/i, '_live.mp4')
-    if (existsSync(livePath)) return this.filePathToUrl(livePath)
-    this.noLiveSet.add(imagePath)
-    return undefined
-  }
-
-  /**
-   * 检测并分离 Motion Photo（实况照片）
-   * Google Motion Photo = JPEG + MP4 拼接在一起
-   * 返回视频文件路径，如果不是实况照片则返回 null
-   */
-  private async extractMotionPhotoVideo(imagePath: string, imageBuffer: Buffer): Promise<string | null> {
-    // 只处理 JPEG 文件
-    if (imageBuffer.length < 8) return null
-    if (imageBuffer[0] !== 0xff || imageBuffer[1] !== 0xd8) return null
-
-    // 从末尾向前搜索 MP4 ftyp 原子签名
-    // ftyp 原子结构: [4字节大小][ftyp(66 74 79 70)][品牌...]
-    // 实际起始位置在 ftyp 前4字节（大小字段）
-    const ftypSig = [0x66, 0x74, 0x79, 0x70] // 'ftyp'
-    let videoOffset: number | null = null
-
-    const searchEnd = Math.max(0, imageBuffer.length - 8)
-    for (let i = searchEnd; i > 0; i--) {
-      if (imageBuffer[i] === ftypSig[0] &&
-        imageBuffer[i + 1] === ftypSig[1] &&
-        imageBuffer[i + 2] === ftypSig[2] &&
-        imageBuffer[i + 3] === ftypSig[3]) {
-        // ftyp 前4字节是 box size，实际 MP4 从这里开始
-        videoOffset = i - 4
-        break
-      }
-    }
-
-    // 备用：从 XMP 元数据中读取偏移量
-    if (videoOffset === null || videoOffset <= 0) {
-      try {
-        const text = imageBuffer.toString('latin1')
-        const match = text.match(/MediaDataOffset="(\d+)"/i) || text.match(/MicroVideoOffset="(\d+)"/i)
-        if (match) {
-          const offset = parseInt(match[1], 10)
-          if (offset > 0 && offset < imageBuffer.length) {
-            videoOffset = imageBuffer.length - offset
-          }
-        }
-      } catch { }
-    }
-
-    if (videoOffset === null || videoOffset <= 100) return null
-
-    // 验证视频部分确实以有效 MP4 数据开头
-    const videoStart = imageBuffer[videoOffset + 4] === 0x66 &&
-      imageBuffer[videoOffset + 5] === 0x74 &&
-      imageBuffer[videoOffset + 6] === 0x79 &&
-      imageBuffer[videoOffset + 7] === 0x70
-    if (!videoStart) return null
-
-    // 写出视频文件
-    const videoPath = imagePath.replace(/\.(jpg|jpeg|png)$/i, '_live.mp4')
-    const videoBuffer = imageBuffer.slice(videoOffset)
-    await writeFile(videoPath, videoBuffer)
-    return videoPath
-  }
-
-  /**
    * 解包 wxgf 格式
    * wxgf 是微信的图片格式，内部使用 HEVC 编码
    */
@@ -1790,25 +1674,28 @@ export class ImageDecryptService {
 
     // 提取 HEVC NALU 裸流
     const hevcData = this.extractHevcNalu(buffer)
-    if (!hevcData || hevcData.length < 100) {
-      return { data: buffer, isWxgf: true }
-    }
+    // 优先用提取的 NALU 裸流，提取失败则跳过 wxgf 头部直接用原始数据
+    const feedData = (hevcData && hevcData.length >= 100) ? hevcData : buffer.subarray(4)
+    this.logInfo('unwrapWxgf: 准备 ffmpeg 转换', {
+      naluExtracted: !!(hevcData && hevcData.length >= 100),
+      feedSize: feedData.length
+    })
 
     // 尝试用 ffmpeg 转换
     try {
-      const jpgData = await this.convertHevcToJpg(hevcData)
+      const jpgData = await this.convertHevcToJpg(feedData)
       if (jpgData && jpgData.length > 0) {
         return { data: jpgData, isWxgf: false }
       }
-    } catch {
-      // ffmpeg 转换失败
+    } catch (e) {
+      this.logError('unwrapWxgf: ffmpeg 转换失败', e)
     }
 
-    return { data: hevcData, isWxgf: true }
+    return { data: feedData, isWxgf: true }
   }
 
   /**
-   * 从 wxgf 数据中提取 HEVC NALU 裸流
+   * 浠?wxgf 鏁版嵁涓彁鍙?HEVC NALU 瑁告祦
    */
   private extractHevcNalu(buffer: Buffer): Buffer | null {
     const nalUnits: Buffer[] = []
@@ -1871,51 +1758,131 @@ export class ImageDecryptService {
   /**
    * 使用 ffmpeg 将 HEVC 裸流转换为 JPG
    */
-  private convertHevcToJpg(hevcData: Buffer): Promise<Buffer | null> {
+  private async convertHevcToJpg(hevcData: Buffer): Promise<Buffer | null> {
     const ffmpeg = this.getFfmpegPath()
     this.logInfo('ffmpeg 转换开始', { ffmpegPath: ffmpeg, hevcSize: hevcData.length })
 
+    const tmpDir = join(app.getPath('temp'), 'weflow_hevc')
+    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true })
+    const ts = Date.now()
+    const tmpInput = join(tmpDir, `hevc_${ts}.hevc`)
+    const tmpOutput = join(tmpDir, `hevc_${ts}.jpg`)
+
+    try {
+      await writeFile(tmpInput, hevcData)
+
+      // 依次尝试: 1) -f hevc 裸流  2) 不指定格式让 ffmpeg 自动检测
+      const attempts: { label: string; inputArgs: string[] }[] = [
+        { label: 'hevc raw', inputArgs: ['-f', 'hevc', '-i', tmpInput] },
+        { label: 'auto detect', inputArgs: ['-i', tmpInput] },
+      ]
+
+      for (const attempt of attempts) {
+        // 清理上一轮的输出
+        try { if (existsSync(tmpOutput)) require('fs').unlinkSync(tmpOutput) } catch {}
+
+        const result = await this.runFfmpegConvert(ffmpeg, attempt.inputArgs, tmpOutput, attempt.label)
+        if (result) return result
+      }
+
+      return null
+    } catch (e) {
+      this.logError('ffmpeg 转换异常', e)
+      return null
+    } finally {
+      try { if (existsSync(tmpInput)) require('fs').unlinkSync(tmpInput) } catch {}
+      try { if (existsSync(tmpOutput)) require('fs').unlinkSync(tmpOutput) } catch {}
+    }
+  }
+
+  private runFfmpegConvert(ffmpeg: string, inputArgs: string[], tmpOutput: string, label: string): Promise<Buffer | null> {
     return new Promise((resolve) => {
       const { spawn } = require('child_process')
-      const chunks: Buffer[] = []
       const errChunks: Buffer[] = []
 
-      const proc = spawn(ffmpeg, [
-        '-hide_banner',
-        '-loglevel', 'error',
-        '-f', 'hevc',
-        '-i', 'pipe:0',
-        '-vframes', '1',
-        '-q:v', '3',
-        '-f', 'mjpeg',
-        'pipe:1'
-      ], {
-        stdio: ['pipe', 'pipe', 'pipe'],
+      const args = [
+        '-hide_banner', '-loglevel', 'error',
+        ...inputArgs,
+        '-vframes', '1', '-q:v', '2', '-f', 'image2', tmpOutput
+      ]
+      this.logInfo(`ffmpeg 尝试 [${label}]`, { args: args.join(' ') })
+
+      const proc = spawn(ffmpeg, args, {
+        stdio: ['ignore', 'ignore', 'pipe'],
         windowsHide: true
       })
 
-      proc.stdout.on('data', (chunk: Buffer) => chunks.push(chunk))
       proc.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk))
 
-      proc.on('close', (code: number) => {
-        if (code === 0 && chunks.length > 0) {
-          this.logInfo('ffmpeg 转换成功', { outputSize: Buffer.concat(chunks).length })
-          resolve(Buffer.concat(chunks))
-        } else {
-          const errMsg = Buffer.concat(errChunks).toString()
-          this.logInfo('ffmpeg 转换失败', { code, error: errMsg })
-          resolve(null)
-        }
-      })
+      const timer = setTimeout(() => {
+        proc.kill('SIGKILL')
+        this.logError(`ffmpeg [${label}] 超时(15s)`)
+        resolve(null)
+      }, 15000)
 
-      proc.on('error', (err: Error) => {
-        this.logInfo('ffmpeg 进程错误', { error: err.message })
+      proc.on('close', (code: number) => {
+        clearTimeout(timer)
+        if (code === 0 && existsSync(tmpOutput)) {
+          try {
+            const jpgBuf = readFileSync(tmpOutput)
+            if (jpgBuf.length > 0) {
+              this.logInfo(`ffmpeg [${label}] 成功`, { outputSize: jpgBuf.length })
+              resolve(jpgBuf)
+              return
+            }
+          } catch (e) {
+            this.logError(`ffmpeg [${label}] 读取输出失败`, e)
+          }
+        }
+        const errMsg = Buffer.concat(errChunks).toString().trim()
+        this.logInfo(`ffmpeg [${label}] 失败`, { code, error: errMsg })
         resolve(null)
       })
 
-      proc.stdin.write(hevcData)
-      proc.stdin.end()
+      proc.on('error', (err: Error) => {
+        clearTimeout(timer)
+        this.logError(`ffmpeg [${label}] 进程错误`, err)
+        resolve(null)
+      })
     })
+  }
+
+  private looksLikeMd5(s: string): boolean {
+    return /^[a-f0-9]{32}$/i.test(s)
+  }
+
+  private isThumbnailDat(name: string): boolean {
+    const lower = name.toLowerCase()
+    return lower.includes('_t.dat') || lower.includes('.t.dat') || lower.includes('_thumb.dat')
+  }
+
+  private hasXVariant(base: string): boolean {
+    const lower = base.toLowerCase()
+    return lower.endsWith('_h') || lower.endsWith('_hd') || lower.endsWith('_thumb') || lower.endsWith('_t')
+  }
+
+  private isHdPath(p: string): boolean {
+    return p.toLowerCase().includes('_hd') || p.toLowerCase().includes('_h')
+  }
+
+  private isThumbnailPath(p: string): boolean {
+    const lower = p.toLowerCase()
+    return lower.includes('_thumb') || lower.includes('_t') || lower.includes('.t.')
+  }
+
+  private sanitizeDirName(s: string): string {
+    return s.replace(/[<>:"/\\|?*]/g, '_').trim() || 'unknown'
+  }
+
+  private resolveTimeDir(filePath: string): string {
+    try {
+      const stats = statSync(filePath)
+      const d = new Date(stats.mtime)
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+    } catch {
+      const d = new Date()
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+    }
   }
 
   // 保留原有的解密到文件方法（用于兼容）
@@ -1930,7 +1897,7 @@ export class ImageDecryptService {
       decrypted = this.decryptDatV4(inputPath, xorKey, key)
     } else {
       if (!aesKey || aesKey.length !== 16) {
-        throw new Error('V4版本需要16字节AES密钥')
+        throw new Error('V4版本需要 16 字节 AES 密钥')
       }
       decrypted = this.decryptDatV4(inputPath, xorKey, aesKey)
     }

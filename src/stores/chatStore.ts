@@ -32,7 +32,7 @@ export interface ChatState {
   setConnectionError: (error: string | null) => void
   setSessions: (sessions: ChatSession[]) => void
   setFilteredSessions: (sessions: ChatSession[]) => void
-  setCurrentSession: (sessionId: string | null) => void
+  setCurrentSession: (sessionId: string | null, options?: { preserveMessages?: boolean }) => void
   setLoadingSessions: (loading: boolean) => void
   setMessages: (messages: Message[]) => void
   appendMessages: (messages: Message[], prepend?: boolean) => void
@@ -69,12 +69,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setSessions: (sessions) => set({ sessions, filteredSessions: sessions }),
   setFilteredSessions: (sessions) => set({ filteredSessions: sessions }),
 
-  setCurrentSession: (sessionId) => set({
+  setCurrentSession: (sessionId, options) => set((state) => ({
     currentSessionId: sessionId,
-    messages: [],
+    messages: options?.preserveMessages ? state.messages : [],
     hasMoreMessages: true,
     hasMoreLater: false
-  }),
+  })),
 
   setLoadingSessions: (loading) => set({ isLoadingSessions: loading }),
 
@@ -86,15 +86,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (m.localId && m.localId > 0) return `l:${m.localId}`
       return `t:${m.createTime}:${m.sortSeq || 0}:${m.serverId || 0}`
     }
-    const existingKeys = new Set(state.messages.map(getMsgKey))
+    const currentMessages = state.messages || []
+    const existingKeys = new Set(currentMessages.map(getMsgKey))
     const filtered = newMessages.filter(m => !existingKeys.has(getMsgKey(m)))
 
     if (filtered.length === 0) return state
 
     return {
       messages: prepend
-        ? [...filtered, ...state.messages]
-        : [...state.messages, ...filtered]
+        ? [...filtered, ...currentMessages]
+        : [...currentMessages, ...filtered]
     }
   }),
 

@@ -82,6 +82,8 @@ function SettingsPage() {
   const exportExcelColumnsDropdownRef = useRef<HTMLDivElement>(null)
   const exportConcurrencyDropdownRef = useRef<HTMLDivElement>(null)
   const [cachePath, setCachePath] = useState('')
+  const [imageKeyProgress, setImageKeyProgress] = useState(0)
+  const [imageKeyPercent, setImageKeyPercent] = useState<number | null>(null)
 
   const [logEnabled, setLogEnabled] = useState(false)
   const [whisperModelName, setWhisperModelName] = useState('base')
@@ -146,6 +148,11 @@ function SettingsPage() {
   const [helloAvailable, setHelloAvailable] = useState(false)
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
+  const [oldPassword, setOldPassword] = useState('')
+  const [helloPassword, setHelloPassword] = useState('')
+  const [disableLockPassword, setDisableLockPassword] = useState('')
+  const [showDisableLockInput, setShowDisableLockInput] = useState(false)
+  const [isLockMode, setIsLockMode] = useState(false)
   const [isSettingHello, setIsSettingHello] = useState(false)
 
   // HTTP API 设置 state
@@ -184,14 +191,6 @@ function SettingsPage() {
     checkApiStatus()
   }, [])
 
-  async function sha256(message: string) {
-    const msgBuffer = new TextEncoder().encode(message)
-    const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer)
-    const hashArray = Array.from(new Uint8Array(hashBuffer))
-    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
-    return hashHex
-  }
-
   useEffect(() => {
     loadConfig()
     loadAppVersion()
@@ -225,8 +224,28 @@ function SettingsPage() {
     const removeDb = window.electronAPI.key.onDbKeyStatus((payload: { message: string; level: number }) => {
       setDbKeyStatus(payload.message)
     })
-    const removeImage = window.electronAPI.key.onImageKeyStatus((payload: { message: string }) => {
-      setImageKeyStatus(payload.message)
+
+    const removeImage = window.electronAPI.key.onImageKeyStatus((payload: { message: string, percent?: number }) => {
+      let msg = payload.message;
+      let pct = payload.percent;
+
+      // 如果后端没有显式传 percent，则用正则从字符串中提取如 "(12.5%)"
+      if (pct === undefined) {
+        const match = msg.match(/\(([\d.]+)%\)/);
+        if (match) {
+          pct = parseFloat(match[1]);
+          // 将百分比从文本中剥离，让 UI 更清爽
+          msg = msg.replace(/\s*\([\d.]+%\)/, '');
+        }
+      }
+
+      setImageKeyStatus(msg);
+      if (pct !== undefined) {
+        setImageKeyPercent(pct);
+      } else if (msg.includes('启动多核') || msg.includes('定位') || msg.includes('准备')) {
+        // 预热阶段
+        setImageKeyPercent(0);
+      }
     })
     return () => {
       removeDb?.()
@@ -279,10 +298,12 @@ function SettingsPage() {
       const savedNotificationFilterMode = await configService.getNotificationFilterMode()
       const savedNotificationFilterList = await configService.getNotificationFilterList()
 
-      const savedAuthEnabled = await configService.getAuthEnabled()
+      const savedAuthEnabled = await window.electronAPI.auth.verifyEnabled()
       const savedAuthUseHello = await configService.getAuthUseHello()
+      const savedIsLockMode = await window.electronAPI.auth.isLockMode()
       setAuthEnabled(savedAuthEnabled)
       setAuthUseHello(savedAuthUseHello)
+      setIsLockMode(savedIsLockMode)
 
       if (savedPath) setDbPath(savedPath)
       if (savedWxid) setWxid(savedWxid)
@@ -746,45 +767,61 @@ function SettingsPage() {
   }
 
   const handleAutoGetImageKey = async () => {
-    if (isFetchingImageKey) return
-    if (!dbPath) {
-      showMessage('请先选择数据库目录', false)
-      return
-    }
-    setIsFetchingImageKey(true)
-    setImageKeyStatus('正在准备获取图片密钥...')
+    if (isFetchingImageKey) return;
+    if (!dbPath) { showMessage('请先选择数据库目录', false); return; }
+    setIsFetchingImageKey(true);
+    setImageKeyPercent(0)
+    setImageKeyStatus('正在初始化...');
+    setImageKeyProgress(0);
+
     try {
-      const accountPath = wxid ? `${dbPath}/${wxid}` : dbPath
-      const result = await window.electronAPI.key.autoGetImageKey(accountPath)
+      const accountPath = wxid ? `${dbPath}/${wxid}` : dbPath;
+      const result = await window.electronAPI.key.autoGetImageKey(accountPath, wxid)
       if (result.success && result.aesKey) {
-        if (typeof result.xorKey === 'number') {
-          setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
-        }
+        if (typeof result.xorKey === 'number') setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
         setImageAesKey(result.aesKey)
         setImageKeyStatus('已获取图片密钥')
         showMessage('已自动获取图片密钥', true)
-
-        // Auto-save after fetching keys
-        // We need to use the values directly because state updates are async
         const newXorKey = typeof result.xorKey === 'number' ? result.xorKey : 0
         const newAesKey = result.aesKey
-
         await configService.setImageXorKey(newXorKey)
         await configService.setImageAesKey(newAesKey)
-
-        if (wxid) {
-          await configService.setWxidConfig(wxid, {
-            decryptKey: decryptKey, // use current state as it hasn't changed here
-            imageXorKey: newXorKey,
-            imageAesKey: newAesKey
-          })
-        }
-
+        if (wxid) await configService.setWxidConfig(wxid, { decryptKey, imageXorKey: newXorKey, imageAesKey: newAesKey })
       } else {
         showMessage(result.error || '自动获取图片密钥失败', false)
       }
     } catch (e: any) {
       showMessage(`自动获取图片密钥失败: ${e}`, false)
+    } finally {
+      setIsFetchingImageKey(false)
+    }
+  }
+
+  const handleScanImageKeyFromMemory = async () => {
+    if (isFetchingImageKey) return;
+    if (!dbPath) { showMessage('请先选择数据库目录', false); return; }
+    setIsFetchingImageKey(true);
+    setImageKeyPercent(0)
+    setImageKeyStatus('正在扫描内存...');
+
+    try {
+      const accountPath = wxid ? `${dbPath}/${wxid}` : dbPath;
+      const result = await window.electronAPI.key.scanImageKeyFromMemory(accountPath)
+      if (result.success && result.aesKey) {
+        if (typeof result.xorKey === 'number') setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
+        setImageAesKey(result.aesKey)
+        setImageKeyStatus('内存扫描成功，已获取图片密钥')
+        showMessage('内存扫描成功，已获取图片密钥', true)
+        const newXorKey = typeof result.xorKey === 'number' ? result.xorKey : 0
+        const newAesKey = result.aesKey
+        await configService.setImageXorKey(newXorKey)
+        await configService.setImageAesKey(newAesKey)
+        if (wxid) await configService.setWxidConfig(wxid, { decryptKey, imageXorKey: newXorKey, imageAesKey: newAesKey })
+      } else {
+        showMessage(result.error || '内存扫描获取图片密钥失败', false)
+      }
+    } catch (e: any) {
+      showMessage(`内存扫描失败: ${e}`, false)
     } finally {
       setIsFetchingImageKey(false)
     }
@@ -940,8 +977,20 @@ function SettingsPage() {
       <div className="theme-grid">
         {themes.map((theme) => (
           <div key={theme.id} className={`theme-card ${currentTheme === theme.id ? 'active' : ''}`} onClick={() => setTheme(theme.id)}>
-            <div className="theme-preview" style={{ background: effectiveMode === 'dark' ? 'linear-gradient(135deg, #1a1a1a 0%, #2a2a2a 100%)' : `linear-gradient(135deg, ${theme.bgColor} 0%, ${theme.bgColor}dd 100%)` }}>
-              <div className="theme-accent" style={{ background: theme.primaryColor }} />
+            <div className="theme-preview" style={{
+              background: effectiveMode === 'dark'
+                ? (theme.id === 'blossom-dream' ? 'linear-gradient(150deg, #151316 0%, #1A1620 50%, #131018 100%)'
+                  : theme.id === 'geist' ? 'linear-gradient(135deg, #1a1a1a 0%, #222222 100%)'
+                  : 'linear-gradient(135deg, #1a1a1a 0%, #2a2a2a 100%)')
+                : (theme.id === 'blossom-dream' ? `linear-gradient(150deg, ${theme.bgColor} 0%, #F8F2F8 45%, #F2F6FB 100%)`
+                  : theme.id === 'geist' ? 'linear-gradient(135deg, #ffffff 0%, #f0f0f0 100%)'
+                  : `linear-gradient(135deg, ${theme.bgColor} 0%, ${theme.bgColor}dd 100%)`)
+            }}>
+              <div className="theme-accent" style={{
+                background: theme.accentColor
+                  ? `linear-gradient(135deg, ${theme.primaryColor} 0%, ${theme.accentColor} 100%)`
+                  : theme.primaryColor
+              }} />
             </div>
             <div className="theme-info">
               <span className="theme-name">{theme.name}</span>
@@ -1341,11 +1390,27 @@ function SettingsPage() {
             scheduleConfigSave('keys', () => syncCurrentKeys({ imageAesKey: value, wxid }))
           }}
         />
-        <button className="btn btn-secondary btn-sm" onClick={handleAutoGetImageKey} disabled={isFetchingImageKey}>
-          <Plug size={14} /> {isFetchingImageKey ? '获取中...' : '自动获取图片密钥'}
-        </button>
-        {imageKeyStatus && <div className="form-hint status-text">{imageKeyStatus}</div>}
-        {isFetchingImageKey && <div className="form-hint status-text">正在扫描内存，请稍候...</div>}
+        <div className="form-hint" style={{ color: '#f59e0b', margin: '6px 0' }}>
+          ⚠️ 快速获取方案基于本地缓存计算，可能因账号信息不匹配而不准确。若图片无法解密，请使用「内存扫描」方案。
+        </div>
+        <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+          <button className="btn btn-secondary btn-sm" onClick={handleAutoGetImageKey} disabled={isFetchingImageKey} title="从本地缓存快速计算（可能不准确）">
+            <Plug size={14} /> {isFetchingImageKey ? '获取中...' : '快速获取（缓存计算）'}
+          </button>
+          <button className="btn btn-primary btn-sm" onClick={handleScanImageKeyFromMemory} disabled={isFetchingImageKey} title="扫描微信进程内存，准确率更高">
+            {isFetchingImageKey ? '扫描中...' : '内存扫描（推荐）'}
+          </button>
+        </div>
+        {isFetchingImageKey ? (
+          <div className="brute-force-progress">
+            <div className="status-header">
+              <span className="status-text">{imageKeyStatus || '正在启动...'}</span>
+            </div>
+          </div>
+        ) : (
+          imageKeyStatus && <div className="form-hint status-text" style={{ marginTop: '8px' }}>{imageKeyStatus}</div>
+        )}
+        <span className="form-hint">内存扫描需要微信正在运行，并在微信中打开 2-3 张图片大图后再点击</span>
       </div>
 
       <div className="form-group">
@@ -1931,6 +1996,10 @@ function SettingsPage() {
   )
 
   const handleSetupHello = async () => {
+    if (!helloPassword) {
+      showMessage('请输入当前密码以开启 Hello', false)
+      return
+    }
     setIsSettingHello(true)
     try {
       const challenge = new Uint8Array(32)
@@ -1948,8 +2017,10 @@ function SettingsPage() {
       })
 
       if (credential) {
+        // 存储密码作为 Hello Secret，以便 Hello 解锁时能派生密钥
+        await window.electronAPI.auth.setHelloSecret(helloPassword)
         setAuthUseHello(true)
-        await configService.setAuthUseHello(true)
+        setHelloPassword('')
         showMessage('Windows Hello 设置成功', true)
       }
     } catch (e: any) {
@@ -1967,18 +2038,40 @@ function SettingsPage() {
       return
     }
 
-    // 简单的保存逻辑，实际上应该先验证旧密码，但为了简化流程，这里直接允许覆盖
-    // 因为能进入设置页面说明已经解锁了
     try {
-      const hash = await sha256(newPassword)
-      await configService.setAuthPassword(hash)
-      await configService.setAuthEnabled(true)
-      setAuthEnabled(true)
-      setNewPassword('')
-      setConfirmPassword('')
-      showMessage('密码已更新', true)
+      const lockMode = await window.electronAPI.auth.isLockMode()
+
+      if (authEnabled && lockMode) {
+        // 已开启应用锁且已是 lock: 模式 → 修改密码
+        if (!oldPassword) {
+          showMessage('请输入旧密码', false)
+          return
+        }
+        const result = await window.electronAPI.auth.changePassword(oldPassword, newPassword)
+        if (result.success) {
+          setNewPassword('')
+          setConfirmPassword('')
+          setOldPassword('')
+          showMessage('密码已更新', true)
+        } else {
+          showMessage(result.error || '密码更新失败', false)
+        }
+      } else {
+        // 未开启应用锁，或旧版 safe: 模式 → 开启/升级为 lock: 模式
+        const result = await window.electronAPI.auth.enableLock(newPassword)
+        if (result.success) {
+          setAuthEnabled(true)
+          setIsLockMode(true)
+          setNewPassword('')
+          setConfirmPassword('')
+          setOldPassword('')
+          showMessage('应用锁已开启', true)
+        } else {
+          showMessage(result.error || '开启失败', false)
+        }
+      }
     } catch (e: any) {
-      showMessage('密码更新失败', false)
+      showMessage('操作失败', false)
     }
   }
 
@@ -2037,31 +2130,73 @@ function SettingsPage() {
       <div className="form-group">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
-            <label>启用应用锁</label>
-            <span className="form-hint">每次启动应用时需要验证密码</span>
+            <label>应用锁状态</label>
+            <span className="form-hint">{
+              isLockMode ? '已开启' :
+                authEnabled ? '旧版模式 — 请重新设置密码以升级为新模式提高安全性' :
+                  '未开启 — 请设置密码以开启'
+            }</span>
           </div>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={authEnabled}
-              onChange={async (e) => {
-                const enabled = e.target.checked
-                setAuthEnabled(enabled)
-                await configService.setAuthEnabled(enabled)
-              }}
-            />
-            <span className="switch-slider" />
-          </label>
+          {authEnabled && !showDisableLockInput && (
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => setShowDisableLockInput(true)}
+            >
+              关闭应用锁
+            </button>
+          )}
         </div>
+        {showDisableLockInput && (
+          <div style={{ marginTop: 10, display: 'flex', gap: 10 }}>
+            <input
+              type="password"
+              className="field-input"
+              placeholder="输入当前密码以关闭"
+              value={disableLockPassword}
+              onChange={e => setDisableLockPassword(e.target.value)}
+              style={{ flex: 1 }}
+            />
+            <button
+              className="btn btn-primary btn-sm"
+              disabled={!disableLockPassword}
+              onClick={async () => {
+                const result = await window.electronAPI.auth.disableLock(disableLockPassword)
+                if (result.success) {
+                  setAuthEnabled(false)
+                  setAuthUseHello(false)
+                  setIsLockMode(false)
+                  setShowDisableLockInput(false)
+                  setDisableLockPassword('')
+                  showMessage('应用锁已关闭', true)
+                } else {
+                  showMessage(result.error || '关闭失败', false)
+                }
+              }}
+            >确认</button>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => { setShowDisableLockInput(false); setDisableLockPassword('') }}
+            >取消</button>
+          </div>
+        )}
       </div>
 
       <div className="divider" />
 
       <div className="form-group">
-        <label>重置密码</label>
-        <span className="form-hint">设置新的启动密码</span>
+        <label>{isLockMode ? '修改密码' : '设置密码并开启应用锁'}</label>
+        <span className="form-hint">{isLockMode ? '修改应用锁密码（需要旧密码验证）' : '设置密码后将自动开启应用锁'}</span>
 
         <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {isLockMode && (
+            <input
+              type="password"
+              className="field-input"
+              placeholder="旧密码"
+              value={oldPassword}
+              onChange={e => setOldPassword(e.target.value)}
+            />
+          )}
           <input
             type="password"
             className="field-input"
@@ -2078,7 +2213,9 @@ function SettingsPage() {
               onChange={e => setConfirmPassword(e.target.value)}
               style={{ flex: 1 }}
             />
-            <button className="btn btn-primary" onClick={handleUpdatePassword} disabled={!newPassword}>更新</button>
+            <button className="btn btn-primary" onClick={handleUpdatePassword} disabled={!newPassword}>
+              {isLockMode ? '更新' : '开启'}
+            </button>
           </div>
         </div>
       </div>
@@ -2090,23 +2227,39 @@ function SettingsPage() {
           <div>
             <label>Windows Hello</label>
             <span className="form-hint">使用面容、指纹快速解锁</span>
-            {!helloAvailable && <div className="form-hint warning" style={{ color: '#ff4d4f' }}> 当前设备不支持 Windows Hello</div>}
+            {!authEnabled && <div className="form-hint warning" style={{ color: '#ff4d4f' }}>请先开启应用锁</div>}
+            {!helloAvailable && authEnabled && <div className="form-hint warning" style={{ color: '#ff4d4f' }}>当前设备不支持 Windows Hello</div>}
           </div>
 
           <div>
             {authUseHello ? (
-              <button className="btn btn-secondary btn-sm" onClick={() => setAuthUseHello(false)}>关闭</button>
+              <button className="btn btn-secondary btn-sm" onClick={async () => {
+                await window.electronAPI.auth.clearHelloSecret()
+                setAuthUseHello(false)
+                showMessage('Windows Hello 已关闭', true)
+              }}>关闭</button>
             ) : (
               <button
                 className="btn btn-secondary btn-sm"
                 onClick={handleSetupHello}
-                disabled={!helloAvailable || isSettingHello}
+                disabled={!helloAvailable || isSettingHello || !authEnabled || !helloPassword}
               >
                 {isSettingHello ? '设置中...' : '开启与设置'}
               </button>
             )}
           </div>
         </div>
+        {!authUseHello && authEnabled && (
+          <div style={{ marginTop: 10 }}>
+            <input
+              type="password"
+              className="field-input"
+              placeholder="输入当前密码以开启 Hello"
+              value={helloPassword}
+              onChange={e => setHelloPassword(e.target.value)}
+            />
+          </div>
+        )}
       </div>
     </div>
   )

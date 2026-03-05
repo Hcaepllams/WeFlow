@@ -54,6 +54,9 @@ if (parentPort) {
                 case 'getMessageCount':
                     result = await core.getMessageCount(payload.sessionId)
                     break
+                case 'getMessageCounts':
+                    result = await core.getMessageCounts(payload.sessionIds)
+                    break
                 case 'getDisplayNames':
                     result = await core.getDisplayNames(payload.usernames)
                     break
@@ -86,6 +89,9 @@ if (parentPort) {
                     break
                 case 'getContact':
                     result = await core.getContact(payload.username)
+                    break
+                case 'getContactStatus':
+                    result = await core.getContactStatus(payload.usernames)
                     break
                 case 'getAggregateStats':
                     result = await core.getAggregateStats(payload.sessionIds, payload.beginTimestamp, payload.endTimestamp)
@@ -144,6 +150,18 @@ if (parentPort) {
                 case 'getSnsAnnualStats':
                     result = await core.getSnsAnnualStats(payload.beginTimestamp, payload.endTimestamp)
                     break
+                case 'installSnsBlockDeleteTrigger':
+                    result = await core.installSnsBlockDeleteTrigger()
+                    break
+                case 'uninstallSnsBlockDeleteTrigger':
+                    result = await core.uninstallSnsBlockDeleteTrigger()
+                    break
+                case 'checkSnsBlockDeleteTrigger':
+                    result = await core.checkSnsBlockDeleteTrigger()
+                    break
+                case 'deleteSnsPost':
+                    result = await core.deleteSnsPost(payload.postId)
+                    break
                 case 'getLogs':
                     result = await core.getLogs()
                     break
@@ -156,7 +174,15 @@ if (parentPort) {
                 case 'deleteMessage':
                     result = await core.deleteMessage(payload.sessionId, payload.localId, payload.createTime, payload.dbPathHint)
                     break
-
+                case 'cloudInit':
+                    result = await core.cloudInit(payload.intervalSeconds)
+                    break
+                case 'cloudReport':
+                    result = await core.cloudReport(payload.statsJson)
+                    break
+                case 'cloudStop':
+                    result = core.cloudStop()
+                    break
                 default:
                     result = { success: false, error: `Unknown method: ${type}` }
             }
