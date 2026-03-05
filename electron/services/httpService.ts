@@ -1322,17 +1322,26 @@ class HttpService {
   /**
    * 判断是否应发送 Webhook
    */
-  private shouldSendWebhook(message: Message, session: any, config: WebhookConfig): boolean {
-    const isGroup = session.username.endsWith('@chatroom')
-    const content = message.parsedContent || message.rawContent || ''
-    const senderName = message.senderUsername || ''
 
-    // 1. 私聊检查
-    if (!isGroup && config.triggers.privateChat) {
-      // 检查特定用户
-      if (config.triggers.privateChatUsers.length > 0) {
-        const isTargetUser = config.triggers.privateChatUsers.some(user => 
 
+  /**
+   * 保存 Webhook 配置
+   */
+  public saveWebhookConfig(config: WebhookConfig): void {
+    this.configService.set("webhook", config)
+    console.log("[Webhook] 配置已保存")
+  }
+
+  /**
+   * 获取 Webhook 状态
+   */
+  public getWebhookStatus(): { enabled: boolean; url: string } {
+    const config = this.getWebhookConfig()
+    return {
+      enabled: config.enabled,
+      url: config.url
+    }
+  }
 }
 
 export const httpService = new HttpService()
