@@ -148,9 +148,9 @@ class HttpService {
         }
       })
 
-      this.server.listen(this.port, '127.0.0.1', () => {
+      this.server.listen(this.port, '0.0.0.0', () => {
         this.running = true
-        console.log(`[HttpService] HTTP API server started on http://127.0.0.1:${this.port}`)
+        console.log(`[HttpService] HTTP API server started on http://0.0.0.0:${this.port}`)
         resolve({ success: true, port: this.port })
       })
     })
@@ -223,7 +223,7 @@ class HttpService {
       return
     }
 
-    const url = new URL(req.url || '/', `http://127.0.0.1:${this.port}`)
+    const url = new URL(req.url || '/', `http://0.0.0.0:${this.port}`)
     const pathname = url.pathname
 
     try {

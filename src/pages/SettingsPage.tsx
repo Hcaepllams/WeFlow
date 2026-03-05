@@ -1821,7 +1821,7 @@ function SettingsPage() {
   }
 
   const handleCopyApiUrl = () => {
-    const url = `http://127.0.0.1:${httpApiPort}`
+    const url = `http://0.0.0.0:${httpApiPort}`
     navigator.clipboard.writeText(url)
     showMessage('已复制 API 地址', true)
   }
@@ -1870,7 +1870,7 @@ function SettingsPage() {
             <input
               type="text"
               className="field-input"
-              value={`http://127.0.0.1:${httpApiPort}`}
+              value={`http://0.0.0.0:${httpApiPort}`}
               readOnly
             />
             <button className="btn btn-secondary" onClick={handleCopyApiUrl} title="复制">
