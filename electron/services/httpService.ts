@@ -1268,25 +1268,6 @@ class HttpService {
   }
 
   /**
-   * 保存 Webhook 配置
-   */
-  public saveWebhookConfig(config: WebhookConfig): void {
-    this.configService.set('webhook', config)
-    console.log('[Webhook] 配置已保存')
-  }
-
-  /**
-   * 获取 Webhook 状态
-   */
-  public getWebhookStatus(): { enabled: boolean; url: string } {
-    const config = this.getWebhookConfig()
-    return {
-      enabled: config.enabled,
-      url: config.url
-    }
-  }
-
-  /**
    * 获取默认 Webhook 配置
    */
   private getDefaultWebhookConfig(): WebhookConfig {
@@ -1304,42 +1285,6 @@ class HttpService {
         groupKeywords: [],
         targetGroups: []
       }
-    }
-  }
-
-  /**
-   * 获取 Webhook 配置
-   */
-  private getWebhookConfig(): WebhookConfig {
-    try {
-      const config = this.configService.get('webhook') as WebhookConfig | undefined
-      return config || this.getDefaultWebhookConfig()
-    } catch {
-      return this.getDefaultWebhookConfig()
-    }
-  }
-
-  /**
-   * 判断是否应发送 Webhook
-   */
-
-
-  /**
-   * 保存 Webhook 配置
-   */
-  public saveWebhookConfig(config: WebhookConfig): void {
-    this.configService.set("webhook", config)
-    console.log("[Webhook] 配置已保存")
-  }
-
-  /**
-   * 获取 Webhook 状态
-   */
-  public getWebhookStatus(): { enabled: boolean; url: string } {
-    const config = this.getWebhookConfig()
-    return {
-      enabled: config.enabled,
-      url: config.url
     }
   }
 }
