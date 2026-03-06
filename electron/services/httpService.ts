@@ -1173,7 +1173,7 @@ class HttpService {
   }
 
   /**
-   * Process a single talker - only check latest message
+   * Process a single talker - use message key for deduplication
    */
   private async processTalker(talkerId: string, config: WebhookConfig): Promise<void> {
     console.log(`[Webhook] processTalker called: talkerId=${talkerId}`)
@@ -1193,14 +1193,13 @@ class HttpService {
     const message = messages[0]
     const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
 
-    // Check if this is actually a new message (timestamp > stored timestamp)
-    const lastTimestamp = this.sessionTimestamps.get(talkerId) || 0
-    if (message.timestamp <= lastTimestamp) {
-      console.log(`[Webhook] Message timestamp ${message.timestamp} <= last ${lastTimestamp}, skipping`)
+    console.log(`[Webhook] Checking message: key=${msgKey.substring(0, 60)}, processed=${this.processedMessages.has(msgKey)}`)
+
+    // Check if already processed using message key
+    if (this.processedMessages.has(msgKey)) {
+      console.log(`[Webhook] Message already processed, skipping`)
       return
     }
-
-    console.log(`[Webhook] Processing latest message: key=${msgKey.substring(0, 60)}`)
 
     // Mark as processed
     this.processedMessages.set(msgKey, Date.now())
