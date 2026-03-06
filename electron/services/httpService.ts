@@ -1181,35 +1181,39 @@ class HttpService {
     // Wait for database write
     await new Promise(r => setTimeout(r, 100))
 
-    // Get ONLY the latest message (not 5)
-    const messages = await this.getLatestMessages(talkerId, 1)
-    console.log(`[Webhook] Got ${messages?.length || 0} messages for ${talkerId}`)
+    // Get latest messages (10 to find unprocessed ones)
+    const messages = await this.getLatestMessages(talkerId, 10)
+    console.log(`[Webhook] Got ${messages?.length || 0} messages for ${talkerId} (checking for unprocessed)`)
     
     if (!messages || messages.length === 0) {
       console.log(`[Webhook] No messages for ${talkerId}, returning`)
       return
     }
 
-    // Only process the first (latest) message
-    const message = messages[0]
-    const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
-    console.log(`[Webhook] Processing latest message: key=${msgKey.substring(0, 60)}, alreadyProcessed=${this.processedMessages.has(msgKey)}`)
-    
-    if (this.processedMessages.has(msgKey)) {
-      console.log(`[Webhook] Message already processed, skipping`)
-      return
-    }
-    
-    this.processedMessages.set(msgKey, Date.now())
-    console.log(`[Webhook] Message marked as processed`)
+    // Process messages - find first unprocessed message that matches trigger
+    for (const message of messages) {
+      const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
+      console.log(`[Webhook] Checking message: key=${msgKey.substring(0, 60)}, alreadyProcessed=${this.processedMessages.has(msgKey)}`)
+      
+      if (this.processedMessages.has(msgKey)) {
+        console.log(`[Webhook] Message already processed, continue to next`)
+        continue
+      }
+      
+      this.processedMessages.set(msgKey, Date.now())
+      console.log(`[Webhook] Message marked as processed`)
 
-    const triggerType = this.getTriggerType(message, talkerId, config)
-    console.log(`[Webhook] Message triggerType=${triggerType}`)
-    
-    if (triggerType) {
-      console.log(`[Webhook] Calling sendWebhook`)
-      await this.sendWebhook(message, talkerId, config, triggerType)
+      const triggerType = this.getTriggerType(message, talkerId, config)
+      console.log(`[Webhook] Message triggerType=${triggerType}`)
+      
+      if (triggerType) {
+        console.log(`[Webhook] Calling sendWebhook`)
+        await this.sendWebhook(message, talkerId, config, triggerType)
+        return // Found and sent, exit
+      }
     }
+    
+    console.log(`[Webhook] No matching unprocessed messages found for ${talkerId}`)
   }
 
   /**
