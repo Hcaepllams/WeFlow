@@ -1146,12 +1146,17 @@ class HttpService {
         const lastTimestamp = session.lastTimestamp || 0
         const prevTimestamp = this.sessionTimestamps.get(talkerId) || 0
 
+        console.log(`[Webhook] Session ${talkerId}: lastTimestamp=${lastTimestamp}, prevTimestamp=${prevTimestamp}, diff=${lastTimestamp - prevTimestamp}`)
+
         // Only process sessions with updated timestamps
         if (lastTimestamp > prevTimestamp) {
+          console.log(`[Webhook] Session ${talkerId} has new messages, processing...`)
           this.sessionTimestamps.set(talkerId, lastTimestamp)
           this.sessionProcessTime.set(talkerId, now)
           await this.processTalker(talkerId, config)
           checkedCount++
+        } else {
+          console.log(`[Webhook] Session ${talkerId} no new messages (timestamp not updated)`)
         }
       }
 
