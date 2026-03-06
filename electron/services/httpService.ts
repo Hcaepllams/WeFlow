@@ -126,6 +126,8 @@ class HttpService {
   private connectionMutex: boolean = false
   private processedMessages: Map<string, number> = new Map()  // 用于 webhook 去重
   private sessionTimestamps: Map<string, number> = new Map()  // 存储每个会话的最后时间戳
+  private webhookSentMessages: Map<string, number> = new Map() // webhook 发送记录
+  private webhookCooldownMs: number = 5000 // 5秒内不重复发送同一消息
   private webhookConfig: WebhookConfig = this.getDefaultWebhookConfig()
 
   constructor() {
@@ -1240,6 +1242,24 @@ class HttpService {
    */
   private async sendWebhook(message: any, talkerId: string, config: WebhookConfig, triggerType: string): Promise<void> {
     try {
+      // Check cooldown - don't send duplicate webhook within 5 seconds
+      const msgKey = `${talkerId}_${message.timestamp}_${message.content?.slice(0, 50)}`
+      const lastSent = this.webhookSentMessages.get(msgKey)
+      const now = Date.now()
+      
+      if (lastSent && (now - lastSent) < this.webhookCooldownMs) {
+        console.log(`[Webhook] Skipping duplicate: ${talkerId} (sent ${now - lastSent}ms ago)`)
+        return
+      }
+      
+      this.webhookSentMessages.set(msgKey, now)
+      
+      // Clean up old entries
+      const cutoff = now - 60000 // Keep 1 minute of history
+      for (const [k, v] of this.webhookSentMessages) {
+        if (v < cutoff) this.webhookSentMessages.delete(k)
+      }
+
       const isGroup = talkerId.includes('@chatroom')
 
       const payload = {
