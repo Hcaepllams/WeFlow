@@ -1051,7 +1051,7 @@ class HttpService {
    */
   public saveWebhookConfig(config: WebhookConfig): void {
     this.configService.set('webhook', config)
-    console.log('[Webhook] 配置已保存')
+    console.log('[Webhook] 配置已保存，重启 HTTP API 服务后生效')
   }
 
   /**
@@ -1075,19 +1075,26 @@ class HttpService {
    * 处理 monitor 事件
    */
   private async handleMonitorEvent(type: string, json: string): Promise<void> {
+    console.log('[Webhook] 收到事件:', type)
     try {
       const config = this.getWebhookConfig()
-      if (!config.enabled || !config.url) return
+      console.log('[Webhook] 配置状态:', { enabled: config.enabled, url: config.url?.substring(0, 30) })
+      if (!config.enabled || !config.url) {
+        console.log('[Webhook] 未启用或URL为空，跳过')
+        return
+      }
 
       // 解析事件数据
       let eventData: any
       try {
         eventData = JSON.parse(json)
       } catch {
+        console.log('[Webhook] JSON解析失败')
         return
       }
 
       const talkerId = eventData.talker || eventData.sessionId
+      console.log('[Webhook] talkerId:', talkerId)
       if (!talkerId) return
 
       // 延迟等待数据库写入完成
@@ -1095,6 +1102,7 @@ class HttpService {
 
       // 获取最新消息
       const messages = await this.getLatestMessages(talkerId, 5)
+      console.log('[Webhook] 获取消息数:', messages?.length || 0)
       if (!messages || messages.length === 0) return
 
       // 处理新消息
@@ -1103,7 +1111,9 @@ class HttpService {
         if (this.processedMessages.has(msgKey)) continue
         this.processedMessages.set(msgKey, Date.now())
 
-        if (this.shouldSendWebhook(message, talkerId, config)) {
+        const shouldSend = this.shouldSendWebhook(message, talkerId, config)
+        console.log('[Webhook] 是否发送:', shouldSend, '消息:', message.content?.substring(0, 30))
+        if (shouldSend) {
           await this.sendWebhook(message, talkerId, config)
         }
       }
