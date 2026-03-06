@@ -1084,16 +1084,18 @@ class HttpService {
         return
       }
 
-      // 解析事件数据
+      // Parse event data
       let eventData: any
       try {
         eventData = JSON.parse(json)
+        console.log('[Webhook] Event data keys:', Object.keys(eventData))
+        console.log('[Webhook] Event data:', JSON.stringify(eventData).substring(0, 200))
       } catch {
         console.log('[Webhook] JSON parse failed')
         return
       }
 
-      const talkerId = eventData.talker || eventData.sessionId
+      const talkerId = eventData.talker || eventData.sessionId || eventData.username || eventData.id
       console.log('[Webhook] talkerId:', talkerId)
       if (!talkerId) return
 
