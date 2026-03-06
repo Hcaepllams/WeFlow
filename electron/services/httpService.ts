@@ -1154,10 +1154,10 @@ class HttpService {
       if (this.processedMessages.has(msgKey)) continue
       this.processedMessages.set(msgKey, Date.now())
 
-      const shouldSend = this.shouldSendWebhook(message, talkerId, config)
-      if (shouldSend) {
-        console.log('[Webhook] Sending for:', talkerId)
-        await this.sendWebhook(message, talkerId, config)
+      const triggerType = this.getTriggerType(message, talkerId, config)
+      if (triggerType) {
+        console.log('[Webhook] Sending for:', talkerId, 'type:', triggerType)
+        await this.sendWebhook(message, talkerId, config, triggerType)
       }
     }
   }
@@ -1179,66 +1179,67 @@ class HttpService {
   }
 
   /**
-   * 判断是否应该发送 Webhook
+   * Check if should send webhook and return trigger type
    */
-  private shouldSendWebhook(message: any, talkerId: string, config: WebhookConfig): boolean {
+  private getTriggerType(message: any, talkerId: string, config: WebhookConfig): string | null {
     const isGroup = talkerId.includes('@chatroom')
     const content = message.content || ''
     const senderName = message.accountName || ''
 
-    // 私聊检查
+    // Private chat check
     if (!isGroup && config.triggers.privateChat) {
       if (config.triggers.privateChatUsers.length > 0) {
         const isTarget = config.triggers.privateChatUsers.some(u =>
           senderName.includes(u)
         )
-        if (!isTarget) return false
+        if (!isTarget) return null
       }
       if (config.triggers.privateChatKeywords.length > 0) {
         const hasKeyword = config.triggers.privateChatKeywords.some(k =>
           content.includes(k)
         )
-        if (!hasKeyword) return false
+        if (!hasKeyword) return null
       }
-      return true
+      return 'private_chat'
     }
 
-    // 群聊检查
+    // Group check
     if (isGroup) {
       if (config.triggers.targetGroups.length > 0) {
         const isTarget = config.triggers.targetGroups.some(g =>
           talkerId.includes(g)
         )
-        if (!isTarget) return false
+        if (!isTarget) return null
       }
 
       if (config.triggers.groupAt) {
         const hasAt = config.triggers.groupAtKeywords.some(k =>
           content.includes(k)
         )
-        if (hasAt) return true
+        if (hasAt) return 'group_at'
       }
 
       if (config.triggers.groupKeyword) {
         const hasKeyword = config.triggers.groupKeywords.some(k =>
           content.includes(k)
         )
-        if (hasKeyword) return true
+        if (hasKeyword) return 'group_keyword'
       }
     }
 
-    return false
+    return null
   }
 
   /**
-   * 发送 Webhook
+   * Send Webhook
    */
-  private async sendWebhook(message: any, talkerId: string, config: WebhookConfig): Promise<void> {
+  private async sendWebhook(message: any, talkerId: string, config: WebhookConfig, triggerType: string): Promise<void> {
     try {
       const isGroup = talkerId.includes('@chatroom')
 
       const payload = {
         type: isGroup ? 'group' : 'private',
+        trigger_type: triggerType,
         timestamp: Date.now(),
         wechatTimestamp: message.timestamp,
         session: {
@@ -1270,9 +1271,9 @@ class HttpService {
       }
 
       await this.postRequest(config.url, payload, headers)
-      console.log(`[Webhook] 发送成功: ${talkerId}`)
+      console.log(`[Webhook] Sent: ${talkerId}, type: ${triggerType}`)
     } catch (error) {
-      console.error('[Webhook] 发送失败:', error)
+      console.error('[Webhook] Send failed:', error)
     }
   }
 
