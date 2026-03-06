@@ -129,7 +129,7 @@ class HttpService {
   private webhookSentMessages: Map<string, number> = new Map() // webhook 发送记录
   private webhookCooldownMs: number = 5000 // 5秒内不重复发送同一消息
   private lastEventProcessTime: number = 0 // 上次处理事件的时间
-  private eventProcessCooldownMs: number = 2000 // 事件处理冷却：2秒
+  private eventProcessCooldownMs: number = 30000 // 事件处理冷却：30秒
   private webhookMonitorStarted: boolean = false // 防止重复注册
   private webhookConfig: WebhookConfig = this.getDefaultWebhookConfig()
 
