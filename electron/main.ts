@@ -2365,6 +2365,22 @@ app.whenReady().then(async () => {
   // 启动时检测更新（不阻塞启动）
   checkForUpdatesOnStartup()
 
+  // Auto-start HTTP API if enabled
+  const httpApiAutoStart = configService?.get('httpApiAutoStart')
+  if (httpApiAutoStart === true) {
+    const httpApiPort = configService?.get('httpApiPort') || 5031
+    console.log('[Main] Auto-starting HTTP API on port', httpApiPort)
+    httpService.start(httpApiPort).then((result) => {
+      if (result.success) {
+        console.log('[Main] HTTP API auto-started on port', result.port)
+      } else {
+        console.error('[Main] HTTP API auto-start failed:', result.error)
+      }
+    }).catch((err) => {
+      console.error('[Main] HTTP API auto-start error:', err)
+    })
+  }
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = createWindow()

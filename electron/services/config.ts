@@ -45,6 +45,10 @@ interface ConfigSchema {
   // 更新相关
   ignoredUpdateVersion: string
 
+  // HTTP API
+  httpApiAutoStart: boolean
+  httpApiPort: number
+
   // 通知
   notificationEnabled: boolean
   notificationPosition: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left'
@@ -129,6 +133,8 @@ export class ConfigService {
         authUseHello: false,
         authHelloSecret: '',
         ignoredUpdateVersion: '',
+        httpApiAutoStart: true,
+        httpApiPort: 5031,
         notificationEnabled: true,
         notificationPosition: 'top-right',
         notificationFilterMode: 'all',
