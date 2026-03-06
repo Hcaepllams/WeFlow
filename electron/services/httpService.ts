@@ -1099,14 +1099,13 @@ class HttpService {
    */
   private async checkAllSessions(config: WebhookConfig): Promise<void> {
     try {
-      const url = `http://127.0.0.1:${this.port}/api/v1/sessions?limit=100`
-      const res = await this.request(url)
+      const sessionsResult = await chatService.getSessions()
       
-      if (res.status !== 200 || !res.data.sessions) {
+      if (!sessionsResult.success || !sessionsResult.sessions) {
         return
       }
 
-      const sessions = res.data.sessions
+      const sessions = sessionsResult.sessions
       console.log('[Webhook] Checking', sessions.length, 'sessions')
 
       let checkedCount = 0
@@ -1167,10 +1166,16 @@ class HttpService {
    */
   private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
-      const url = `${this.configService.get('weflowApiUrl') || 'http://127.0.0.1:5031'}/api/v1/messages?talker=${talkerId}&limit=${limit}&chatlab=1`
-      const res = await this.request(url)
-      if (res.status === 200 && res.data.messages) {
-        return res.data.messages
+      const result = await chatService.getMessages(talkerId, limit)
+      if (result.success && result.messages) {
+        return result.messages.map((m: any) => ({
+          sender: m.senderUsername,
+          timestamp: m.createTime,
+          content: m.parsedContent || m.content,
+          type: m.localType,
+          accountName: m.senderDisplayName || m.senderUsername,
+          groupNickname: m.groupNickname
+        }))
       }
       return []
     } catch (e) {
