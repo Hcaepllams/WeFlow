@@ -126,10 +126,10 @@ class HttpService {
   private connectionMutex: boolean = false
   private processedMessages: Map<string, number> = new Map()  // 用于 webhook 去重
   private sessionTimestamps: Map<string, number> = new Map()  // 存储每个会话的最后时间戳
+  private sessionProcessTime: Map<string, number> = new Map()  // 每个会话的处理时间（替代全局冷却）
+  private sessionProcessCooldownMs: number = 5000 // 每个会话5秒冷却
   private webhookSentMessages: Map<string, number> = new Map() // webhook 发送记录
   private webhookCooldownMs: number = 5000 // 5秒内不重复发送同一消息
-  private lastEventProcessTime: number = 0 // 上次处理事件的时间
-  private eventProcessCooldownMs: number = 30000 // 事件处理冷却：30秒
   private webhookMonitorStarted: boolean = false // 防止重复注册
   private webhookConfig: WebhookConfig = this.getDefaultWebhookConfig()
 
@@ -1097,17 +1097,6 @@ class HttpService {
   private async handleMonitorEvent(type: string, json: string): Promise<void> {
     console.log(`[Webhook] handleMonitorEvent called: type=${type}, time=${Date.now()}`)
     
-    // Global cooldown between events
-    const now = Date.now()
-    const timeSinceLast = now - this.lastEventProcessTime
-    console.log(`[Webhook] Global cooldown check: now=${now}, last=${this.lastEventProcessTime}, diff=${timeSinceLast}, cooldown=${this.eventProcessCooldownMs}`)
-    
-    if (timeSinceLast < this.eventProcessCooldownMs) {
-      console.log(`[Webhook] Event skipped: global cooldown (only ${timeSinceLast}ms since last)`)
-      return
-    }
-    this.lastEventProcessTime = now
-    
     console.log('[Webhook] Event accepted, processing...')
     try {
       const config = this.getWebhookConfig()
@@ -1133,7 +1122,7 @@ class HttpService {
   private async checkAllSessions(config: WebhookConfig): Promise<void> {
     try {
       const sessionsResult = await chatService.getSessions()
-      
+
       if (!sessionsResult.success || !sessionsResult.sessions) {
         return
       }
@@ -1145,20 +1134,29 @@ class HttpService {
       for (const session of sessions) {
         const talkerId = session.username
         if (!talkerId) continue
-        
+
+        // Check per-session cooldown
+        const now = Date.now()
+        const lastProcessTime = this.sessionProcessTime.get(talkerId) || 0
+        if (now - lastProcessTime < this.sessionProcessCooldownMs) {
+          console.log(`[Webhook] Session ${talkerId} skipped: cooldown (${now - lastProcessTime}ms)`)
+          continue
+        }
+
         const lastTimestamp = session.lastTimestamp || 0
         const prevTimestamp = this.sessionTimestamps.get(talkerId) || 0
-        
+
         // Only process sessions with updated timestamps
         if (lastTimestamp > prevTimestamp) {
           this.sessionTimestamps.set(talkerId, lastTimestamp)
+          this.sessionProcessTime.set(talkerId, now)
           await this.processTalker(talkerId, config)
           checkedCount++
         }
       }
-      
+
       console.log('[Webhook] Processed', checkedCount, 'updated sessions')
-      
+
       // Clean up cache
       const cutoff = Date.now() - 300 * 1000
       for (const [k, v] of this.processedMessages) {
