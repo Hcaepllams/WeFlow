@@ -1064,6 +1064,8 @@ class HttpService {
    * Start Webhook monitor (event-driven)
    */
   private startWebhookMonitor(): void {
+    console.log('[Webhook] startWebhookMonitor called, started=', this.webhookMonitorStarted)
+    
     // Prevent multiple registrations
     if (this.webhookMonitorStarted) {
       console.log('[Webhook] Monitor already started, skip')
@@ -1071,32 +1073,42 @@ class HttpService {
     }
 
     const config = this.getWebhookConfig()
+    console.log('[Webhook] Config check:', { enabled: config.enabled, url: config.url })
+    
     if (!config.enabled) {
       console.log('[Webhook] Not enabled')
       return
     }
 
     this.webhookMonitorStarted = true
-    console.log('[Webhook] Starting event-driven monitor')
+    console.log('[Webhook] Registering monitor handler...')
     
     registerMonitorHandler((type: string, json: string) => {
+      console.log('[Webhook] Handler called with type:', type, 'json:', json.substring(0, 100))
       this.handleMonitorEvent(type, json)
     })
+    
+    console.log('[Webhook] Handler registered successfully')
   }
 
   /**
    * Handle monitor event
    */
   private async handleMonitorEvent(type: string, json: string): Promise<void> {
+    console.log(`[Webhook] handleMonitorEvent called: type=${type}, time=${Date.now()}`)
+    
     // Global cooldown between events
     const now = Date.now()
-    if (now - this.lastEventProcessTime < this.eventProcessCooldownMs) {
-      console.log('[Webhook] Event skipped: global cooldown')
+    const timeSinceLast = now - this.lastEventProcessTime
+    console.log(`[Webhook] Global cooldown check: now=${now}, last=${this.lastEventProcessTime}, diff=${timeSinceLast}, cooldown=${this.eventProcessCooldownMs}`)
+    
+    if (timeSinceLast < this.eventProcessCooldownMs) {
+      console.log(`[Webhook] Event skipped: global cooldown (only ${timeSinceLast}ms since last)`)
       return
     }
     this.lastEventProcessTime = now
     
-    console.log('[Webhook] Event received:', type)
+    console.log('[Webhook] Event accepted, processing...')
     try {
       const config = this.getWebhookConfig()
       console.log('[Webhook] Config status:', { enabled: config.enabled, url: config.url?.substring(0, 30) })
@@ -1106,8 +1118,9 @@ class HttpService {
       }
 
       // Event doesn't contain talkerId, check all sessions
-      console.log('[Webhook] Checking all sessions...')
+      console.log('[Webhook] Calling checkAllSessions...')
       await this.checkAllSessions(config)
+      console.log('[Webhook] checkAllSessions completed')
       
     } catch (error) {
       console.error('[Webhook] Handle event failed:', error)
@@ -1160,22 +1173,39 @@ class HttpService {
    * Process a single talker
    */
   private async processTalker(talkerId: string, config: WebhookConfig): Promise<void> {
+    console.log(`[Webhook] processTalker called: talkerId=${talkerId}`)
+    
     // Wait for database write
     await new Promise(r => setTimeout(r, 100))
 
     // Get latest messages
     const messages = await this.getLatestMessages(talkerId, 5)
-    if (!messages || messages.length === 0) return
+    console.log(`[Webhook] Got ${messages?.length || 0} messages for ${talkerId}`)
+    
+    if (!messages || messages.length === 0) {
+      console.log(`[Webhook] No messages for ${talkerId}, returning`)
+      return
+    }
 
     // Process new messages
-    for (const message of messages) {
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i]
       const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
-      if (this.processedMessages.has(msgKey)) continue
+      console.log(`[Webhook] Processing message ${i}: key=${msgKey.substring(0, 60)}, alreadyProcessed=${this.processedMessages.has(msgKey)}`)
+      
+      if (this.processedMessages.has(msgKey)) {
+        console.log(`[Webhook] Message ${i} already processed, skipping`)
+        continue
+      }
+      
       this.processedMessages.set(msgKey, Date.now())
+      console.log(`[Webhook] Message ${i} marked as processed`)
 
       const triggerType = this.getTriggerType(message, talkerId, config)
+      console.log(`[Webhook] Message ${i} triggerType=${triggerType}`)
+      
       if (triggerType) {
-        console.log('[Webhook] Sending for:', talkerId, 'type:', triggerType)
+        console.log(`[Webhook] Calling sendWebhook for message ${i}`)
         await this.sendWebhook(message, talkerId, config, triggerType)
       }
     }
@@ -1265,12 +1295,15 @@ class HttpService {
       const lastSent = this.webhookSentMessages.get(msgKey)
       const now = Date.now()
       
+      console.log(`[Webhook] sendWebhook called: talkerId=${talkerId}, msgKey=${msgKey.substring(0, 80)}, lastSent=${lastSent}, now=${now}`)
+      
       if (lastSent && (now - lastSent) < this.webhookCooldownMs) {
-        console.log(`[Webhook] Skipping duplicate: ${talkerId} (sent ${now - lastSent}ms ago)`)
+        console.log(`[Webhook] Skipping duplicate: ${talkerId} (sent ${now - lastSent}ms ago, cooldown=${this.webhookCooldownMs}ms)`)
         return
       }
       
       this.webhookSentMessages.set(msgKey, now)
+      console.log(`[Webhook] Message added to sent map. Map size: ${this.webhookSentMessages.size}`)
       
       // Clean up old entries
       const cutoff = now - 60000 // Keep 1 minute of history
