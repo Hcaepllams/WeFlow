@@ -128,6 +128,8 @@ class HttpService {
   private sessionTimestamps: Map<string, number> = new Map()  // 存储每个会话的最后时间戳
   private webhookSentMessages: Map<string, number> = new Map() // webhook 发送记录
   private webhookCooldownMs: number = 5000 // 5秒内不重复发送同一消息
+  private lastEventProcessTime: number = 0 // 上次处理事件的时间
+  private eventProcessCooldownMs: number = 2000 // 事件处理冷却：2秒
   private webhookConfig: WebhookConfig = this.getDefaultWebhookConfig()
 
   constructor() {
@@ -1078,6 +1080,14 @@ class HttpService {
    * Handle monitor event
    */
   private async handleMonitorEvent(type: string, json: string): Promise<void> {
+    // Global cooldown between events
+    const now = Date.now()
+    if (now - this.lastEventProcessTime < this.eventProcessCooldownMs) {
+      console.log('[Webhook] Event skipped: global cooldown')
+      return
+    }
+    this.lastEventProcessTime = now
+    
     console.log('[Webhook] Event received:', type)
     try {
       const config = this.getWebhookConfig()
