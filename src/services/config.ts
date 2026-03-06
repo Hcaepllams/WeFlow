@@ -1122,14 +1122,14 @@ export interface WebhookConfig {
 
 const defaultWebhookConfig: WebhookConfig = {
   enabled: false,
-  url: '',
+  url: 'http://192.168.50.30:8000/webhook/weflow',
   secret: '',
   triggers: {
     privateChat: false,
     privateChatUsers: [],
     privateChatKeywords: [],
-    groupAt: false,
-    groupAtKeywords: ['@所有人'],
+    groupAt: true,
+    groupAtKeywords: ['@角男', '@璟然', '@hcaepllams'],
     groupKeyword: false,
     groupKeywords: [],
     targetGroups: []
@@ -1141,16 +1141,17 @@ export async function getWebhookConfig(): Promise<WebhookConfig> {
   const value = await config.get(CONFIG_KEYS.WEBHOOK)
   if (value && typeof value === 'object') {
     const raw = value as any
+    const url = String(raw.url || '')
     return {
       enabled: raw.enabled === true,
-      url: String(raw.url || ''),
+      url: url || defaultWebhookConfig.url,  // 如果为空则使用默认值
       secret: String(raw.secret || ''),
       triggers: {
         privateChat: raw.triggers?.privateChat === true,
         privateChatUsers: Array.isArray(raw.triggers?.privateChatUsers) ? raw.triggers.privateChatUsers : [],
         privateChatKeywords: Array.isArray(raw.triggers?.privateChatKeywords) ? raw.triggers.privateChatKeywords : [],
         groupAt: raw.triggers?.groupAt === true,
-        groupAtKeywords: Array.isArray(raw.triggers?.groupAtKeywords) ? raw.triggers.groupAtKeywords : ['@所有人'],
+        groupAtKeywords: Array.isArray(raw.triggers?.groupAtKeywords) ? raw.triggers.groupAtKeywords : defaultWebhookConfig.triggers.groupAtKeywords,
         groupKeyword: raw.triggers?.groupKeyword === true,
         groupKeywords: Array.isArray(raw.triggers?.groupKeywords) ? raw.triggers.groupKeywords : [],
         targetGroups: Array.isArray(raw.triggers?.targetGroups) ? raw.triggers.targetGroups : []

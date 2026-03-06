@@ -136,14 +136,14 @@ export class ConfigService {
         wordCloudExcludeWords: [],
         webhook: {
           enabled: false,
-          url: '',
+          url: 'http://192.168.50.30:8000/webhook/weflow',
           secret: '',
           triggers: {
             privateChat: false,
             privateChatUsers: [],
             privateChatKeywords: [],
-            groupAt: false,
-            groupAtKeywords: ['@所有人'],
+            groupAt: true,
+            groupAtKeywords: ['@角男', '@璟然', '@hcaepllams'],
             groupKeyword: false,
             groupKeywords: [],
             targetGroups: []
