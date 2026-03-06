@@ -1072,7 +1072,7 @@ class HttpService {
   }
 
   /**
-   * 处理 monitor 事件
+   * Handle monitor event
    */
   private async handleMonitorEvent(type: string, json: string): Promise<void> {
     console.log('[Webhook] Event received:', type)
@@ -1084,18 +1084,9 @@ class HttpService {
         return
       }
 
-      // Parse talkerId from event
-      let talkerId = this.parseTalkerIdFromEvent(json)
-      
-      if (!talkerId) {
-        // No talkerId in event, try to get from session list
-        console.log('[Webhook] No talkerId, checking all sessions...')
-        await this.checkAllSessions(config)
-        return
-      }
-
-      console.log('[Webhook] Parsed talkerId:', talkerId)
-      await this.processTalker(talkerId, config)
+      // Event doesn't contain talkerId, check all sessions
+      console.log('[Webhook] Checking all sessions...')
+      await this.checkAllSessions(config)
       
     } catch (error) {
       console.error('[Webhook] Handle event failed:', error)
@@ -1325,61 +1316,6 @@ class HttpService {
         groupKeywords: [],
         targetGroups: []
       }
-    }
-  }
-
-  /**
-   * Collect session IDs from event payload
-   */
-  private collectSessionIdsFromPayload(payload: unknown): Set<string> {
-    const ids = new Set<string>()
-    const walk = (value: unknown, keyHint?: string) => {
-      if (Array.isArray(value)) {
-        for (const item of value) walk(item, keyHint)
-        return
-      }
-      if (value && typeof value === 'object') {
-        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-          walk(v, k)
-        }
-        return
-      }
-      if (typeof value !== 'string') return
-      const normalized = value.trim()
-      if (!normalized) return
-      const lowerKey = String(keyHint || '').toLowerCase()
-      const keyLooksLikeSession = (
-        lowerKey.includes('session') ||
-        lowerKey.includes('talker') ||
-        lowerKey.includes('username') ||
-        lowerKey.includes('chatroom')
-      )
-      if (!keyLooksLikeSession && !normalized.includes('@chatroom')) {
-        return
-      }
-      ids.add(normalized)
-    }
-    walk(payload)
-    return ids
-  }
-
-  /**
-   * Parse event data to get talkerId
-   */
-  private parseTalkerIdFromEvent(json: string): string | null {
-    console.log('[Webhook] Parsing event json:', json.substring(0, 500))
-    try {
-      const eventData = JSON.parse(json)
-      console.log('[Webhook] Event data full:', JSON.stringify(eventData))
-      const ids = this.collectSessionIdsFromPayload(eventData)
-      console.log('[Webhook] Collected IDs:', Array.from(ids))
-      if (ids.size > 0) {
-        return Array.from(ids)[0]
-      }
-      return null
-    } catch (e) {
-      console.log('[Webhook] Parse error:', e)
-      return null
     }
   }
 }
