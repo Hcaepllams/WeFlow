@@ -130,6 +130,7 @@ class HttpService {
   private webhookCooldownMs: number = 5000 // 5秒内不重复发送同一消息
   private lastEventProcessTime: number = 0 // 上次处理事件的时间
   private eventProcessCooldownMs: number = 2000 // 事件处理冷却：2秒
+  private webhookMonitorStarted: boolean = false // 防止重复注册
   private webhookConfig: WebhookConfig = this.getDefaultWebhookConfig()
 
   constructor() {
@@ -1063,12 +1064,19 @@ class HttpService {
    * Start Webhook monitor (event-driven)
    */
   private startWebhookMonitor(): void {
+    // Prevent multiple registrations
+    if (this.webhookMonitorStarted) {
+      console.log('[Webhook] Monitor already started, skip')
+      return
+    }
+
     const config = this.getWebhookConfig()
     if (!config.enabled) {
       console.log('[Webhook] Not enabled')
       return
     }
 
+    this.webhookMonitorStarted = true
     console.log('[Webhook] Starting event-driven monitor')
     
     registerMonitorHandler((type: string, json: string) => {
