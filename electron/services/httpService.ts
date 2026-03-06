@@ -1084,30 +1084,23 @@ class HttpService {
         return
       }
 
-      // Parse event data
-      let eventData: any
-      try {
-        eventData = JSON.parse(json)
-        console.log('[Webhook] Event data keys:', Object.keys(eventData))
-        console.log('[Webhook] Event data:', JSON.stringify(eventData).substring(0, 200))
-      } catch {
-        console.log('[Webhook] JSON parse failed')
+      // Parse talkerId from event
+      const talkerId = this.parseTalkerIdFromEvent(json)
+      console.log('[Webhook] Parsed talkerId:', talkerId)
+      if (!talkerId) {
+        console.log('[Webhook] No talkerId found, skip')
         return
       }
 
-      const talkerId = eventData.talker || eventData.sessionId || eventData.username || eventData.id
-      console.log('[Webhook] talkerId:', talkerId)
-      if (!talkerId) return
-
-      // 延迟等待数据库写入完成
+      // Wait for database write to complete
       await new Promise(r => setTimeout(r, 100))
 
-      // 获取最新消息
+      // Get latest messages
       const messages = await this.getLatestMessages(talkerId, 5)
       console.log('[Webhook] Messages count:', messages?.length || 0)
       if (!messages || messages.length === 0) return
 
-      // 处理新消息
+      // Process new messages
       for (const message of messages) {
         const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
         if (this.processedMessages.has(msgKey)) continue
@@ -1120,7 +1113,7 @@ class HttpService {
         }
       }
 
-      // 清理过期缓存
+      // Clean up expired cache
       const cutoff = Date.now() - 300 * 1000
       for (const [k, v] of this.processedMessages) {
         if (v < cutoff) this.processedMessages.delete(k)
@@ -1131,7 +1124,7 @@ class HttpService {
   }
 
   /**
-   * 获取最新消息
+   * Get latest messages
    */
   private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
@@ -1280,7 +1273,7 @@ class HttpService {
   }
 
   /**
-   * 获取默认 Webhook 配置
+   * Get default Webhook config
    */
   private getDefaultWebhookConfig(): WebhookConfig {
     return {
@@ -1297,6 +1290,57 @@ class HttpService {
         groupKeywords: [],
         targetGroups: []
       }
+    }
+  }
+
+  /**
+   * Collect session IDs from event payload
+   */
+  private collectSessionIdsFromPayload(payload: unknown): Set<string> {
+    const ids = new Set<string>()
+    const walk = (value: unknown, keyHint?: string) => {
+      if (Array.isArray(value)) {
+        for (const item of value) walk(item, keyHint)
+        return
+      }
+      if (value && typeof value === 'object') {
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+          walk(v, k)
+        }
+        return
+      }
+      if (typeof value !== 'string') return
+      const normalized = value.trim()
+      if (!normalized) return
+      const lowerKey = String(keyHint || '').toLowerCase()
+      const keyLooksLikeSession = (
+        lowerKey.includes('session') ||
+        lowerKey.includes('talker') ||
+        lowerKey.includes('username') ||
+        lowerKey.includes('chatroom')
+      )
+      if (!keyLooksLikeSession && !normalized.includes('@chatroom')) {
+        return
+      }
+      ids.add(normalized)
+    }
+    walk(payload)
+    return ids
+  }
+
+  /**
+   * Parse event data to get talkerId
+   */
+  private parseTalkerIdFromEvent(json: string): string | null {
+    try {
+      const eventData = JSON.parse(json)
+      const ids = this.collectSessionIdsFromPayload(eventData)
+      if (ids.size > 0) {
+        return Array.from(ids)[0]
+      }
+      return null
+    } catch {
+      return null
     }
   }
 }
