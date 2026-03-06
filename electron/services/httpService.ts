@@ -1047,24 +1047,24 @@ class HttpService {
   }
 
   /**
-   * 保存 Webhook 配置
+   * Save Webhook config
    */
   public saveWebhookConfig(config: WebhookConfig): void {
     this.configService.set('webhook', config)
-    console.log('[Webhook] 配置已保存，重启 HTTP API 服务后生效')
+    console.log('[Webhook] Config saved, restart HTTP API to apply')
   }
 
   /**
-   * 启动 Webhook 监听（事件驱动）
+   * Start Webhook monitor (event-driven)
    */
   private startWebhookMonitor(): void {
     const config = this.getWebhookConfig()
     if (!config.enabled) {
-      console.log('[Webhook] 未启用')
+      console.log('[Webhook] Not enabled')
       return
     }
 
-    console.log('[Webhook] 启动事件驱动监听')
+    console.log('[Webhook] Starting event-driven monitor')
     
     registerMonitorHandler((type: string, json: string) => {
       this.handleMonitorEvent(type, json)
@@ -1075,12 +1075,12 @@ class HttpService {
    * 处理 monitor 事件
    */
   private async handleMonitorEvent(type: string, json: string): Promise<void> {
-    console.log('[Webhook] 收到事件:', type)
+    console.log('[Webhook] Event received:', type)
     try {
       const config = this.getWebhookConfig()
-      console.log('[Webhook] 配置状态:', { enabled: config.enabled, url: config.url?.substring(0, 30) })
+      console.log('[Webhook] Config status:', { enabled: config.enabled, url: config.url?.substring(0, 30) })
       if (!config.enabled || !config.url) {
-        console.log('[Webhook] 未启用或URL为空，跳过')
+        console.log('[Webhook] Disabled or URL empty, skip')
         return
       }
 
@@ -1089,7 +1089,7 @@ class HttpService {
       try {
         eventData = JSON.parse(json)
       } catch {
-        console.log('[Webhook] JSON解析失败')
+        console.log('[Webhook] JSON parse failed')
         return
       }
 
@@ -1102,7 +1102,7 @@ class HttpService {
 
       // 获取最新消息
       const messages = await this.getLatestMessages(talkerId, 5)
-      console.log('[Webhook] 获取消息数:', messages?.length || 0)
+      console.log('[Webhook] Messages count:', messages?.length || 0)
       if (!messages || messages.length === 0) return
 
       // 处理新消息
@@ -1112,7 +1112,7 @@ class HttpService {
         this.processedMessages.set(msgKey, Date.now())
 
         const shouldSend = this.shouldSendWebhook(message, talkerId, config)
-        console.log('[Webhook] 是否发送:', shouldSend, '消息:', message.content?.substring(0, 30))
+        console.log('[Webhook] Should send:', shouldSend, 'Msg:', message.content?.substring(0, 30))
         if (shouldSend) {
           await this.sendWebhook(message, talkerId, config)
         }
@@ -1124,7 +1124,7 @@ class HttpService {
         if (v < cutoff) this.processedMessages.delete(k)
       }
     } catch (error) {
-      console.error('[Webhook] 处理事件失败:', error)
+      console.error('[Webhook] Handle event failed:', error)
     }
   }
 
