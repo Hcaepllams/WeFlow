@@ -125,6 +125,7 @@ class HttpService {
   private connections: Set<import('net').Socket> = new Set()
   private connectionMutex: boolean = false
   private processedMessages: Map<string, number> = new Map()  // 用于 webhook 去重
+  private sessionTimestamps: Map<string, number> = new Map()  // 存储每个会话的最后时间戳
   private webhookConfig: WebhookConfig = this.getDefaultWebhookConfig()
 
   constructor() {
@@ -1108,11 +1109,23 @@ class HttpService {
       const sessions = res.data.sessions
       console.log('[Webhook] Checking', sessions.length, 'sessions')
 
+      let checkedCount = 0
       for (const session of sessions) {
         const talkerId = session.username
         if (!talkerId) continue
-        await this.processTalker(talkerId, config)
+        
+        const lastTimestamp = session.lastTimestamp || 0
+        const prevTimestamp = this.sessionTimestamps.get(talkerId) || 0
+        
+        // Only process sessions with updated timestamps
+        if (lastTimestamp > prevTimestamp) {
+          this.sessionTimestamps.set(talkerId, lastTimestamp)
+          await this.processTalker(talkerId, config)
+          checkedCount++
+        }
       }
+      
+      console.log('[Webhook] Processed', checkedCount, 'updated sessions')
       
       // Clean up cache
       const cutoff = Date.now() - 300 * 1000
