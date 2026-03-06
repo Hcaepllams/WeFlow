@@ -282,34 +282,6 @@ export function ExportDefaultsSettingsForm({
 
       <div className="form-group">
         <div className="form-copy">
-          <label>默认语音转文字</label>
-          <span className="form-hint">导出时默认将语音转写为文字</span>
-        </div>
-        <div className="form-control">
-          <div className="log-toggle-line">
-            <span className="log-status">{exportDefaultVoiceAsText ? '已开启' : '已关闭'}</span>
-            <label className="switch" htmlFor="shared-export-default-voice-as-text">
-              <input
-                id="shared-export-default-voice-as-text"
-                className="switch-input"
-                type="checkbox"
-                checked={exportDefaultVoiceAsText}
-                onChange={async (e) => {
-                  const enabled = e.target.checked
-                  setExportDefaultVoiceAsText(enabled)
-                  await configService.setExportDefaultVoiceAsText(enabled)
-                  onDefaultsChanged?.({ voiceAsText: enabled })
-                  notify(enabled ? '已开启默认语音转文字' : '已关闭默认语音转文字', true)
-                }}
-              />
-              <span className="switch-slider" />
-            </label>
-          </div>
-        </div>
-      </div>
-
-      <div className="form-group">
-        <div className="form-copy">
           <label>Excel 列显示</label>
           <span className="form-hint">控制 Excel 导出的列字段</span>
         </div>
@@ -350,6 +322,34 @@ export function ExportDefaultsSettingsForm({
                 ))}
               </div>
             )}
+          </div>
+        </div>
+      </div>
+
+      <div className="form-group">
+        <div className="form-copy">
+          <label>默认语音转文字</label>
+          <span className="form-hint">导出时默认将语音转写为文字</span>
+        </div>
+        <div className="form-control">
+          <div className="log-toggle-line">
+            <span className="log-status">{exportDefaultVoiceAsText ? '已开启' : '已关闭'}</span>
+            <label className="switch" htmlFor="shared-export-default-voice-as-text">
+              <input
+                id="shared-export-default-voice-as-text"
+                className="switch-input"
+                type="checkbox"
+                checked={exportDefaultVoiceAsText}
+                onChange={async (e) => {
+                  const enabled = e.target.checked
+                  setExportDefaultVoiceAsText(enabled)
+                  await configService.setExportDefaultVoiceAsText(enabled)
+                  onDefaultsChanged?.({ voiceAsText: enabled })
+                  notify(enabled ? '已开启默认语音转文字' : '已关闭默认语音转文字', true)
+                }}
+              />
+              <span className="switch-slider" />
+            </label>
           </div>
         </div>
       </div>
