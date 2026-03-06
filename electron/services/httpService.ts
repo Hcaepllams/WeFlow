@@ -1085,41 +1085,76 @@ class HttpService {
       }
 
       // Parse talkerId from event
-      const talkerId = this.parseTalkerIdFromEvent(json)
-      console.log('[Webhook] Parsed talkerId:', talkerId)
+      let talkerId = this.parseTalkerIdFromEvent(json)
+      
       if (!talkerId) {
-        console.log('[Webhook] No talkerId found, skip')
+        // No talkerId in event, try to get from session list
+        console.log('[Webhook] No talkerId, checking all sessions...')
+        await this.checkAllSessions(config)
         return
       }
 
-      // Wait for database write to complete
-      await new Promise(r => setTimeout(r, 100))
+      console.log('[Webhook] Parsed talkerId:', talkerId)
+      await this.processTalker(talkerId, config)
+      
+    } catch (error) {
+      console.error('[Webhook] Handle event failed:', error)
+    }
+  }
 
-      // Get latest messages
-      const messages = await this.getLatestMessages(talkerId, 5)
-      console.log('[Webhook] Messages count:', messages?.length || 0)
-      if (!messages || messages.length === 0) return
-
-      // Process new messages
-      for (const message of messages) {
-        const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
-        if (this.processedMessages.has(msgKey)) continue
-        this.processedMessages.set(msgKey, Date.now())
-
-        const shouldSend = this.shouldSendWebhook(message, talkerId, config)
-        console.log('[Webhook] Should send:', shouldSend, 'Msg:', message.content?.substring(0, 30))
-        if (shouldSend) {
-          await this.sendWebhook(message, talkerId, config)
-        }
+  /**
+   * Check all sessions for new messages
+   */
+  private async checkAllSessions(config: WebhookConfig): Promise<void> {
+    try {
+      const url = `http://127.0.0.1:${this.port}/api/v1/sessions?limit=100`
+      const res = await this.request(url)
+      
+      if (res.status !== 200 || !res.data.sessions) {
+        return
       }
 
-      // Clean up expired cache
+      const sessions = res.data.sessions
+      console.log('[Webhook] Checking', sessions.length, 'sessions')
+
+      for (const session of sessions) {
+        const talkerId = session.username
+        if (!talkerId) continue
+        await this.processTalker(talkerId, config)
+      }
+      
+      // Clean up cache
       const cutoff = Date.now() - 300 * 1000
       for (const [k, v] of this.processedMessages) {
         if (v < cutoff) this.processedMessages.delete(k)
       }
     } catch (error) {
-      console.error('[Webhook] Handle event failed:', error)
+      console.error('[Webhook] Check all sessions failed:', error)
+    }
+  }
+
+  /**
+   * Process a single talker
+   */
+  private async processTalker(talkerId: string, config: WebhookConfig): Promise<void> {
+    // Wait for database write
+    await new Promise(r => setTimeout(r, 100))
+
+    // Get latest messages
+    const messages = await this.getLatestMessages(talkerId, 5)
+    if (!messages || messages.length === 0) return
+
+    // Process new messages
+    for (const message of messages) {
+      const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
+      if (this.processedMessages.has(msgKey)) continue
+      this.processedMessages.set(msgKey, Date.now())
+
+      const shouldSend = this.shouldSendWebhook(message, talkerId, config)
+      if (shouldSend) {
+        console.log('[Webhook] Sending for:', talkerId)
+        await this.sendWebhook(message, talkerId, config)
+      }
     }
   }
 
@@ -1332,14 +1367,18 @@ class HttpService {
    * Parse event data to get talkerId
    */
   private parseTalkerIdFromEvent(json: string): string | null {
+    console.log('[Webhook] Parsing event json:', json.substring(0, 500))
     try {
       const eventData = JSON.parse(json)
+      console.log('[Webhook] Event data full:', JSON.stringify(eventData))
       const ids = this.collectSessionIdsFromPayload(eventData)
+      console.log('[Webhook] Collected IDs:', Array.from(ids))
       if (ids.size > 0) {
         return Array.from(ids)[0]
       }
       return null
-    } catch {
+    } catch (e) {
+      console.log('[Webhook] Parse error:', e)
       return null
     }
   }
