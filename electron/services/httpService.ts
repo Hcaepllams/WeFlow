@@ -1192,12 +1192,18 @@ class HttpService {
     try {
       const dbPath = this.configService.get('dbPath') as string
       
-      // Use string concatenation instead of parameterized query
-      // Escape single quotes to prevent injection
+      // First, find what talkerIds exist in database (for debugging)
+      const checkSql = `SELECT DISTINCT talkerId FROM Message LIMIT 10`
+      const checkResult = await wcdbService.execQuery('message', dbPath, checkSql, [])
+      if (checkResult.success && checkResult.rows && checkResult.rows.length > 0) {
+        console.log(`[SQL] Available talkerIds: ${checkResult.rows.map((r: any) => r.talkerId).join(', ')}`)
+      }
+      
+      // Query with the provided talkerId
       const safeTalkerId = talkerId.replace(/'/g, "''")
       const sql = `SELECT senderUsername, createTime, content, type as localType FROM Message WHERE talkerId = '${safeTalkerId}' ORDER BY createTime DESC LIMIT ${limit}`
       
-      console.log(`[SQL] Query: ${sql.substring(0, 100)}...`)
+      console.log(`[SQL] Query: ${sql}`)
       
       const result = await wcdbService.execQuery('message', dbPath, sql, [])
       
