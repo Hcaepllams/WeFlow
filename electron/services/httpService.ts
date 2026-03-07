@@ -1194,12 +1194,13 @@ class HttpService {
     // Wait for database write
     await new Promise(r => setTimeout(r, 100))
 
-    // Get only the latest message
-    const messages = await this.getLatestMessages(talkerId, 1)
-    console.log(`[Webhook] Got ${messages?.length || 0} messages for ${talkerId}`)
+    // Get only the latest message (after the previous timestamp)
+    const prevTimestamp = this.sessionTimestamps.get(talkerId) || 0
+    const messages = await this.getLatestMessages(talkerId, 1, prevTimestamp)
+    console.log(`[Webhook] Got ${messages?.length || 0} messages for ${talkerId} (after ts ${prevTimestamp})`)
 
     if (!messages || messages.length === 0) {
-      console.log(`!!! [2/5] Scan complete: ${talkerId} - No new messages`)
+      console.log(`!!! [2/5] Scan complete: ${talkerId} - No new messages after ${prevTimestamp}`)
       return
     }
 
@@ -1210,6 +1211,8 @@ class HttpService {
 
     const message = messages[0]
     const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
+    
+    console.log(`[DEBUG] Processing message: sender=${message.sender}, timestamp=${message.timestamp}, content=${message.content?.slice(0, 30)}...`)
 
     // *** FILTER: Skip self-sent messages to prevent echo loop ***
     // Compare sender with myWxid or myDisplayName to detect self-sent messages
@@ -1265,11 +1268,20 @@ class HttpService {
   /**
    * Get latest messages
    */
-  private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
+  private async getLatestMessages(talkerId: string, limit: number, afterTimestamp?: number): Promise<any[]> {
     try {
       const result = await chatService.getMessages(talkerId, limit)
       if (result.success && result.messages) {
-        return result.messages.map((m: any) => ({
+        // Filter messages by timestamp if provided
+        let messages = result.messages
+        if (afterTimestamp) {
+          messages = messages.filter((m: any) => m.createTime > afterTimestamp)
+        }
+        
+        // Sort by timestamp descending and take the latest
+        messages = messages.sort((a: any, b: any) => b.createTime - a.createTime)
+        
+        return messages.slice(0, limit).map((m: any) => ({
           sender: m.senderUsername,
           timestamp: m.createTime,
           content: m.parsedContent || m.content,
