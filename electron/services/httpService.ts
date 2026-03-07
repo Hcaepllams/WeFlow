@@ -1084,6 +1084,10 @@ class HttpService {
 
     // *** Webhook Monitor Started ***
     console.log('[Webhook] Monitor started')
+    
+    registerMonitorHandler((type: string, json: string) => {
+      this.handleMonitorEvent(type, json)
+    })
   }
 
   /**
