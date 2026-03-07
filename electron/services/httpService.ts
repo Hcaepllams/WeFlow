@@ -1212,11 +1212,15 @@ class HttpService {
     const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
 
     // *** FILTER: Skip self-sent messages to prevent echo loop ***
-    // isSend: 0=received from others (process it), 1=sent by self (skip it)
-    console.log(`--- [DEBUG] Message isSend value: ${message.isSend}, type: ${typeof message.isSend}`)
+    // Compare sender with myWxid to detect messages sent by myself
+    const myWxid = this.configService.get('myWxid') || ''
+    const sender = message.sender || ''
     
-    if (message.isSend === 1 || message.isSend === true) {
-      console.log(`--- [FILTER] Skipping self-sent message (isSend=${message.isSend})`)
+    console.log(`--- [DEBUG] Sender: ${sender}, MyWxid: ${myWxid}`)
+    
+    // Check if sender is myself (case insensitive comparison)
+    if (myWxid && sender && sender.toLowerCase() === myWxid.toLowerCase()) {
+      console.log(`--- [FILTER] Skipping self-sent message (sender matches myWxid)`)
       console.log(`--- Sender: ${message.accountName || message.sender}`)
       return
     }
@@ -1266,8 +1270,7 @@ class HttpService {
           content: m.parsedContent || m.content,
           type: m.localType,
           accountName: m.senderDisplayName || m.senderUsername,
-          groupNickname: m.groupNickname,
-          isSend: m.isSend  // 0=received, 1=self-sent
+          groupNickname: m.groupNickname
         }))
       }
       return []
