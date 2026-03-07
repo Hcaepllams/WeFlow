@@ -1083,42 +1083,19 @@ class HttpService {
     this.webhookMonitorStarted = true
 
     // *** Webhook Monitor Started ***
-    console.log('\n==============================================================')
-    console.log('***           WEBHOOK MONITOR STARTED                      ***')
-    console.log('==============================================================')
-    console.log(`***  URL: ${config.url || 'N/A'}`)
-    console.log(`***  Private Chat: ${config.triggers?.privateChat ? 'ENABLED' : 'DISABLED'}`)
-    console.log(`***  Group @: ${config.triggers?.groupAt ? 'ENABLED' : 'DISABLED'}`)
-    console.log('==============================================================\n')
-    
-    registerMonitorHandler((type: string, json: string) => {
-      console.log('[Webhook] Handler called with type:', type, 'json:', json.substring(0, 100))
-      this.handleMonitorEvent(type, json)
-    })
-    
-    console.log('[Webhook] Handler registered successfully')
+    console.log('[Webhook] Monitor started')
   }
 
   /**
    * Handle monitor event
    */
   private async handleMonitorEvent(type: string, json: string): Promise<void> {
-    console.log(`[Webhook] handleMonitorEvent called: type=${type}, time=${Date.now()}`)
-    
-    console.log('[Webhook] Event accepted, processing...')
     try {
       const config = this.getWebhookConfig()
-      console.log('[Webhook] Config status:', { enabled: config.enabled, url: config.url?.substring(0, 30) })
       if (!config.enabled || !config.url) {
-        console.log('[Webhook] Disabled or URL empty, skip')
         return
       }
-
-      // Event doesn't contain talkerId, check all sessions
-      console.log('[Webhook] Calling checkAllSessions...')
       await this.checkAllSessions(config)
-      console.log('[Webhook] checkAllSessions completed')
-      
     } catch (error) {
       console.error('[Webhook] Handle event failed:', error)
     }
@@ -1147,28 +1124,22 @@ class HttpService {
         const now = Date.now()
         const lastProcessTime = this.sessionProcessTime.get(talkerId) || 0
         if (now - lastProcessTime < this.sessionProcessCooldownMs) {
-          console.log(`[Webhook] Session ${talkerId} skipped: cooldown (${now - lastProcessTime}ms)`)
           continue
         }
 
         const lastTimestamp = session.lastTimestamp || 0
         const prevTimestamp = this.sessionTimestamps.get(talkerId) || 0
 
-        console.log(`[Webhook] Session ${talkerId}: lastTimestamp=${lastTimestamp}, prevTimestamp=${prevTimestamp}, diff=${lastTimestamp - prevTimestamp}`)
-
         // Only process sessions with updated timestamps
         if (lastTimestamp > prevTimestamp) {
-          console.log(`[Webhook] Session ${talkerId} has new messages, processing...`)
           this.sessionTimestamps.set(talkerId, lastTimestamp)
           this.sessionProcessTime.set(talkerId, now)
           await this.processTalker(talkerId, config)
           checkedCount++
-        } else {
-          console.log(`[Webhook] Session ${talkerId} no new messages (timestamp not updated)`)
         }
       }
 
-      console.log('[Webhook] Processed', checkedCount, 'updated sessions')
+      console.log(`[Webhook] Processed ${checkedCount} sessions`)
 
       // Clean up cache
       const cutoff = Date.now() - 300 * 1000
@@ -1184,31 +1155,23 @@ class HttpService {
    * Process a single talker
    */
   private async processTalker(talkerId: string, config: WebhookConfig): Promise<void> {
-    // Get latest 5 messages to ensure we get the truly latest one
+    // Wait for database write to complete
+    await new Promise(r => setTimeout(r, 200))
+    
+    // Get messages
     const messages = await this.getLatestMessages(talkerId, 5)
     if (!messages || messages.length === 0) return
 
-    // Get the most recent message (first after sorting by time desc)
+    // Get the most recent message
     const message = messages[0]
-    const isGroup = talkerId.includes('@chatroom')
-    
-    // My WeChat ID
     const myWxid = 'wxid_kvjnpk8d9z4d12'
     
-    // Log message details
-    console.log('\n========================================')
-    console.log(`[MSG] Session: ${talkerId}`)
-    console.log(`[MSG] Type: ${isGroup ? 'Group' : 'Private'}`)
-    console.log(`[MSG] Sender: ${message.sender}`)
-    console.log(`[MSG] SenderName: ${message.accountName}`)
-    console.log(`[MSG] Content: ${message.content}`)
-    console.log(`[MSG] Timestamp: ${message.timestamp}`)
-    console.log(`[MSG] MyWxid: ${myWxid}`)
-    console.log('========================================\n')
+    // Only log the essential info
+    console.log(`[MSG] ${talkerId} | Sender: ${message.sender} | Content: ${message.content?.substring(0, 40)}...`)
 
     // Filter: Skip messages sent by myself
     if (message.sender === myWxid) {
-      console.log(`[FILTER] Skipping self-sent message (sender matches myWxid)`)
+      console.log(`[SKIP] Self-sent message`)
       return
     }
 
@@ -1223,14 +1186,10 @@ class HttpService {
    */
   private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
-      // Use larger limit to get more messages, then find truly latest
-      const result = await chatService.getMessages(talkerId, Math.max(limit, 20))
+      const result = await chatService.getMessages(talkerId, 20)
       if (result.success && result.messages && result.messages.length > 0) {
         // Sort by timestamp descending (newest first)
         const sorted = result.messages.sort((a: any, b: any) => b.createTime - a.createTime)
-        
-        // Log for debugging
-        console.log(`[DEBUG] Got ${result.messages.length} messages, latest timestamp: ${sorted[0]?.createTime}`)
         
         return sorted.slice(0, limit).map((m: any) => ({
           sender: m.senderUsername,
@@ -1243,7 +1202,6 @@ class HttpService {
       }
       return []
     } catch (e) {
-      console.error('[ERROR] getLatestMessages failed:', e)
       return []
     }
   }
@@ -1363,17 +1321,9 @@ class HttpService {
 
       await this.postRequest(config.url, payload, headers)
       
-      // *** STEP 5/5: Webhook Sent Successfully ***
-      console.log(`\n==============================================================`)
-      console.log(`*** [5/5] *** WEBHOOK SENT SUCCESSFULLY! ***`)
-      console.log(`*** Target: ${config.url}`)
-      console.log(`*** Session: ${talkerId}`)
-      console.log(`*** Sender: ${message.accountName || message.sender}`)
-      console.log(`*** Trigger Type: ${triggerType}`)
-      console.log(`==============================================================\n`)
+      console.log(`[SENT] Webhook sent: ${talkerId} | ${message.sender} | ${message.content?.substring(0, 30)}...`)
     } catch (error) {
-      console.error('[Webhook] Send failed:', error)
-      console.log(`\n[ERROR] [5/5] WEBHOOK SEND FAILED: ${error}\n`)
+      console.error('[ERROR] Webhook send failed:', error)
     }
   }
 
