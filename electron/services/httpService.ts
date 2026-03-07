@@ -1189,28 +1189,33 @@ class HttpService {
   }
 
   /**
-   * Get latest messages using chatService.getLatestMessages (same as ChatPage)
+   * Get latest messages using chatService.getNewMessages (same as ChatPage.tsx incremental refresh)
    */
   private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
-      console.log(`[DEBUG] getLatestMessages called for talkerId=${talkerId}`)
+      // Get last processed timestamp for this talker
+      const lastTimestamp = this.sessionTimestamps.get(talkerId) || 0
       
-      // Use chatService.getLatestMessages (same as ChatPage.tsx)
-      const result = await chatService.getLatestMessages(talkerId, limit)
+      console.log(`[DEBUG] getNewMessages for talkerId=${talkerId}, lastTimestamp=${lastTimestamp}`)
       
-      console.log(`[DEBUG] chatService.getLatestMessages returned: success=${result.success}, count=${result.messages?.length || 0}`)
+      // Use chatService.getNewMessages (same as ChatPage.tsx handleRefreshMessages)
+      const result = await chatService.getNewMessages(talkerId, lastTimestamp, limit)
+      
+      console.log(`[DEBUG] chatService.getNewMessages returned: success=${result.success}, count=${result.messages?.length || 0}`)
       
       if (!result.success || !result.messages || result.messages.length === 0) {
         return []
       }
       
-      // chatService.getLatestMessages already returns normalized order
-      // Just take the first one (latest)
-      const messages = result.messages.slice(0, limit)
+      // Update timestamp to latest message
+      const latestMsg = result.messages[result.messages.length - 1]
+      if (latestMsg?.createTime) {
+        this.sessionTimestamps.set(talkerId, latestMsg.createTime)
+      }
       
-      console.log(`[DEBUG] Latest message: sender=${messages[0].senderUsername}, time=${messages[0].createTime}, content=${messages[0].parsedContent?.substring(0, 30) || messages[0].content?.substring(0, 30)}`)
+      console.log(`[DEBUG] Got ${result.messages.length} new messages, latest time=${latestMsg?.createTime}`)
       
-      return messages.map((m: any) => ({
+      return result.messages.map((m: any) => ({
         sender: m.senderUsername,
         timestamp: m.createTime,
         content: m.parsedContent || m.content,
