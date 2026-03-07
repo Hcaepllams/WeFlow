@@ -1192,11 +1192,17 @@ class HttpService {
     try {
       const dbPath = this.configService.get('dbPath') as string
       
+      console.log(`[DEBUG] getLatestMessages called for talkerId=${talkerId}`)
+      
       // First, find what talkerIds exist in database (for debugging)
       const checkSql = `SELECT DISTINCT talkerId FROM Message LIMIT 10`
       const checkResult = await wcdbService.execQuery('message', dbPath, checkSql, [])
+      console.log(`[DEBUG] checkResult.success=${checkResult.success}, rows=${checkResult.rows?.length || 0}`)
       if (checkResult.success && checkResult.rows && checkResult.rows.length > 0) {
-        console.log(`[SQL] Available talkerIds: ${checkResult.rows.map((r: any) => r.talkerId).join(', ')}`)
+        const ids = checkResult.rows.map((r: any) => r.talkerId).join(', ')
+        console.log(`[DEBUG] Available talkerIds: ${ids}`)
+      } else {
+        console.log(`[DEBUG] No talkerIds found or query failed`)
       }
       
       // Query with the provided talkerId
