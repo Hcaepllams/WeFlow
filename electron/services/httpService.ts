@@ -1186,26 +1186,36 @@ class HttpService {
   }
 
   /**
-   * Get latest messages
+   * Get latest messages - directly query database for truly latest message
    */
   private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
-      const result = await chatService.getMessages(talkerId, 20)
-      if (result.success && result.messages && result.messages.length > 0) {
-        // Sort by timestamp descending (newest first)
-        const sorted = result.messages.sort((a: any, b: any) => b.createTime - a.createTime)
-        
-        return sorted.slice(0, limit).map((m: any) => ({
+      // Use execQuery to directly get the latest messages
+      // Message table: localId, talkerId, senderUsername, createTime, content, etc.
+      const sql = `
+        SELECT senderUsername, createTime, content, type as localType 
+        FROM Message 
+        WHERE talkerId = ? 
+        ORDER BY createTime DESC 
+        LIMIT ?
+      `
+      
+      const dbPath = this.configService.get('dbPath') as string
+      const result = await wcdbService.execQuery('message', dbPath, sql, [talkerId, limit])
+      
+      if (result.success && result.rows && result.rows.length > 0) {
+        return result.rows.map((m: any) => ({
           sender: m.senderUsername,
           timestamp: m.createTime,
-          content: m.parsedContent || m.content,
+          content: m.content,
           type: m.localType,
-          accountName: m.senderDisplayName || m.senderUsername,
-          groupNickname: m.groupNickname
+          accountName: m.senderUsername, // Use username as accountName for now
+          groupNickname: ''
         }))
       }
       return []
     } catch (e) {
+      console.error('[ERROR] getLatestMessages failed:', e)
       return []
     }
   }
