@@ -1082,14 +1082,14 @@ class HttpService {
 
     this.webhookMonitorStarted = true
 
-    // ★★★ Webhook Monitor Started ★★★
-    console.log('\n╔════════════════════════════════════════════════════════════════╗')
-    console.log('║              ★ WEBHOOK MONITOR STARTED ★                     ║')
-    console.log('╠════════════════════════════════════════════════════════════════╣')
-    console.log(`║  URL: ${config.url?.padEnd(54) || 'N/A'.padEnd(54)} ║`)
-    console.log(`║  Private Chat: ${config.triggers?.privateChat ? '✓ ENABLED' : '✗ DISABLED'}${' '.repeat(37)} ║`)
-    console.log(`║  Group @: ${config.triggers?.groupAt ? '✓ ENABLED' : '✗ DISABLED'}${' '.repeat(42)} ║`)
-    console.log('╚════════════════════════════════════════════════════════════════╝\n')
+    // *** Webhook Monitor Started ***
+    console.log('\n==============================================================')
+    console.log('***           WEBHOOK MONITOR STARTED                      ***')
+    console.log('==============================================================')
+    console.log(`***  URL: ${config.url || 'N/A'}`)
+    console.log(`***  Private Chat: ${config.triggers?.privateChat ? 'ENABLED' : 'DISABLED'}`)
+    console.log(`***  Group @: ${config.triggers?.groupAt ? 'ENABLED' : 'DISABLED'}`)
+    console.log('==============================================================\n')
     
     registerMonitorHandler((type: string, json: string) => {
       console.log('[Webhook] Handler called with type:', type, 'json:', json.substring(0, 100))
@@ -1186,10 +1186,10 @@ class HttpService {
   private async processTalker(talkerId: string, config: WebhookConfig): Promise<void> {
     console.log(`[Webhook] processTalker called: talkerId=${talkerId}`)
 
-    // ★★★ Database Change Detected ★★★
-    console.log(`\n★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★`)
-    console.log(`★★★ [1/5] Database change detected: ${talkerId}`)
-    console.log(`★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★\n`)
+    // *** STEP 1/5: Database Change Detected ***
+    console.log(`\n*** *** *** *** *** *** *** *** *** *** *** *** *** *** ***`)
+    console.log(`*** [1/5] Database change detected: ${talkerId}`)
+    console.log(`*** *** *** *** *** *** *** *** *** *** *** *** *** *** ***\n`)
 
     // Wait for database write
     await new Promise(r => setTimeout(r, 100))
@@ -1203,43 +1203,43 @@ class HttpService {
       return
     }
 
-    // ★★★ Messages Found ★★★
-    console.log(`!!! !!! !!! !!! !!! !!! !!! !!! !!! !!!`)
+    // *** STEP 2/5: Messages Found ***
+    console.log(`!!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!!`)
     console.log(`!!! [2/5] Scan complete: Found ${messages.length} new messages`)
-    console.log(`!!! !!! !!! !!! !!! !!! !!! !!! !!! !!!`)
+    console.log(`!!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!!`)
 
     const message = messages[0]
     const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
 
-    // ★★★ Check Condition + Find Key ★★★
-    console.log(`\n◆◆◆ [3/5] Checking if message matches conditions...`)
-    console.log(`◆◆◆ Sender: ${message.accountName || message.sender}`)
-    console.log(`◆◆◆ Content: ${message.content?.slice(0, 50)}...`)
-    console.log(`◆◆◆ Looking up key: ${msgKey.substring(0, 50)}...`)
+    // *** STEP 3/5: Check Conditions ***
+    console.log(`\n--- [3/5] Checking if message matches conditions...`)
+    console.log(`--- Sender: ${message.accountName || message.sender}`)
+    console.log(`--- Content: ${message.content?.slice(0, 50)}...`)
+    console.log(`--- Looking up key: ${msgKey.substring(0, 50)}...`)
 
     // Check if already processed using message key
     if (this.processedMessages.has(msgKey)) {
-      console.log(`◆◆◆ Result: ❌ KEY EXISTS - Skipping this message`)
+      console.log(`--- Result: [SKIP] KEY EXISTS - Skipping this message`)
       return
     }
-    console.log(`◆◆◆ Result: ✓ KEY NOT FOUND - Continuing processing`)
+    console.log(`--- Result: [OK] KEY NOT FOUND - Continuing processing`)
 
     // Mark as processed
     this.processedMessages.set(msgKey, Date.now())
-    console.log(`◆◆◆ Message marked as processed`)
+    console.log(`--- Message marked as processed`)
 
     const triggerType = this.getTriggerType(message, talkerId, config)
-    console.log(`◆◆◆ Trigger type: ${triggerType || 'None'}`)
+    console.log(`--- Trigger type: ${triggerType || 'None'}`)
 
     if (triggerType) {
-      // ★★★ Condition Matched ★★★
-      console.log(`\n✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓`)
-      console.log(`✓✓✓ [4/5] ✓✓✓ CONDITION MATCHED! Preparing to send webhook ✓✓✓`)
-      console.log(`✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓`)
+      // *** STEP 4/5: Condition Matched ***
+      console.log(`\n>>> >>> >>> >>> >>> >>> >>> >>> >>>`)
+      console.log(`>>> [4/5] >>> CONDITION MATCHED! Preparing to send webhook <<<`)
+      console.log(`>>> >>> >>> >>> >>> >>> >>> >>> >>>`)
       
       await this.sendWebhook(message, talkerId, config, triggerType)
     } else {
-      console.log(`◆◆◆ Result: ❌ Does not match trigger conditions`)
+      console.log(`--- Result: [SKIP] Does not match trigger conditions`)
     }
   }
 
@@ -1380,17 +1380,17 @@ class HttpService {
 
       await this.postRequest(config.url, payload, headers)
       
-      // ★★★ Webhook Sent Successfully ★★★
-      console.log(`\n◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆`)
-      console.log(`◆◆◆ [5/5] ◆◆◆ WEBHOOK SENT SUCCESSFULLY! ◆◆◆`)
-      console.log(`◆◆◆ Target: ${config.url}`)
-      console.log(`◆◆◆ Session: ${talkerId}`)
-      console.log(`◆◆◆ Sender: ${message.accountName || message.sender}`)
-      console.log(`◆◆◆ Trigger Type: ${triggerType}`)
-      console.log(`◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆\n`)
+      // *** STEP 5/5: Webhook Sent Successfully ***
+      console.log(`\n==============================================================`)
+      console.log(`*** [5/5] *** WEBHOOK SENT SUCCESSFULLY! ***`)
+      console.log(`*** Target: ${config.url}`)
+      console.log(`*** Session: ${talkerId}`)
+      console.log(`*** Sender: ${message.accountName || message.sender}`)
+      console.log(`*** Trigger Type: ${triggerType}`)
+      console.log(`==============================================================\n`)
     } catch (error) {
       console.error('[Webhook] Send failed:', error)
-      console.log(`\n❌❌❌ [5/5] ❌❌❌ WEBHOOK SEND FAILED: ${error} ❌❌❌\n`)
+      console.log(`\n[ERROR] [5/5] WEBHOOK SEND FAILED: ${error}\n`)
     }
   }
 
