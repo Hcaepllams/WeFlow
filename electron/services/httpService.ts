@@ -1181,27 +1181,36 @@ class HttpService {
   }
 
   /**
-   * Process a single talker - simplified for debugging
+   * Process a single talker
    */
   private async processTalker(talkerId: string, config: WebhookConfig): Promise<void> {
-    // Get latest message
-    const messages = await this.getLatestMessages(talkerId, 1)
+    // Get latest 5 messages to ensure we get the truly latest one
+    const messages = await this.getLatestMessages(talkerId, 5)
     if (!messages || messages.length === 0) return
 
+    // Get the most recent message (first after sorting by time desc)
     const message = messages[0]
     const isGroup = talkerId.includes('@chatroom')
     
-    // Simplified log - only show key info for判断
+    // My WeChat ID
+    const myWxid = 'wxid_kvjnpk8d9z4d12'
+    
+    // Log message details
     console.log('\n========================================')
     console.log(`[MSG] Session: ${talkerId}`)
     console.log(`[MSG] Type: ${isGroup ? 'Group' : 'Private'}`)
     console.log(`[MSG] Sender: ${message.sender}`)
     console.log(`[MSG] SenderName: ${message.accountName}`)
     console.log(`[MSG] Content: ${message.content}`)
+    console.log(`[MSG] Timestamp: ${message.timestamp}`)
+    console.log(`[MSG] MyWxid: ${myWxid}`)
     console.log('========================================\n')
 
-    // Temporarily disable all filters - just observe
-    // TODO: Add filtering logic after understanding the data
+    // Filter: Skip messages sent by myself
+    if (message.sender === myWxid) {
+      console.log(`[FILTER] Skipping self-sent message (sender matches myWxid)`)
+      return
+    }
 
     const triggerType = this.getTriggerType(message, talkerId, config)
     if (triggerType) {
@@ -1214,12 +1223,16 @@ class HttpService {
    */
   private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
-      const result = await chatService.getMessages(talkerId, limit)
-      if (result.success && result.messages) {
-        // Sort by timestamp descending and take the latest
-        const messages = result.messages.sort((a: any, b: any) => b.createTime - a.createTime)
+      // Use larger limit to get more messages, then find truly latest
+      const result = await chatService.getMessages(talkerId, Math.max(limit, 20))
+      if (result.success && result.messages && result.messages.length > 0) {
+        // Sort by timestamp descending (newest first)
+        const sorted = result.messages.sort((a: any, b: any) => b.createTime - a.createTime)
         
-        return messages.slice(0, limit).map((m: any) => ({
+        // Log for debugging
+        console.log(`[DEBUG] Got ${result.messages.length} messages, latest timestamp: ${sorted[0]?.createTime}`)
+        
+        return sorted.slice(0, limit).map((m: any) => ({
           sender: m.senderUsername,
           timestamp: m.createTime,
           content: m.parsedContent || m.content,
@@ -1230,6 +1243,7 @@ class HttpService {
       }
       return []
     } catch (e) {
+      console.error('[ERROR] getLatestMessages failed:', e)
       return []
     }
   }
