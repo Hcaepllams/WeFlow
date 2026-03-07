@@ -1213,7 +1213,7 @@ class HttpService {
 
     // *** FILTER: Skip self-sent messages to prevent echo loop ***
     // Compare sender with myWxid to detect messages sent by myself
-    const myWxid = this.configService.get('myWxid') || ''
+    const myWxid = this.configService.get('myWxid') || 'wxid_kvjnpk8d9z4d12'  // Hardcoded for testing
     const sender = message.sender || ''
     
     console.log(`--- [DEBUG] Sender: ${sender}, MyWxid: ${myWxid}`)
