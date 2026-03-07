@@ -1191,25 +1191,24 @@ class HttpService {
   private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
       // Use execQuery to directly get the latest messages
-      // Message table: localId, talkerId, senderUsername, createTime, content, etc.
-      const sql = `
-        SELECT senderUsername, createTime, content, type as localType 
-        FROM Message 
-        WHERE talkerId = ? 
-        ORDER BY createTime DESC 
-        LIMIT ?
-      `
+      const sql = `SELECT senderUsername, createTime, content, type as localType FROM Message WHERE talkerId = ? ORDER BY createTime DESC LIMIT ?`
       
       const dbPath = this.configService.get('dbPath') as string
+      console.log(`[SQL] Querying talkerId=${talkerId}, limit=${limit}`)
+      console.log(`[SQL] DB Path: ${dbPath?.substring(0, 50)}...`)
+      
       const result = await wcdbService.execQuery('message', dbPath, sql, [talkerId, limit])
       
+      console.log(`[SQL] Query result: success=${result.success}, rows=${result.rows?.length || 0}`)
+      
       if (result.success && result.rows && result.rows.length > 0) {
+        console.log(`[SQL] First row: sender=${result.rows[0].senderUsername}, time=${result.rows[0].createTime}, content=${result.rows[0].content?.substring(0, 30)}`)
         return result.rows.map((m: any) => ({
           sender: m.senderUsername,
           timestamp: m.createTime,
           content: m.content,
           type: m.localType,
-          accountName: m.senderUsername, // Use username as accountName for now
+          accountName: m.senderUsername,
           groupNickname: ''
         }))
       }
