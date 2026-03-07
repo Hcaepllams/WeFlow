@@ -1198,21 +1198,35 @@ class HttpService {
       console.log(`[DEBUG] getLatestMessages called for talkerId=${talkerId}`)
       
       // First, find what talkerIds exist in database (for debugging)
-      const checkSql = `SELECT DISTINCT talkerId FROM Message LIMIT 10`
-      const checkResult = await wcdbService.execQuery('message', dbPath, checkSql, [])
-      console.log(`[DEBUG] checkResult.success=${checkResult.success}, rows=${checkResult.rows?.length || 0}`)
-      if (checkResult.success && checkResult.rows && checkResult.rows.length > 0) {
-        const ids = checkResult.rows.map((r: any) => r.talkerId).join(', ')
-        console.log(`[DEBUG] Available talkerIds: ${ids}`)
-      } else {
-        console.log(`[DEBUG] No talkerIds found or query failed`)
+      // Try different possible table names
+      const tableNames = ['Message', 'message', 'MSG', 'msg', 'Chat', 'chat']
+      let checkResult: any = null
+      let foundTable = ''
+      
+      for (const tableName of tableNames) {
+        const checkSql = `SELECT DISTINCT talkerId FROM ${tableName} LIMIT 5`
+        const result = await wcdbService.execQuery('message', dbPath, checkSql, [])
+        console.log(`[DEBUG] Table ${tableName}: success=${result.success}, rows=${result.rows?.length || 0}`)
+        if (result.success && result.rows && result.rows.length > 0) {
+          checkResult = result
+          foundTable = tableName
+          break
+        }
       }
       
-      // Query with the provided talkerId
-      const safeTalkerId = talkerId.replace(/'/g, "''")
-      const sql = `SELECT senderUsername, createTime, content, type as localType FROM Message WHERE talkerId = '${safeTalkerId}' ORDER BY createTime DESC LIMIT ${limit}`
+      if (checkResult && checkResult.rows && checkResult.rows.length > 0) {
+        const ids = checkResult.rows.map((r: any) => r.talkerId).join(', ')
+        console.log(`[DEBUG] Found table: ${foundTable}, Available talkerIds: ${ids}`)
+      } else {
+        console.log(`[DEBUG] No messages found in any table`)
+      }
       
-      console.log(`[SQL] Query: ${sql}`)
+      // Query with the provided talkerId using found table
+      const safeTalkerId = talkerId.replace(/'/g, "''")
+      const tableToUse = foundTable || 'Message'
+      const sql = `SELECT senderUsername, createTime, content, type as localType FROM ${tableToUse} WHERE talkerId = '${safeTalkerId}' ORDER BY createTime DESC LIMIT ${limit}`
+      
+      console.log(`[SQL] Query using table ${tableToUse}: ${sql}`)
       
       const result = await wcdbService.execQuery('message', dbPath, sql, [])
       
