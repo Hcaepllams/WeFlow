@@ -1190,19 +1190,14 @@ class HttpService {
    */
   private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
-      // Use execQuery to directly get the latest messages
-      const sql = `SELECT senderUsername, createTime, content, type as localType FROM Message WHERE talkerId = ? ORDER BY createTime DESC LIMIT ?`
-      
+      // Try different query formats since talkerId format may vary
       const dbPath = this.configService.get('dbPath') as string
-      console.log(`[SQL] Querying talkerId=${talkerId}, limit=${limit}`)
-      console.log(`[SQL] DB Path: ${dbPath?.substring(0, 50)}...`)
       
-      const result = await wcdbService.execQuery('message', dbPath, sql, [talkerId, limit])
-      
-      console.log(`[SQL] Query result: success=${result.success}, rows=${result.rows?.length || 0}`)
+      // Query 1: Try with talkerId (exact match)
+      let sql = `SELECT senderUsername, createTime, content, type as localType FROM Message WHERE talkerId = ? ORDER BY createTime DESC LIMIT ?`
+      let result = await wcdbService.execQuery('message', dbPath, sql, [talkerId, limit])
       
       if (result.success && result.rows && result.rows.length > 0) {
-        console.log(`[SQL] First row: sender=${result.rows[0].senderUsername}, time=${result.rows[0].createTime}, content=${result.rows[0].content?.substring(0, 30)}`)
         return result.rows.map((m: any) => ({
           sender: m.senderUsername,
           timestamp: m.createTime,
@@ -1212,6 +1207,21 @@ class HttpService {
           groupNickname: ''
         }))
       }
+      
+      // Query 2: If no results, try to find what talkerId format is used
+      console.log(`[SQL] No results for talkerId=${talkerId}, trying alternative...`)
+      
+      // Get sample messages to understand the format
+      const sampleSql = `SELECT talkerId, senderUsername, createTime, content FROM Message ORDER BY createTime DESC LIMIT 3`
+      const sampleResult = await wcdbService.execQuery('message', dbPath, sampleSql, [])
+      
+      if (sampleResult.success && sampleResult.rows && sampleResult.rows.length > 0) {
+        console.log(`[SQL] Sample messages format:`)
+        sampleResult.rows.forEach((row: any, i: number) => {
+          console.log(`  [${i}] talkerId=${row.talkerId}, sender=${row.senderUsername}, content=${row.content?.substring(0, 20)}`)
+        })
+      }
+      
       return []
     } catch (e) {
       console.error('[ERROR] getLatestMessages failed:', e)
