@@ -1212,10 +1212,10 @@ class HttpService {
     const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
 
     // *** FILTER: Skip self-sent messages to prevent echo loop ***
+    // isSend: 0=self-sent, 1=received from others
     console.log(`--- [DEBUG] Message isSend value: ${message.isSend}, type: ${typeof message.isSend}`)
     
-    // isSend can be: 0/false/undefined (received), 1/true (self-sent)
-    if (message.isSend) {
+    if (message.isSend === 0 || message.isSend === false) {
       console.log(`--- [FILTER] Skipping self-sent message (isSend=${message.isSend})`)
       console.log(`--- Sender: ${message.accountName || message.sender}`)
       return
