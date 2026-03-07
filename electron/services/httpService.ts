@@ -1212,16 +1212,21 @@ class HttpService {
     const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
 
     // *** FILTER: Skip self-sent messages to prevent echo loop ***
-    // Compare sender with myWxid to detect messages sent by myself
-    const myWxid = this.configService.get('myWxid') || 'wxid_kvjnpk8d9z4d12'  // Hardcoded for testing
-    const sender = message.sender || ''
+    // Compare sender with myWxid or myDisplayName to detect self-sent messages
+    const myWxid = this.configService.get('myWxid') || ''
+    const myDisplayName = this.configService.get('myDisplayName') || 'hcaepllams'  // Your WeChat display name
+    const senderId = message.sender || ''
+    const senderName = message.accountName || ''
     
-    console.log(`--- [DEBUG] Sender: ${sender}, MyWxid: ${myWxid}`)
+    console.log(`--- [DEBUG] SenderId: ${senderId}, SenderName: ${senderName}, MyWxid: ${myWxid}, MyName: ${myDisplayName}`)
     
-    // Check if sender is myself (case insensitive comparison)
-    if (myWxid && sender && sender.toLowerCase() === myWxid.toLowerCase()) {
-      console.log(`--- [FILTER] Skipping self-sent message (sender matches myWxid)`)
-      console.log(`--- Sender: ${message.accountName || message.sender}`)
+    // Check if sender is myself
+    const isSelfSent = (myWxid && senderId && senderId.toLowerCase() === myWxid.toLowerCase()) ||
+                       (myDisplayName && senderName && senderName.toLowerCase() === myDisplayName.toLowerCase())
+    
+    if (isSelfSent) {
+      console.log(`--- [FILTER] Skipping self-sent message`)
+      console.log(`--- Sender: ${senderName || senderId}`)
       return
     }
 
