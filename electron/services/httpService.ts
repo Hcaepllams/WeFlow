@@ -1189,35 +1189,28 @@ class HttpService {
   }
 
   /**
-   * Get latest messages using chatService with cursor reset
+   * Get latest messages using chatService.getLatestMessages (same as ChatPage)
    */
   private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
       console.log(`[DEBUG] getLatestMessages called for talkerId=${talkerId}`)
       
-      // Close existing cursor to ensure fresh query from latest
-      try {
-        await chatService.closeMessageCursor(talkerId)
-        console.log(`[DEBUG] Closed cursor for ${talkerId}`)
-      } catch (e) {
-        // Cursor might not exist, ignore error
-      }
+      // Use chatService.getLatestMessages (same as ChatPage.tsx)
+      const result = await chatService.getLatestMessages(talkerId, limit)
       
-      // Get messages (fetch more to ensure we get latest)
-      const result = await chatService.getMessages(talkerId, 20, 0, 0, 0, false)
-      
-      console.log(`[DEBUG] chatService.getMessages returned: success=${result.success}, count=${result.messages?.length || 0}`)
+      console.log(`[DEBUG] chatService.getLatestMessages returned: success=${result.success}, count=${result.messages?.length || 0}`)
       
       if (!result.success || !result.messages || result.messages.length === 0) {
         return []
       }
       
-      // Sort by createTime descending (newest first) and take top N
-      const sorted = result.messages.sort((a: any, b: any) => b.createTime - a.createTime)
+      // chatService.getLatestMessages already returns normalized order
+      // Just take the first one (latest)
+      const messages = result.messages.slice(0, limit)
       
-      console.log(`[DEBUG] Latest message: sender=${sorted[0].senderUsername}, time=${sorted[0].createTime}, content=${sorted[0].parsedContent?.substring(0, 30) || sorted[0].content?.substring(0, 30)}`)
+      console.log(`[DEBUG] Latest message: sender=${messages[0].senderUsername}, time=${messages[0].createTime}, content=${messages[0].parsedContent?.substring(0, 30) || messages[0].content?.substring(0, 30)}`)
       
-      return sorted.slice(0, limit).map((m: any) => ({
+      return messages.map((m: any) => ({
         sender: m.senderUsername,
         timestamp: m.createTime,
         content: m.parsedContent || m.content,
