@@ -1082,13 +1082,13 @@ class HttpService {
 
     this.webhookMonitorStarted = true
 
-    // ★★★ Webhook监控启动标记 ★★★
+    // ★★★ Webhook Monitor Started ★★★
     console.log('\n╔════════════════════════════════════════════════════════════════╗')
-    console.log('║                  ★ WEBHOOK 监控已启动 ★                        ║')
+    console.log('║              ★ WEBHOOK MONITOR STARTED ★                     ║')
     console.log('╠════════════════════════════════════════════════════════════════╣')
     console.log(`║  URL: ${config.url?.padEnd(54) || 'N/A'.padEnd(54)} ║`)
-    console.log(`║  私聊触发: ${config.triggers?.privateChat ? '✓ 启用' : '✗ 禁用'}${' '.repeat(44)} ║`)
-    console.log(`║  群@触发: ${config.triggers?.groupAt ? '✓ 启用' : '✗ 禁用'}${' '.repeat(45)} ║`)
+    console.log(`║  Private Chat: ${config.triggers?.privateChat ? '✓ ENABLED' : '✗ DISABLED'}${' '.repeat(37)} ║`)
+    console.log(`║  Group @: ${config.triggers?.groupAt ? '✓ ENABLED' : '✗ DISABLED'}${' '.repeat(42)} ║`)
     console.log('╚════════════════════════════════════════════════════════════════╝\n')
     
     registerMonitorHandler((type: string, json: string) => {
@@ -1186,9 +1186,9 @@ class HttpService {
   private async processTalker(talkerId: string, config: WebhookConfig): Promise<void> {
     console.log(`[Webhook] processTalker called: talkerId=${talkerId}`)
 
-    // ★★★ 检测到数据库变化 ★★★
+    // ★★★ Database Change Detected ★★★
     console.log(`\n★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★`)
-    console.log(`★★★ [1/5] 检测到数据库变化: ${talkerId}`)
+    console.log(`★★★ [1/5] Database change detected: ${talkerId}`)
     console.log(`★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★ ★★★\n`)
 
     // Wait for database write
@@ -1199,47 +1199,47 @@ class HttpService {
     console.log(`[Webhook] Got ${messages?.length || 0} messages for ${talkerId}`)
 
     if (!messages || messages.length === 0) {
-      console.log(`!!! [2/5] 扫描完成: ${talkerId} - 无新消息`)
+      console.log(`!!! [2/5] Scan complete: ${talkerId} - No new messages`)
       return
     }
 
-    // ★★★ 扫描到消息 ★★★
+    // ★★★ Messages Found ★★★
     console.log(`!!! !!! !!! !!! !!! !!! !!! !!! !!! !!!`)
-    console.log(`!!! [2/5] 扫描完成: 发现 ${messages.length} 条新消息`)
+    console.log(`!!! [2/5] Scan complete: Found ${messages.length} new messages`)
     console.log(`!!! !!! !!! !!! !!! !!! !!! !!! !!! !!!`)
 
     const message = messages[0]
     const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
 
-    // ★★★ 判断是否符合条件 + 查找key ★★★
-    console.log(`\n◆◆◆ [3/5] 开始判断消息是否符合条件...`)
-    console.log(`◆◆◆ 发送者: ${message.accountName || message.sender}`)
-    console.log(`◆◆◆ 内容: ${message.content?.slice(0, 50)}...`)
-    console.log(`◆◆◆ 查找key: ${msgKey.substring(0, 50)}...`)
+    // ★★★ Check Condition + Find Key ★★★
+    console.log(`\n◆◆◆ [3/5] Checking if message matches conditions...`)
+    console.log(`◆◆◆ Sender: ${message.accountName || message.sender}`)
+    console.log(`◆◆◆ Content: ${message.content?.slice(0, 50)}...`)
+    console.log(`◆◆◆ Looking up key: ${msgKey.substring(0, 50)}...`)
 
     // Check if already processed using message key
     if (this.processedMessages.has(msgKey)) {
-      console.log(`◆◆◆ 结果: ❌ KEY已存在 - 跳过此消息`)
+      console.log(`◆◆◆ Result: ❌ KEY EXISTS - Skipping this message`)
       return
     }
-    console.log(`◆◆◆ 结果: ✓ KEY不存在 - 继续处理`)
+    console.log(`◆◆◆ Result: ✓ KEY NOT FOUND - Continuing processing`)
 
     // Mark as processed
     this.processedMessages.set(msgKey, Date.now())
-    console.log(`◆◆◆ 消息已标记为已处理`)
+    console.log(`◆◆◆ Message marked as processed`)
 
     const triggerType = this.getTriggerType(message, talkerId, config)
-    console.log(`◆◆◆ 触发类型: ${triggerType || '无'}`)
+    console.log(`◆◆◆ Trigger type: ${triggerType || 'None'}`)
 
     if (triggerType) {
-      // ★★★ 符合条件 ★★★
+      // ★★★ Condition Matched ★★★
       console.log(`\n✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓`)
-      console.log(`✓✓✓ [4/5] ✓✓✓ 符合条件! 准备发送webhook ✓✓✓`)
+      console.log(`✓✓✓ [4/5] ✓✓✓ CONDITION MATCHED! Preparing to send webhook ✓✓✓`)
       console.log(`✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓ ✓✓✓`)
       
       await this.sendWebhook(message, talkerId, config, triggerType)
     } else {
-      console.log(`◆◆◆ 结果: ❌ 不符合触发条件`)
+      console.log(`◆◆◆ Result: ❌ Does not match trigger conditions`)
     }
   }
 
@@ -1380,17 +1380,17 @@ class HttpService {
 
       await this.postRequest(config.url, payload, headers)
       
-      // ★★★ 最终发送成功 ★★★
+      // ★★★ Webhook Sent Successfully ★★★
       console.log(`\n◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆`)
-      console.log(`◆◆◆ [5/5] ◆◆◆ WEBHOOK发送成功! ◆◆◆`)
-      console.log(`◆◆◆ 目标: ${config.url}`)
-      console.log(`◆◆◆ 群/会话: ${talkerId}`)
-      console.log(`◆◆◆ 发送者: ${message.accountName || message.sender}`)
-      console.log(`◆◆◆ 触发类型: ${triggerType}`)
+      console.log(`◆◆◆ [5/5] ◆◆◆ WEBHOOK SENT SUCCESSFULLY! ◆◆◆`)
+      console.log(`◆◆◆ Target: ${config.url}`)
+      console.log(`◆◆◆ Session: ${talkerId}`)
+      console.log(`◆◆◆ Sender: ${message.accountName || message.sender}`)
+      console.log(`◆◆◆ Trigger Type: ${triggerType}`)
       console.log(`◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆◆\n`)
     } catch (error) {
       console.error('[Webhook] Send failed:', error)
-      console.log(`\n❌❌❌ [5/5] ❌❌❌ WEBHOOK发送失败: ${error} ❌❌❌\n`)
+      console.log(`\n❌❌❌ [5/5] ❌❌❌ WEBHOOK SEND FAILED: ${error} ❌❌❌\n`)
     }
   }
 
