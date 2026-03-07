@@ -1190,14 +1190,21 @@ class HttpService {
    */
   private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
-      // Try different query formats since talkerId format may vary
       const dbPath = this.configService.get('dbPath') as string
       
-      // Query 1: Try with talkerId (exact match)
-      let sql = `SELECT senderUsername, createTime, content, type as localType FROM Message WHERE talkerId = ? ORDER BY createTime DESC LIMIT ?`
-      let result = await wcdbService.execQuery('message', dbPath, sql, [talkerId, limit])
+      // Use string concatenation instead of parameterized query
+      // Escape single quotes to prevent injection
+      const safeTalkerId = talkerId.replace(/'/g, "''")
+      const sql = `SELECT senderUsername, createTime, content, type as localType FROM Message WHERE talkerId = '${safeTalkerId}' ORDER BY createTime DESC LIMIT ${limit}`
+      
+      console.log(`[SQL] Query: ${sql.substring(0, 100)}...`)
+      
+      const result = await wcdbService.execQuery('message', dbPath, sql, [])
+      
+      console.log(`[SQL] Result: success=${result.success}, rows=${result.rows?.length || 0}`)
       
       if (result.success && result.rows && result.rows.length > 0) {
+        console.log(`[SQL] First row: sender=${result.rows[0].senderUsername}, time=${result.rows[0].createTime}`)
         return result.rows.map((m: any) => ({
           sender: m.senderUsername,
           timestamp: m.createTime,
@@ -1206,20 +1213,6 @@ class HttpService {
           accountName: m.senderUsername,
           groupNickname: ''
         }))
-      }
-      
-      // Query 2: If no results, try to find what talkerId format is used
-      console.log(`[SQL] No results for talkerId=${talkerId}, trying alternative...`)
-      
-      // Get sample messages to understand the format
-      const sampleSql = `SELECT talkerId, senderUsername, createTime, content FROM Message ORDER BY createTime DESC LIMIT 3`
-      const sampleResult = await wcdbService.execQuery('message', dbPath, sampleSql, [])
-      
-      if (sampleResult.success && sampleResult.rows && sampleResult.rows.length > 0) {
-        console.log(`[SQL] Sample messages format:`)
-        sampleResult.rows.forEach((row: any, i: number) => {
-          console.log(`  [${i}] talkerId=${row.talkerId}, sender=${row.senderUsername}, content=${row.content?.substring(0, 20)}`)
-        })
       }
       
       return []
