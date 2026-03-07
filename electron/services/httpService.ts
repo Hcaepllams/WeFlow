@@ -1064,6 +1064,9 @@ class HttpService {
    * Start Webhook monitor (event-driven)
    */
   private startWebhookMonitor(): void {
+    // VERSION MARK: 2025-03-07 15:20 - Latest code with DEBUG logs
+    console.log('[Webhook] VERSION: 2025-03-07-15-20-DEBUG')
+    
     console.log('[Webhook] startWebhookMonitor called, started=', this.webhookMonitorStarted)
     
     // Prevent multiple registrations
