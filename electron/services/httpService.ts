@@ -1211,15 +1211,11 @@ class HttpService {
     const message = messages[0]
     const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
 
-    // *** FILTER: Skip messages sent by self to prevent echo loop ***
-    const myWxid = this.configService.get('myWxid') || ''
-    const isSelfSent = message.sender === myWxid || 
-                       message.sender?.toLowerCase() === myWxid?.toLowerCase()
-    
-    if (isSelfSent) {
-      console.log(`--- [FILTER] Skipping self-sent message from ${message.accountName || message.sender}`)
-      console.log(`--- Sender ID: ${message.sender}, My ID: ${myWxid}`)
-      console.log(`--- This prevents echo loop when bot replies`)
+    // *** FILTER: Skip self-sent messages to prevent echo loop ***
+    // isSend: 0=received from others, 1=sent by self
+    if (message.isSend === 1 || message.isSend === true) {
+      console.log(`--- [FILTER] Skipping self-sent message (isSend=${message.isSend})`)
+      console.log(`--- Sender: ${message.accountName || message.sender}`)
       return
     }
 
@@ -1268,7 +1264,8 @@ class HttpService {
           content: m.parsedContent || m.content,
           type: m.localType,
           accountName: m.senderDisplayName || m.senderUsername,
-          groupNickname: m.groupNickname
+          groupNickname: m.groupNickname,
+          isSend: m.isSend  // 0=received, 1=self-sent
         }))
       }
       return []
