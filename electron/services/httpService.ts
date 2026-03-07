@@ -1214,9 +1214,7 @@ class HttpService {
     // *** FILTER: Skip messages sent by self to prevent echo loop ***
     const myWxid = this.configService.get('myWxid') || ''
     const isSelfSent = message.sender === myWxid || 
-                       message.sender?.toLowerCase() === myWxid?.toLowerCase() ||
-                       message.isSend === 1 || 
-                       message.isSend === true
+                       message.sender?.toLowerCase() === myWxid?.toLowerCase()
     
     if (isSelfSent) {
       console.log(`--- [FILTER] Skipping self-sent message from ${message.accountName || message.sender}`)
@@ -1270,8 +1268,7 @@ class HttpService {
           content: m.parsedContent || m.content,
           type: m.localType,
           accountName: m.senderDisplayName || m.senderUsername,
-          groupNickname: m.groupNickname,
-          isSend: m.isSend  // Add isSend field to identify self-sent messages
+          groupNickname: m.groupNickname
         }))
       }
       return []
