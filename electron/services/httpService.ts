@@ -1211,6 +1211,13 @@ class HttpService {
     const message = messages[0]
     const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
 
+    // *** FILTER: Skip messages sent by self to prevent echo loop ***
+    if (message.isSend === 1 || message.isSend === true) {
+      console.log(`--- [FILTER] Skipping self-sent message from ${message.accountName || message.sender}`)
+      console.log(`--- This prevents echo loop when bot replies`)
+      return
+    }
+
     // *** STEP 3/5: Check Conditions ***
     console.log(`\n--- [3/5] Checking if message matches conditions...`)
     console.log(`--- Sender: ${message.accountName || message.sender}`)
@@ -1256,7 +1263,8 @@ class HttpService {
           content: m.parsedContent || m.content,
           type: m.localType,
           accountName: m.senderDisplayName || m.senderUsername,
-          groupNickname: m.groupNickname
+          groupNickname: m.groupNickname,
+          isSend: m.isSend  // Add isSend field to identify self-sent messages
         }))
       }
       return []
