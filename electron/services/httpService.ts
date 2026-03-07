@@ -1189,62 +1189,42 @@ class HttpService {
   }
 
   /**
-   * Get latest messages - directly query database for truly latest message
+   * Get latest messages using chatService with cursor reset
    */
   private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
-      const dbPath = this.configService.get('dbPath') as string
-      
       console.log(`[DEBUG] getLatestMessages called for talkerId=${talkerId}`)
       
-      // First, find what talkerIds exist in database (for debugging)
-      // Try different possible table names
-      const tableNames = ['Message', 'message', 'MSG', 'msg', 'Chat', 'chat']
-      let checkResult: any = null
-      let foundTable = ''
-      
-      for (const tableName of tableNames) {
-        const checkSql = `SELECT DISTINCT talkerId FROM ${tableName} LIMIT 5`
-        const result = await wcdbService.execQuery('message', dbPath, checkSql, [])
-        console.log(`[DEBUG] Table ${tableName}: success=${result.success}, rows=${result.rows?.length || 0}`)
-        if (result.success && result.rows && result.rows.length > 0) {
-          checkResult = result
-          foundTable = tableName
-          break
-        }
+      // Close existing cursor to ensure fresh query from latest
+      try {
+        await chatService.closeMessageCursor(talkerId)
+        console.log(`[DEBUG] Closed cursor for ${talkerId}`)
+      } catch (e) {
+        // Cursor might not exist, ignore error
       }
       
-      if (checkResult && checkResult.rows && checkResult.rows.length > 0) {
-        const ids = checkResult.rows.map((r: any) => r.talkerId).join(', ')
-        console.log(`[DEBUG] Found table: ${foundTable}, Available talkerIds: ${ids}`)
-      } else {
-        console.log(`[DEBUG] No messages found in any table`)
+      // Get messages (fetch more to ensure we get latest)
+      const result = await chatService.getMessages(talkerId, 20, 0, 0, 0, false)
+      
+      console.log(`[DEBUG] chatService.getMessages returned: success=${result.success}, count=${result.messages?.length || 0}`)
+      
+      if (!result.success || !result.messages || result.messages.length === 0) {
+        return []
       }
       
-      // Query with the provided talkerId using found table
-      const safeTalkerId = talkerId.replace(/'/g, "''")
-      const tableToUse = foundTable || 'Message'
-      const sql = `SELECT senderUsername, createTime, content, type as localType FROM ${tableToUse} WHERE talkerId = '${safeTalkerId}' ORDER BY createTime DESC LIMIT ${limit}`
+      // Sort by createTime descending (newest first) and take top N
+      const sorted = result.messages.sort((a: any, b: any) => b.createTime - a.createTime)
       
-      console.log(`[SQL] Query using table ${tableToUse}: ${sql}`)
+      console.log(`[DEBUG] Latest message: sender=${sorted[0].senderUsername}, time=${sorted[0].createTime}, content=${sorted[0].parsedContent?.substring(0, 30) || sorted[0].content?.substring(0, 30)}`)
       
-      const result = await wcdbService.execQuery('message', dbPath, sql, [])
-      
-      console.log(`[SQL] Result: success=${result.success}, rows=${result.rows?.length || 0}`)
-      
-      if (result.success && result.rows && result.rows.length > 0) {
-        console.log(`[SQL] First row: sender=${result.rows[0].senderUsername}, time=${result.rows[0].createTime}`)
-        return result.rows.map((m: any) => ({
-          sender: m.senderUsername,
-          timestamp: m.createTime,
-          content: m.content,
-          type: m.localType,
-          accountName: m.senderUsername,
-          groupNickname: ''
-        }))
-      }
-      
-      return []
+      return sorted.slice(0, limit).map((m: any) => ({
+        sender: m.senderUsername,
+        timestamp: m.createTime,
+        content: m.parsedContent || m.content,
+        type: m.localType,
+        accountName: m.senderDisplayName || m.senderUsername,
+        groupNickname: m.groupNickname
+      }))
     } catch (e) {
       console.error('[ERROR] getLatestMessages failed:', e)
       return []
