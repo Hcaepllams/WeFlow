@@ -1181,105 +1181,43 @@ class HttpService {
   }
 
   /**
-   * Process a single talker - use message key for deduplication
+   * Process a single talker - simplified for debugging
    */
   private async processTalker(talkerId: string, config: WebhookConfig): Promise<void> {
-    console.log(`[Webhook] processTalker called: talkerId=${talkerId}`)
-
-    // *** STEP 1/5: Database Change Detected ***
-    console.log(`\n*** *** *** *** *** *** *** *** *** *** *** *** *** *** ***`)
-    console.log(`*** [1/5] Database change detected: ${talkerId}`)
-    console.log(`*** *** *** *** *** *** *** *** *** *** *** *** *** *** ***\n`)
-
-    // Wait for database write
-    await new Promise(r => setTimeout(r, 100))
-
-    // Get only the latest message (after the previous timestamp)
-    const prevTimestamp = this.sessionTimestamps.get(talkerId) || 0
-    const messages = await this.getLatestMessages(talkerId, 1, prevTimestamp)
-    console.log(`[Webhook] Got ${messages?.length || 0} messages for ${talkerId} (after ts ${prevTimestamp})`)
-
-    if (!messages || messages.length === 0) {
-      console.log(`!!! [2/5] Scan complete: ${talkerId} - No new messages after ${prevTimestamp}`)
-      return
-    }
-
-    // *** STEP 2/5: Messages Found ***
-    console.log(`!!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!!`)
-    console.log(`!!! [2/5] Scan complete: Found ${messages.length} new messages`)
-    console.log(`!!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!! !!!`)
+    // Get latest message
+    const messages = await this.getLatestMessages(talkerId, 1)
+    if (!messages || messages.length === 0) return
 
     const message = messages[0]
-    const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
+    const isGroup = talkerId.includes('@chatroom')
     
-    console.log(`[DEBUG] Processing message: sender=${message.sender}, timestamp=${message.timestamp}, content=${message.content?.slice(0, 30)}...`)
+    // Simplified log - only show key info for判断
+    console.log('\n========================================')
+    console.log(`[MSG] Session: ${talkerId}`)
+    console.log(`[MSG] Type: ${isGroup ? 'Group' : 'Private'}`)
+    console.log(`[MSG] Sender: ${message.sender}`)
+    console.log(`[MSG] SenderName: ${message.accountName}`)
+    console.log(`[MSG] Content: ${message.content}`)
+    console.log('========================================\n')
 
-    // *** FILTER: Skip self-sent messages to prevent echo loop ***
-    // Compare sender with myWxid or myDisplayName to detect self-sent messages
-    const myWxid = this.configService.get('myWxid') || ''
-    const myDisplayName = this.configService.get('myDisplayName') || 'hcaepllams'  // Your WeChat display name
-    const senderId = message.sender || ''
-    const senderName = message.accountName || ''
-    
-    console.log(`--- [DEBUG] SenderId: ${senderId}, SenderName: ${senderName}, MyWxid: ${myWxid}, MyName: ${myDisplayName}`)
-    
-    // Check if sender is myself
-    const isSelfSent = (myWxid && senderId && senderId.toLowerCase() === myWxid.toLowerCase()) ||
-                       (myDisplayName && senderName && senderName.toLowerCase() === myDisplayName.toLowerCase())
-    
-    if (isSelfSent) {
-      console.log(`--- [FILTER] Skipping self-sent message`)
-      console.log(`--- Sender: ${senderName || senderId}`)
-      return
-    }
-
-    // *** STEP 3/5: Check Conditions ***
-    console.log(`\n--- [3/5] Checking if message matches conditions...`)
-    console.log(`--- Sender: ${message.accountName || message.sender}`)
-    console.log(`--- Content: ${message.content?.slice(0, 50)}...`)
-    console.log(`--- Looking up key: ${msgKey.substring(0, 50)}...`)
-
-    // Check if already processed using message key
-    if (this.processedMessages.has(msgKey)) {
-      console.log(`--- Result: [SKIP] KEY EXISTS - Skipping this message`)
-      return
-    }
-    console.log(`--- Result: [OK] KEY NOT FOUND - Continuing processing`)
-
-    // Mark as processed
-    this.processedMessages.set(msgKey, Date.now())
-    console.log(`--- Message marked as processed`)
+    // Temporarily disable all filters - just observe
+    // TODO: Add filtering logic after understanding the data
 
     const triggerType = this.getTriggerType(message, talkerId, config)
-    console.log(`--- Trigger type: ${triggerType || 'None'}`)
-
     if (triggerType) {
-      // *** STEP 4/5: Condition Matched ***
-      console.log(`\n>>> >>> >>> >>> >>> >>> >>> >>> >>>`)
-      console.log(`>>> [4/5] >>> CONDITION MATCHED! Preparing to send webhook <<<`)
-      console.log(`>>> >>> >>> >>> >>> >>> >>> >>> >>>`)
-      
       await this.sendWebhook(message, talkerId, config, triggerType)
-    } else {
-      console.log(`--- Result: [SKIP] Does not match trigger conditions`)
     }
   }
 
   /**
    * Get latest messages
    */
-  private async getLatestMessages(talkerId: string, limit: number, afterTimestamp?: number): Promise<any[]> {
+  private async getLatestMessages(talkerId: string, limit: number): Promise<any[]> {
     try {
       const result = await chatService.getMessages(talkerId, limit)
       if (result.success && result.messages) {
-        // Filter messages by timestamp if provided
-        let messages = result.messages
-        if (afterTimestamp) {
-          messages = messages.filter((m: any) => m.createTime > afterTimestamp)
-        }
-        
         // Sort by timestamp descending and take the latest
-        messages = messages.sort((a: any, b: any) => b.createTime - a.createTime)
+        const messages = result.messages.sort((a: any, b: any) => b.createTime - a.createTime)
         
         return messages.slice(0, limit).map((m: any) => ({
           sender: m.senderUsername,
