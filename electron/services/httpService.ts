@@ -1212,8 +1212,15 @@ class HttpService {
     const msgKey = `${message.sender}_${message.timestamp}_${message.content?.slice(0, 50)}`
 
     // *** FILTER: Skip messages sent by self to prevent echo loop ***
-    if (message.isSend === 1 || message.isSend === true) {
+    const myWxid = this.configService.get('myWxid') || ''
+    const isSelfSent = message.sender === myWxid || 
+                       message.sender?.toLowerCase() === myWxid?.toLowerCase() ||
+                       message.isSend === 1 || 
+                       message.isSend === true
+    
+    if (isSelfSent) {
       console.log(`--- [FILTER] Skipping self-sent message from ${message.accountName || message.sender}`)
+      console.log(`--- Sender ID: ${message.sender}, My ID: ${myWxid}`)
       console.log(`--- This prevents echo loop when bot replies`)
       return
     }
