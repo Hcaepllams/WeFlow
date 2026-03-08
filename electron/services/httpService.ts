@@ -758,6 +758,18 @@ class HttpService {
       content: this.getMessageContent(msg),
       rawContent: msg.rawContent,
       parsedContent: msg.parsedContent,
+      // 图片元数据（用于媒体导出）
+      imageMd5: msg.imageMd5,
+      imageDatName: msg.imageDatName,
+      aesKey: msg.aesKey,
+      encrypVer: msg.encrypVer,
+      cdnThumbUrl: msg.cdnThumbUrl,
+      // 视频元数据
+      videoMd5: msg.videoMd5,
+      // 表情元数据
+      emojiMd5: msg.emojiMd5,
+      emojiCdnUrl: msg.emojiCdnUrl,
+      // 媒体文件信息（如果已导出）
       mediaType: media?.kind,
       mediaFileName: media?.fileName,
       mediaUrl: media ? `http://127.0.0.1:${this.port}/api/v1/media/${media.relativePath}` : undefined,
