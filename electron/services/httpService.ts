@@ -273,6 +273,8 @@ class HttpService {
         await this.handleContacts(url, res)
       } else if (pathname.startsWith('/api/v1/media/')) {
         this.handleMediaRequest(pathname, res)
+      } else if (pathname === '/api/v1/image/decrypt' && req.method === 'POST') {
+        await this.handleImageDecrypt(url, res)
       } else {
         this.sendError(res, 404, 'Not Found')
       }
