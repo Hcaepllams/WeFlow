@@ -648,13 +648,32 @@ class HttpService {
     options: ApiMediaOptions
   ): Promise<ApiExportedMedia | null> {
     try {
+      console.log('[HttpService] exportMediaForMessage:', {
+        localType: msg.localType,
+        localId: msg.localId,
+        exportImages: options.exportImages,
+        imageMd5: msg.imageMd5 ? 'present' : 'missing',
+        imageDatName: msg.imageDatName ? 'present' : 'missing',
+        aesKey: msg.aesKey ? 'present' : 'missing'
+      })
+      
       if (msg.localType === 3 && options.exportImages) {
+        if (!msg.imageMd5 && !msg.imageDatName) {
+          console.warn('[HttpService] 图片缺少标识字段:', { localId: msg.localId, imageMd5: msg.imageMd5, imageDatName: msg.imageDatName })
+          return null
+        }
+        
+        console.log('[HttpService] 开始解密图片:', { localId: msg.localId, imageMd5: msg.imageMd5?.substring(0, 8) })
+        
         const result = await imageDecryptService.decryptImage({
           sessionId: talker,
           imageMd5: msg.imageMd5,
           imageDatName: msg.imageDatName,
+          aesKey: msg.aesKey,  // ← 添加 aesKey
           force: true
         })
+        
+        console.log('[HttpService] 解密结果:', { success: result.success, localPath: result.localPath, error: result.error })
         if (result.success && result.localPath) {
           let imagePath = result.localPath
           if (imagePath.startsWith('data:')) {
