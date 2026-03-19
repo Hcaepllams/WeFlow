@@ -190,6 +190,21 @@ function normalizeSearchAvatarUrl(value?: string | null): string | undefined {
   return normalized
 }
 
+function resolveSessionDisplayName(
+  displayName?: string | null,
+  sessionId?: string | null
+): string | undefined {
+  const normalizedSessionId = String(sessionId || '').trim()
+  const normalizedDisplayName = normalizeSearchIdentityText(displayName)
+  if (!normalizedDisplayName) return undefined
+  if (normalizedSessionId && normalizedDisplayName === normalizedSessionId) return undefined
+  return normalizedDisplayName
+}
+
+function isFoldPlaceholderSession(sessionId?: string | null): boolean {
+  return String(sessionId || '').toLowerCase().includes('placeholder_foldgroup')
+}
+
 function isWxidLikeSearchIdentity(value?: string | null): boolean {
   const normalized = String(value || '').trim().toLowerCase()
   if (!normalized) return false
@@ -398,6 +413,8 @@ const CHAT_SESSION_WINDOW_CACHE_TTL_MS = 12 * 60 * 60 * 1000
 const CHAT_SESSION_WINDOW_CACHE_MAX_SESSIONS = 30
 const CHAT_SESSION_WINDOW_CACHE_MAX_MESSAGES = 300
 const GROUP_MEMBERS_PANEL_CACHE_TTL_MS = 10 * 60 * 1000
+const SESSION_CONTACT_PROFILE_RETRY_INTERVAL_MS = 15 * 1000
+const SESSION_CONTACT_PROFILE_CACHE_TTL_MS = 3 * 24 * 60 * 60 * 1000
 
 function buildChatSessionListCacheKey(scope: string): string {
   return `weflow.chat.sessions.v1::${scope || 'default'}`
@@ -505,6 +522,13 @@ interface SessionExportCacheMeta {
   stale: boolean
   includeRelations: boolean
   source: 'memory' | 'disk' | 'fresh'
+}
+
+interface SessionContactProfile {
+  displayName?: string
+  avatarUrl?: string
+  alias?: string
+  updatedAt: number
 }
 
 type GroupMessageCountStatus = 'loading' | 'ready' | 'failed'
@@ -995,11 +1019,17 @@ function ChatPage(props: ChatPageProps) {
   const enrichCancelledRef = useRef(false)
   const isScrollingRef = useRef(false)
   const sessionScrollTimeoutRef = useRef<number | null>(null)
+  const pendingSessionContactEnrichRef = useRef<Set<string>>(new Set())
+  const sessionContactEnrichAttemptAtRef = useRef<Map<string, number>>(new Map())
+  const sessionContactProfileCacheRef = useRef<Map<string, SessionContactProfile>>(new Map())
 
 
   const highlightedMessageSet = useMemo(() => new Set(highlightedMessageKeys), [highlightedMessageKeys])
   const messageKeySetRef = useRef<Set<string>>(new Set())
   const lastMessageTimeRef = useRef(0)
+  const isMessageListAtBottomRef = useRef(true)
+  const lastObservedMessageCountRef = useRef(0)
+  const lastVisibleSenderWarmupAtRef = useRef(0)
   const sessionMapRef = useRef<Map<string, ChatSession>>(new Map())
   const sessionsRef = useRef<ChatSession[]>([])
   const currentSessionRef = useRef<string | null>(null)
@@ -1042,6 +1072,51 @@ function ChatPage(props: ChatPageProps) {
 
   const isGroupChatSession = useCallback((username: string) => {
     return username.includes('@chatroom')
+  }, [])
+
+  const mergeSessionContactPresentation = useCallback((session: ChatSession, previousSession?: ChatSession): ChatSession => {
+    const username = String(session.username || '').trim()
+    if (!username || isFoldPlaceholderSession(username)) {
+      return session
+    }
+
+    const now = Date.now()
+    const cacheMap = sessionContactProfileCacheRef.current
+    const cachedProfile = cacheMap.get(username)
+    if (cachedProfile && now - cachedProfile.updatedAt > SESSION_CONTACT_PROFILE_CACHE_TTL_MS) {
+      cacheMap.delete(username)
+    }
+    const profile = cacheMap.get(username)
+
+    const sessionDisplayName = resolveSessionDisplayName(session.displayName, username)
+    const previousDisplayName = resolveSessionDisplayName(previousSession?.displayName, username)
+    const profileDisplayName = resolveSessionDisplayName(profile?.displayName, username)
+    const resolvedDisplayName = sessionDisplayName || previousDisplayName || profileDisplayName || session.displayName || username
+
+    const sessionAvatarUrl = normalizeSearchAvatarUrl(session.avatarUrl)
+    const previousAvatarUrl = normalizeSearchAvatarUrl(previousSession?.avatarUrl)
+    const profileAvatarUrl = normalizeSearchAvatarUrl(profile?.avatarUrl)
+    const resolvedAvatarUrl = sessionAvatarUrl || previousAvatarUrl || profileAvatarUrl
+
+    const sessionAlias = normalizeSearchIdentityText(session.alias)
+    const previousAlias = normalizeSearchIdentityText(previousSession?.alias)
+    const profileAlias = normalizeSearchIdentityText(profile?.alias)
+    const resolvedAlias = sessionAlias || previousAlias || profileAlias
+
+    if (
+      resolvedDisplayName === session.displayName &&
+      resolvedAvatarUrl === session.avatarUrl &&
+      resolvedAlias === session.alias
+    ) {
+      return session
+    }
+
+    return {
+      ...session,
+      displayName: resolvedDisplayName,
+      avatarUrl: resolvedAvatarUrl,
+      alias: resolvedAlias
+    }
   }, [])
 
   const clearExportPrepareState = useCallback(() => {
@@ -2277,6 +2352,9 @@ function ChatPage(props: ChatPageProps) {
   const handleAccountChanged = useCallback(async () => {
     senderAvatarCache.clear()
     senderAvatarLoading.clear()
+    sessionContactProfileCacheRef.current.clear()
+    pendingSessionContactEnrichRef.current.clear()
+    sessionContactEnrichAttemptAtRef.current.clear()
     preloadImageKeysRef.current.clear()
     lastPreloadSessionRef.current = null
     pendingSessionLoadRef.current = null
@@ -2365,6 +2443,7 @@ function ChatPage(props: ChatPageProps) {
   // 同步 currentSessionId 到 ref
   useEffect(() => {
     currentSessionRef.current = currentSessionId
+    isMessageListAtBottomRef.current = true
     topRangeLoadLockRef.current = false
     bottomRangeLoadLockRef.current = false
     setShowScrollToBottom(false)
@@ -2423,11 +2502,9 @@ function ChatPage(props: ChatPageProps) {
       if (result.success && result.sessions) {
         // 确保 sessions 是数组
         const sessionsArray = Array.isArray(result.sessions) ? result.sessions : []
-        const nextSessions = options?.silent ? mergeSessions(sessionsArray) : sessionsArray
+        const nextSessions = mergeSessions(sessionsArray)
         // 确保 nextSessions 也是数组
         if (Array.isArray(nextSessions)) {
-
-
           setSessions(nextSessions)
           sessionsRef.current = nextSessions
           persistSessionListCache(scope, nextSessions)
@@ -2436,11 +2513,12 @@ function ChatPage(props: ChatPageProps) {
           void enrichSessionsContactInfo(nextSessions)
         } else {
           console.error('mergeSessions returned non-array:', nextSessions)
-          setSessions(sessionsArray)
-          sessionsRef.current = sessionsArray
-          persistSessionListCache(scope, sessionsArray)
-          void hydrateSessionStatuses(sessionsArray)
-          void enrichSessionsContactInfo(sessionsArray)
+          const fallbackSessions = sessionsArray.map((session) => mergeSessionContactPresentation(session))
+          setSessions(fallbackSessions)
+          sessionsRef.current = fallbackSessions
+          persistSessionListCache(scope, fallbackSessions)
+          void hydrateSessionStatuses(fallbackSessions)
+          void enrichSessionsContactInfo(fallbackSessions)
         }
       } else if (!result.success) {
         setConnectionError(result.error || '获取会话失败')
@@ -2457,99 +2535,102 @@ function ChatPage(props: ChatPageProps) {
     }
   }
 
-  // 分批异步加载联系人信息（优化性能：防止重复加载，滚动时暂停，只在空闲时加载）
+  // 分批异步加载联系人信息（优化：缓存优先 + 可持续队列 + 首屏优先批次）
   const enrichSessionsContactInfo = async (sessions: ChatSession[]) => {
-    if (sessions.length === 0) return
+    if (Array.isArray(sessions) && sessions.length > 0) {
+      const now = Date.now()
+      for (const session of sessions) {
+        const username = String(session.username || '').trim()
+        if (!username || isFoldPlaceholderSession(username)) continue
 
-    // 防止重复加载
-    if (isEnrichingRef.current) {
+        const profileCache = sessionContactProfileCacheRef.current
+        const cachedProfile = profileCache.get(username)
+        if (cachedProfile && now - cachedProfile.updatedAt > SESSION_CONTACT_PROFILE_CACHE_TTL_MS) {
+          profileCache.delete(username)
+        }
 
-      return
+        const hasAvatar = Boolean(normalizeSearchAvatarUrl(session.avatarUrl))
+        const hasDisplayName = Boolean(resolveSessionDisplayName(session.displayName, username))
+        if (hasAvatar && hasDisplayName) continue
+
+        const profile = profileCache.get(username)
+        const profileHasAvatar = Boolean(normalizeSearchAvatarUrl(profile?.avatarUrl))
+        const profileHasDisplayName = Boolean(resolveSessionDisplayName(profile?.displayName, username))
+        if (profileHasAvatar && profileHasDisplayName) continue
+
+        const lastAttemptAt = sessionContactEnrichAttemptAtRef.current.get(username) || 0
+        if (now - lastAttemptAt < SESSION_CONTACT_PROFILE_RETRY_INTERVAL_MS) continue
+
+        pendingSessionContactEnrichRef.current.add(username)
+      }
     }
+
+    if (pendingSessionContactEnrichRef.current.size === 0) return
+    if (isEnrichingRef.current) return
 
     isEnrichingRef.current = true
     enrichCancelledRef.current = false
-
-
     const totalStart = performance.now()
-
-    // 移除初始 500ms 延迟，让后台加载与 UI 渲染并行
-
-    // 检查是否被取消
-    if (enrichCancelledRef.current) {
-      isEnrichingRef.current = false
-      return
-    }
+    const batchSize = 8
+    let processedBatchCount = 0
 
     try {
-      // 找出需要加载联系人信息的会话（没有头像或者没有显示名称的）
-      const needEnrich = sessions.filter(s => !s.avatarUrl || !s.displayName || s.displayName === s.username)
-      if (needEnrich.length === 0) {
-
-        isEnrichingRef.current = false
-        return
-      }
-
-
-
-      // 批量补齐联系人，平衡吞吐和 UI 流畅性
-      const batchSize = 8
-      let loadedCount = 0
-
-      for (let i = 0; i < needEnrich.length; i += batchSize) {
-        // 如果正在滚动，暂停加载
+      while (!enrichCancelledRef.current && pendingSessionContactEnrichRef.current.size > 0) {
         if (isScrollingRef.current) {
-
-          // 等待滚动结束
           while (isScrollingRef.current && !enrichCancelledRef.current) {
             await new Promise(resolve => setTimeout(resolve, 120))
           }
-          if (enrichCancelledRef.current) break
         }
-
-        // 检查是否被取消
         if (enrichCancelledRef.current) break
 
+        const usernames = Array.from(pendingSessionContactEnrichRef.current).slice(0, batchSize)
+        if (usernames.length === 0) break
+        usernames.forEach((username) => pendingSessionContactEnrichRef.current.delete(username))
+
+        const attemptAt = Date.now()
+        usernames.forEach((username) => sessionContactEnrichAttemptAtRef.current.set(username, attemptAt))
+
         const batchStart = performance.now()
-        const batch = needEnrich.slice(i, i + batchSize)
-        const usernames = batch.map(s => s.username)
+        const shouldRunImmediately = processedBatchCount < 2
+        if (shouldRunImmediately) {
+          await loadContactInfoBatch(usernames)
+        } else {
+          await new Promise<void>((resolve) => {
+            if ('requestIdleCallback' in window) {
+              window.requestIdleCallback(() => {
+                void loadContactInfoBatch(usernames).finally(resolve)
+              }, { timeout: 700 })
+            } else {
+              setTimeout(() => {
+                void loadContactInfoBatch(usernames).finally(resolve)
+              }, 80)
+            }
+          })
+        }
+        processedBatchCount += 1
 
-        // 使用 requestIdleCallback 延迟执行，避免阻塞UI
-        await new Promise<void>((resolve) => {
-          if ('requestIdleCallback' in window) {
-            window.requestIdleCallback(() => {
-              void loadContactInfoBatch(usernames).then(() => resolve())
-            }, { timeout: 700 })
-          } else {
-            setTimeout(() => {
-              void loadContactInfoBatch(usernames).then(() => resolve())
-            }, 80)
-          }
-        })
-
-        loadedCount += batch.length
         const batchTime = performance.now() - batchStart
         if (batchTime > 200) {
-          console.warn(`[性能监控] 批次 ${Math.floor(i / batchSize) + 1}/${Math.ceil(needEnrich.length / batchSize)} 耗时: ${batchTime.toFixed(2)}ms (已加载: ${loadedCount}/${needEnrich.length})`)
+          console.warn(`[性能监控] 联系人批次 ${processedBatchCount} 耗时: ${batchTime.toFixed(2)}ms, batch=${usernames.length}`)
         }
 
-        // 批次间延迟，给UI更多时间（DLL调用可能阻塞，需要更长的延迟）
-        if (i + batchSize < needEnrich.length && !enrichCancelledRef.current) {
-          const delay = isScrollingRef.current ? 260 : 120
+        if (!enrichCancelledRef.current && pendingSessionContactEnrichRef.current.size > 0) {
+          const delay = isScrollingRef.current ? 220 : 90
           await new Promise(resolve => setTimeout(resolve, delay))
         }
       }
 
       const totalTime = performance.now() - totalStart
-      if (!enrichCancelledRef.current) {
-
-      } else {
-
+      if (totalTime > 500) {
+        console.info(`[性能监控] 联系人补齐总耗时: ${totalTime.toFixed(2)}ms`)
       }
     } catch (e) {
       console.error('加载联系人信息失败:', e)
     } finally {
       isEnrichingRef.current = false
+      if (!enrichCancelledRef.current && pendingSessionContactEnrichRef.current.size > 0) {
+        void enrichSessionsContactInfo([])
+      }
     }
   }
 
@@ -2605,6 +2686,7 @@ function ChatPage(props: ChatPageProps) {
       if (hasChanges) {
         const updateStart = performance.now()
         setSessions(updatedSessions)
+        sessionsRef.current = updatedSessions
         lastUpdateTimeRef.current = Date.now()
         const updateTime = performance.now() - updateStart
         if (updateTime > 50) {
@@ -2644,18 +2726,34 @@ function ChatPage(props: ChatPageProps) {
         // 将更新加入队列，用于侧边栏更新
         const contacts = result.contacts || {}
         for (const [username, contact] of Object.entries(contacts)) {
-          contactUpdateQueueRef.current.set(username, contact)
+          const normalizedDisplayName = resolveSessionDisplayName(contact.displayName, username) || contact.displayName
+          const normalizedAvatarUrl = normalizeSearchAvatarUrl(contact.avatarUrl)
+          const normalizedAlias = normalizeSearchIdentityText(contact.alias)
+          contactUpdateQueueRef.current.set(username, {
+            displayName: normalizedDisplayName,
+            avatarUrl: normalizedAvatarUrl,
+            alias: normalizedAlias
+          })
+
+          if (normalizedDisplayName || normalizedAvatarUrl || normalizedAlias) {
+            sessionContactProfileCacheRef.current.set(username, {
+              displayName: normalizedDisplayName,
+              avatarUrl: normalizedAvatarUrl,
+              alias: normalizedAlias,
+              updatedAt: Date.now()
+            })
+          }
 
           // 如果是自己的信息且当前个人头像为空，同步更新
-          if (myWxid && username === myWxid && contact.avatarUrl && !myAvatarUrl) {
+          if (myWxid && username === myWxid && normalizedAvatarUrl && !myAvatarUrl) {
 
-            setMyAvatarUrl(contact.avatarUrl)
+            setMyAvatarUrl(normalizedAvatarUrl)
           }
 
           // 【核心优化】同步更新全局发送者头像缓存，供 MessageBubble 使用
           senderAvatarCache.set(username, {
-            avatarUrl: contact.avatarUrl,
-            displayName: contact.displayName
+            avatarUrl: normalizedAvatarUrl,
+            displayName: normalizedDisplayName
           })
         }
         // 触发批量更新
@@ -3919,9 +4017,26 @@ function ChatPage(props: ChatPageProps) {
   const handleMessageRangeChanged = useCallback((range: { startIndex: number; endIndex: number }) => {
     visibleMessageRangeRef.current = range
     const total = messages.length
+    const shouldWarmupVisibleGroupSenders = Boolean(
+      currentSessionId && (
+        isGroupChatSession(currentSessionId) ||
+        (
+          standaloneSessionWindow &&
+          normalizedInitialSessionId &&
+          currentSessionId === normalizedInitialSessionId &&
+          normalizedStandaloneInitialContactType === 'group'
+        )
+      )
+    )
     if (total <= 0) {
+      isMessageListAtBottomRef.current = true
       setShowScrollToBottom(prev => (prev ? false : prev))
       return
+    }
+
+    if (range.endIndex >= Math.max(total - 2, 0)) {
+      isMessageListAtBottomRef.current = true
+      setShowScrollToBottom(prev => (prev ? false : prev))
     }
 
     if (
@@ -3947,6 +4062,29 @@ function ChatPage(props: ChatPageProps) {
       bottomRangeLoadLockRef.current = true
       void loadLaterMessages()
     }
+
+    if (shouldWarmupVisibleGroupSenders) {
+      const now = Date.now()
+      if (now - lastVisibleSenderWarmupAtRef.current >= 180) {
+        lastVisibleSenderWarmupAtRef.current = now
+        const latestMessages = useChatStore.getState().messages || []
+        const visibleStart = Math.max(range.startIndex - 12, 0)
+        const visibleEnd = Math.min(range.endIndex + 20, total - 1)
+        const pendingUsernames = new Set<string>()
+        for (let index = visibleStart; index <= visibleEnd; index += 1) {
+          const msg = latestMessages[index]
+          if (!msg || msg.isSend === 1) continue
+          const sender = String(msg.senderUsername || '').trim()
+          if (!sender) continue
+          if (senderAvatarCache.has(sender) || senderAvatarLoading.has(sender)) continue
+          pendingUsernames.add(sender)
+          if (pendingUsernames.size >= 24) break
+        }
+        if (pendingUsernames.size > 0) {
+          warmupGroupSenderProfiles([...pendingUsernames], false)
+        }
+      }
+    }
   }, [
     messages.length,
     isLoadingMore,
@@ -3957,21 +4095,52 @@ function ChatPage(props: ChatPageProps) {
     currentOffset,
     jumpStartTime,
     jumpEndTime,
+    isGroupChatSession,
+    standaloneSessionWindow,
+    normalizedInitialSessionId,
+    normalizedStandaloneInitialContactType,
+    warmupGroupSenderProfiles,
     loadMessages,
     loadLaterMessages
   ])
 
   const handleMessageAtBottomStateChange = useCallback((atBottom: boolean) => {
-    if (!atBottom) {
-      bottomRangeLoadLockRef.current = false
-    }
-    if (messages.length <= 0 || isLoadingMessages || isSessionSwitching || suppressScrollToBottomButtonRef.current) {
+    if (messages.length <= 0) {
+      isMessageListAtBottomRef.current = true
       setShowScrollToBottom(prev => (prev ? false : prev))
       return
     }
-    const shouldShow = !atBottom
+
+    const listEl = messageListRef.current
+    const distanceFromBottom = listEl
+      ? (listEl.scrollHeight - (listEl.scrollTop + listEl.clientHeight))
+      : Number.POSITIVE_INFINITY
+    const nearBottomByRange = visibleMessageRangeRef.current.endIndex >= Math.max(messages.length - 2, 0)
+    const nearBottomByDistance = distanceFromBottom <= 140
+    const effectiveAtBottom = atBottom || nearBottomByRange || nearBottomByDistance
+    isMessageListAtBottomRef.current = effectiveAtBottom
+
+    if (!effectiveAtBottom) {
+      bottomRangeLoadLockRef.current = false
+    }
+
+    if (
+      isLoadingMessages ||
+      isSessionSwitching ||
+      isLoadingMore ||
+      suppressScrollToBottomButtonRef.current
+    ) {
+      setShowScrollToBottom(prev => (prev ? false : prev))
+      return
+    }
+
+    if (effectiveAtBottom) {
+      setShowScrollToBottom(prev => (prev ? false : prev))
+      return
+    }
+    const shouldShow = distanceFromBottom > 180
     setShowScrollToBottom(prev => (prev === shouldShow ? prev : shouldShow))
-  }, [messages.length, isLoadingMessages, isSessionSwitching])
+  }, [messages.length, isLoadingMessages, isLoadingMore, isSessionSwitching])
 
   const handleMessageAtTopStateChange = useCallback((atTop: boolean) => {
     if (!atTop) {
@@ -3990,7 +4159,8 @@ function ChatPage(props: ChatPageProps) {
       prev.lastTimestamp === next.lastTimestamp &&
       prev.lastMsgType === next.lastMsgType &&
       prev.displayName === next.displayName &&
-      prev.avatarUrl === next.avatarUrl
+      prev.avatarUrl === next.avatarUrl &&
+      prev.alias === next.alias
     )
   }, [])
 
@@ -4001,15 +4171,16 @@ function ChatPage(props: ChatPageProps) {
       return Array.isArray(sessionsRef.current) ? sessionsRef.current : []
     }
     if (!Array.isArray(sessionsRef.current) || sessionsRef.current.length === 0) {
-      return nextSessions
+      return nextSessions.map((next) => mergeSessionContactPresentation(next))
     }
     const prevMap = new Map(sessionsRef.current.map((s) => [s.username, s]))
     return nextSessions.map((next) => {
       const prev = prevMap.get(next.username)
-      if (!prev) return next
-      return isSameSession(prev, next) ? prev : next
+      const merged = mergeSessionContactPresentation(next, prev)
+      if (!prev) return merged
+      return isSameSession(prev, merged) ? prev : merged
     })
-  }, [isSameSession])
+  }, [isSameSession, mergeSessionContactPresentation])
 
   const flashNewMessages = useCallback((keys: string[]) => {
     if (keys.length === 0) return
@@ -4052,6 +4223,7 @@ function ChatPage(props: ChatPageProps) {
   // 滚动到底部
   const scrollToBottom = useCallback(() => {
     suppressScrollToBottomButton(220)
+    isMessageListAtBottomRef.current = true
     setShowScrollToBottom(false)
     const lastIndex = messages.length - 1
     if (lastIndex >= 0 && messageVirtuosoRef.current) {
@@ -4122,6 +4294,9 @@ function ChatPage(props: ChatPageProps) {
         clearTimeout(sessionScrollTimeoutRef.current)
       }
       contactUpdateQueueRef.current.clear()
+      pendingSessionContactEnrichRef.current.clear()
+      sessionContactEnrichAttemptAtRef.current.clear()
+      sessionContactProfileCacheRef.current.clear()
       enrichCancelledRef.current = true
       isEnrichingRef.current = false
     }
@@ -4144,6 +4319,32 @@ function ChatPage(props: ChatPageProps) {
     const lastMsg = messages[messages.length - 1]
     lastMessageTimeRef.current = lastMsg?.createTime ?? 0
   }, [messages, getMessageKey])
+
+  useEffect(() => {
+    lastObservedMessageCountRef.current = messages.length
+    if (messages.length <= 0) {
+      isMessageListAtBottomRef.current = true
+    }
+  }, [currentSessionId])
+
+  useEffect(() => {
+    const previousCount = lastObservedMessageCountRef.current
+    const currentCount = messages.length
+    lastObservedMessageCountRef.current = currentCount
+    if (currentCount <= previousCount) return
+    if (!currentSessionId || isLoadingMessages || isSessionSwitching) return
+    const wasNearBottomByRange = visibleMessageRangeRef.current.endIndex >= Math.max(previousCount - 2, 0)
+    if (!isMessageListAtBottomRef.current && !wasNearBottomByRange) return
+    suppressScrollToBottomButton(220)
+    isMessageListAtBottomRef.current = true
+    requestAnimationFrame(() => {
+      const latestMessages = useChatStore.getState().messages || []
+      const lastIndex = latestMessages.length - 1
+      if (lastIndex >= 0 && messageVirtuosoRef.current) {
+        messageVirtuosoRef.current.scrollToIndex({ index: lastIndex, align: 'end', behavior: 'auto' })
+      }
+    })
+  }, [messages.length, currentSessionId, isLoadingMessages, isSessionSwitching, suppressScrollToBottomButton])
 
   useEffect(() => {
     currentSessionRef.current = currentSessionId
@@ -4195,6 +4396,36 @@ function ChatPage(props: ChatPageProps) {
       }
     }
     sessionMapRef.current = nextMap
+  }, [sessions])
+
+  useEffect(() => {
+    if (!Array.isArray(sessions) || sessions.length === 0) return
+    const now = Date.now()
+    const cache = sessionContactProfileCacheRef.current
+
+    for (const session of sessions) {
+      const username = String(session.username || '').trim()
+      if (!username || isFoldPlaceholderSession(username)) continue
+
+      const displayName = resolveSessionDisplayName(session.displayName, username)
+      const avatarUrl = normalizeSearchAvatarUrl(session.avatarUrl)
+      const alias = normalizeSearchIdentityText(session.alias)
+      if (!displayName && !avatarUrl && !alias) continue
+
+      const prev = cache.get(username)
+      cache.set(username, {
+        displayName: displayName || prev?.displayName,
+        avatarUrl: avatarUrl || prev?.avatarUrl,
+        alias: alias || prev?.alias,
+        updatedAt: now
+      })
+    }
+
+    for (const [username, profile] of cache.entries()) {
+      if (now - profile.updatedAt > SESSION_CONTACT_PROFILE_CACHE_TTL_MS) {
+        cache.delete(username)
+      }
+    }
   }, [sessions])
 
   useEffect(() => {
@@ -5958,7 +6189,7 @@ function ChatPage(props: ChatPageProps) {
                     customScrollParent={messageListScrollParent ?? undefined}
                     data={messages}
                     overscan={360}
-                    followOutput={(isAtBottom) => (isAtBottom ? 'auto' : false)}
+                    followOutput={(atBottom) => (atBottom || isMessageListAtBottomRef.current ? 'auto' : false)}
                     atBottomThreshold={80}
                     atBottomStateChange={handleMessageAtBottomStateChange}
                     atTopStateChange={handleMessageAtTopStateChange}
@@ -6852,8 +7083,25 @@ const emojiDataUrlCache = new Map<string, string>()
 const imageDataUrlCache = new Map<string, string>()
 const voiceDataUrlCache = new Map<string, string>()
 const voiceTranscriptCache = new Map<string, string>()
+type SharedImageDecryptResult = { success: boolean; localPath?: string; liveVideoPath?: string; error?: string }
+const imageDecryptInFlight = new Map<string, Promise<SharedImageDecryptResult>>()
 const senderAvatarCache = new Map<string, { avatarUrl?: string; displayName?: string }>()
 const senderAvatarLoading = new Map<string, Promise<{ avatarUrl?: string; displayName?: string } | null>>()
+
+function getSharedImageDecryptTask(
+  key: string,
+  createTask: () => Promise<SharedImageDecryptResult>
+): Promise<SharedImageDecryptResult> {
+  const existing = imageDecryptInFlight.get(key)
+  if (existing) return existing
+  const task = createTask().finally(() => {
+    if (imageDecryptInFlight.get(key) === task) {
+      imageDecryptInFlight.delete(key)
+    }
+  })
+  imageDecryptInFlight.set(key, task)
+  return task
+}
 
 const buildVoiceCacheIdentity = (
   sessionId: string,
@@ -6933,6 +7181,7 @@ function MessageBubble({
   const isSent = message.isSend === 1
   const [senderAvatarUrl, setSenderAvatarUrl] = useState<string | undefined>(undefined)
   const [senderName, setSenderName] = useState<string | undefined>(undefined)
+  const senderProfileRequestSeqRef = useRef(0)
   const [emojiError, setEmojiError] = useState(false)
   const [emojiLoading, setEmojiLoading] = useState(false)
 
@@ -6963,6 +7212,11 @@ function MessageBubble({
   const imageUpdateCheckedRef = useRef<string | null>(null)
   const imageClickTimerRef = useRef<number | null>(null)
   const imageContainerRef = useRef<HTMLDivElement>(null)
+  const emojiContainerRef = useRef<HTMLDivElement>(null)
+  const imageResizeBaselineRef = useRef<number | null>(null)
+  const emojiResizeBaselineRef = useRef<number | null>(null)
+  const imageObservedHeightRef = useRef<number | null>(null)
+  const emojiObservedHeightRef = useRef<number | null>(null)
   const imageAutoDecryptTriggered = useRef(false)
   const imageAutoHdTriggered = useRef<string | null>(null)
   const [imageInView, setImageInView] = useState(false)
@@ -7058,12 +7312,104 @@ function MessageBubble({
     return imageContainerRef.current?.closest('.message-list') ?? null
   }, [])
 
-  // 获取头像首字母
-  const getAvatarLetter = (name: string): string => {
-    if (!name) return '?'
-    const chars = [...name]
-    return chars[0] || '?'
-  }
+  const stabilizeScrollerByDelta = useCallback((host: HTMLElement | null, delta: number) => {
+    if (!host) return
+    if (!Number.isFinite(delta) || Math.abs(delta) < 1) return
+    const scroller = host.closest('.message-list') as HTMLDivElement | null
+    if (!scroller) return
+
+    const distanceFromBottom = scroller.scrollHeight - (scroller.scrollTop + scroller.clientHeight)
+    if (distanceFromBottom <= 96) return
+
+    const scrollerRect = scroller.getBoundingClientRect()
+    const hostRect = host.getBoundingClientRect()
+    const hostTopInScroller = hostRect.top - scrollerRect.top + scroller.scrollTop
+    const viewportBottom = scroller.scrollTop + scroller.clientHeight
+    if (hostTopInScroller > viewportBottom + 24) return
+
+    scroller.scrollTop += delta
+  }, [])
+
+  const bindResizeObserverForHost = useCallback((
+    host: HTMLElement | null,
+    observedHeightRef: React.MutableRefObject<number | null>,
+    pendingBaselineRef: React.MutableRefObject<number | null>
+  ) => {
+    if (!host) return
+
+    const initialHeight = host.getBoundingClientRect().height
+    observedHeightRef.current = Number.isFinite(initialHeight) && initialHeight > 0 ? initialHeight : null
+    if (typeof ResizeObserver === 'undefined') return
+
+    const observer = new ResizeObserver(() => {
+      const nextHeight = host.getBoundingClientRect().height
+      if (!Number.isFinite(nextHeight) || nextHeight <= 0) {
+        observedHeightRef.current = null
+        return
+      }
+      const previousHeight = observedHeightRef.current
+      observedHeightRef.current = nextHeight
+      if (!Number.isFinite(previousHeight) || (previousHeight as number) <= 0) return
+      if (pendingBaselineRef.current !== null) return
+      stabilizeScrollerByDelta(host, nextHeight - (previousHeight as number))
+    })
+
+    observer.observe(host)
+    return () => {
+      observer.disconnect()
+    }
+  }, [stabilizeScrollerByDelta])
+
+  const captureResizeBaseline = useCallback(
+    (host: HTMLElement | null, baselineRef: React.MutableRefObject<number | null>) => {
+      if (!host) return
+      const height = host.getBoundingClientRect().height
+      if (!Number.isFinite(height) || height <= 0) return
+      baselineRef.current = height
+    },
+    []
+  )
+
+  const stabilizeScrollAfterResize = useCallback(
+    (host: HTMLElement | null, baselineRef: React.MutableRefObject<number | null>) => {
+      if (!host) return
+      const baseline = baselineRef.current
+      baselineRef.current = null
+      if (!Number.isFinite(baseline) || (baseline as number) <= 0) return
+
+      requestAnimationFrame(() => {
+        const nextHeight = host.getBoundingClientRect().height
+        stabilizeScrollerByDelta(host, nextHeight - (baseline as number))
+      })
+    },
+    [stabilizeScrollerByDelta]
+  )
+
+  const captureImageResizeBaseline = useCallback(() => {
+    captureResizeBaseline(imageContainerRef.current, imageResizeBaselineRef)
+  }, [captureResizeBaseline])
+
+  const captureEmojiResizeBaseline = useCallback(() => {
+    captureResizeBaseline(emojiContainerRef.current, emojiResizeBaselineRef)
+  }, [captureResizeBaseline])
+
+  const stabilizeImageScrollAfterResize = useCallback(() => {
+    stabilizeScrollAfterResize(imageContainerRef.current, imageResizeBaselineRef)
+  }, [stabilizeScrollAfterResize])
+
+  const stabilizeEmojiScrollAfterResize = useCallback(() => {
+    stabilizeScrollAfterResize(emojiContainerRef.current, emojiResizeBaselineRef)
+  }, [stabilizeScrollAfterResize])
+
+  useEffect(() => {
+    if (!isImage) return
+    return bindResizeObserverForHost(imageContainerRef.current, imageObservedHeightRef, imageResizeBaselineRef)
+  }, [isImage, imageLocalPath, imageLoading, imageError, bindResizeObserverForHost])
+
+  useEffect(() => {
+    if (!isEmoji) return
+    return bindResizeObserverForHost(emojiContainerRef.current, emojiObservedHeightRef, emojiResizeBaselineRef)
+  }, [isEmoji, emojiLocalPath, emojiLoading, emojiError, bindResizeObserverForHost])
 
   // 下载表情包
   const downloadEmoji = () => {
@@ -7072,6 +7418,7 @@ function MessageBubble({
     // 先检查缓存
     const cached = emojiDataUrlCache.get(cacheKey)
     if (cached) {
+      captureEmojiResizeBaseline()
       setEmojiLocalPath(cached)
       setEmojiError(false)
       return
@@ -7082,6 +7429,7 @@ function MessageBubble({
     window.electronAPI.chat.downloadEmoji(message.emojiCdnUrl, message.emojiMd5).then((result: { success: boolean; localPath?: string; error?: string }) => {
       if (result.success && result.localPath) {
         emojiDataUrlCache.set(cacheKey, result.localPath)
+        captureEmojiResizeBaseline()
         setEmojiLocalPath(result.localPath)
       } else {
         setEmojiError(true)
@@ -7095,37 +7443,55 @@ function MessageBubble({
 
   // 群聊中获取发送者信息 (如果自己发的没头像，也尝试拉取)
   useEffect(() => {
-    if (message.senderUsername && (isGroupChat || (isSent && !myAvatarUrl))) {
-      const sender = message.senderUsername
-      const cached = senderAvatarCache.get(sender)
-      if (cached) {
-        setSenderAvatarUrl(cached.avatarUrl)
-        setSenderName(cached.displayName)
-        return
-      }
-      const pending = senderAvatarLoading.get(sender)
-      if (pending) {
-        pending.then((result: { avatarUrl?: string; displayName?: string } | null) => {
-          if (result) {
-            setSenderAvatarUrl(result.avatarUrl)
-            setSenderName(result.displayName)
-          }
-        })
-        return
-      }
-      const request = window.electronAPI.chat.getContactAvatar(sender)
-      senderAvatarLoading.set(sender, request)
-      request.then((result: { avatarUrl?: string; displayName?: string } | null) => {
-        if (result) {
-          senderAvatarCache.set(sender, result)
-          setSenderAvatarUrl(result.avatarUrl)
-          setSenderName(result.displayName)
-        }
-      }).catch(() => { }).finally(() => {
-        senderAvatarLoading.delete(sender)
-      })
+    const sender = String(message.senderUsername || '').trim()
+    const cached = sender ? senderAvatarCache.get(sender) : undefined
+    setSenderAvatarUrl(cached?.avatarUrl || message.senderAvatarUrl || undefined)
+    setSenderName(cached?.displayName || message.senderDisplayName || undefined)
+
+    if (!sender || !(isGroupChat || (isSent && !myAvatarUrl))) return
+
+    const requestSeq = senderProfileRequestSeqRef.current + 1
+    senderProfileRequestSeqRef.current = requestSeq
+    let cancelled = false
+    const applyProfile = (result: { avatarUrl?: string; displayName?: string } | null) => {
+      if (!result || cancelled) return
+      if (requestSeq !== senderProfileRequestSeqRef.current) return
+      if (result.avatarUrl) setSenderAvatarUrl(result.avatarUrl)
+      if (result.displayName) setSenderName(result.displayName)
     }
-  }, [isGroupChat, isSent, message.senderUsername, myAvatarUrl])
+
+    if (cached) {
+      applyProfile(cached)
+      return () => {
+        cancelled = true
+      }
+    }
+
+    const pending = senderAvatarLoading.get(sender)
+    if (pending) {
+      pending.then(applyProfile).catch(() => { })
+      return () => {
+        cancelled = true
+      }
+    }
+
+    const request = window.electronAPI.chat.getContactAvatar(sender)
+    senderAvatarLoading.set(sender, request)
+    request.then((result: { avatarUrl?: string; displayName?: string } | null) => {
+      if (result) {
+        senderAvatarCache.set(sender, result)
+      }
+      applyProfile(result)
+    }).catch(() => { }).finally(() => {
+      if (senderAvatarLoading.get(sender) === request) {
+        senderAvatarLoading.delete(sender)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [isGroupChat, isSent, message.senderAvatarUrl, message.senderDisplayName, message.senderUsername, myAvatarUrl])
 
   // 解析转账消息的付款方和收款方显示名称
   useEffect(() => {
@@ -7152,17 +7518,18 @@ function MessageBubble({
     if (emojiLocalPath) return
     // 后端已从本地缓存找到文件（转发表情包无 CDN URL 的情况）
     if (isEmoji && message.emojiLocalPath && !emojiLocalPath) {
+      captureEmojiResizeBaseline()
       setEmojiLocalPath(message.emojiLocalPath)
       return
     }
     if (isEmoji && message.emojiCdnUrl && !emojiLoading && !emojiError) {
       downloadEmoji()
     }
-  }, [isEmoji, message.emojiCdnUrl, message.emojiLocalPath, emojiLocalPath, emojiLoading, emojiError])
+  }, [isEmoji, message.emojiCdnUrl, message.emojiLocalPath, emojiLocalPath, emojiLoading, emojiError, captureEmojiResizeBaseline])
 
-  const requestImageDecrypt = useCallback(async (forceUpdate = false, silent = false) => {
-    if (!isImage) return
-    if (imageLoading || imageDecryptPendingRef.current) return
+  const requestImageDecrypt = useCallback(async (forceUpdate = false, silent = false): Promise<SharedImageDecryptResult> => {
+    if (!isImage) return { success: false }
+    if (imageDecryptPendingRef.current) return { success: false }
     imageDecryptPendingRef.current = true
     if (!silent) {
       setImageLoading(true)
@@ -7170,14 +7537,20 @@ function MessageBubble({
     }
     try {
       if (message.imageMd5 || message.imageDatName) {
-        const result = await window.electronAPI.image.decrypt({
-          sessionId: session.username,
-          imageMd5: message.imageMd5 || undefined,
-          imageDatName: message.imageDatName,
-          force: forceUpdate
+        const sharedDecryptKey = `${session.username}:${imageCacheKey}:${forceUpdate ? 'force' : 'normal'}`
+        const result = await getSharedImageDecryptTask(sharedDecryptKey, async () => {
+          return await window.electronAPI.image.decrypt({
+            sessionId: session.username,
+            imageMd5: message.imageMd5 || undefined,
+            imageDatName: message.imageDatName,
+            force: forceUpdate
+          }) as SharedImageDecryptResult
         })
         if (result.success && result.localPath) {
           imageDataUrlCache.set(imageCacheKey, result.localPath)
+          if (imageLocalPath !== result.localPath) {
+            captureImageResizeBaseline()
+          }
           setImageLocalPath(result.localPath)
           setImageHasUpdate(false)
           if (result.liveVideoPath) setImageLiveVideoPath(result.liveVideoPath)
@@ -7190,9 +7563,12 @@ function MessageBubble({
         const mime = detectImageMimeFromBase64(fallback.data)
         const dataUrl = `data:${mime};base64,${fallback.data}`
         imageDataUrlCache.set(imageCacheKey, dataUrl)
+        if (imageLocalPath !== dataUrl) {
+          captureImageResizeBaseline()
+        }
         setImageLocalPath(dataUrl)
         setImageHasUpdate(false)
-        return { success: true, localPath: dataUrl } as any
+        return { success: true, localPath: dataUrl }
       }
       if (!silent) setImageError(true)
     } catch {
@@ -7201,8 +7577,8 @@ function MessageBubble({
       if (!silent) setImageLoading(false)
       imageDecryptPendingRef.current = false
     }
-    return { success: false } as any
-  }, [isImage, imageLoading, message.imageMd5, message.imageDatName, message.localId, session.username, imageCacheKey, detectImageMimeFromBase64])
+    return { success: false }
+  }, [isImage, message.imageMd5, message.imageDatName, message.localId, session.username, imageCacheKey, detectImageMimeFromBase64, imageLocalPath, captureImageResizeBaseline])
 
   const triggerForceHd = useCallback(() => {
     if (!message.imageMd5 && !message.imageDatName) return
@@ -7263,6 +7639,9 @@ function MessageBubble({
           finalImagePath = resolved.localPath
           finalLiveVideoPath = resolved.liveVideoPath || finalLiveVideoPath
           imageDataUrlCache.set(imageCacheKey, resolved.localPath)
+          if (imageLocalPath !== resolved.localPath) {
+            captureImageResizeBaseline()
+          }
           setImageLocalPath(resolved.localPath)
           if (resolved.liveVideoPath) setImageLiveVideoPath(resolved.liveVideoPath)
           setImageHasUpdate(Boolean(resolved.hasUpdate))
@@ -7275,6 +7654,7 @@ function MessageBubble({
     imageLiveVideoPath,
     imageLocalPath,
     imageCacheKey,
+    captureImageResizeBaseline,
     message.imageDatName,
     message.imageMd5,
     requestImageDecrypt,
@@ -7304,6 +7684,7 @@ function MessageBubble({
       if (result.success && result.localPath) {
         imageDataUrlCache.set(imageCacheKey, result.localPath)
         if (!imageLocalPath || imageLocalPath !== result.localPath) {
+          captureImageResizeBaseline()
           setImageLocalPath(result.localPath)
           setImageError(false)
         }
@@ -7314,7 +7695,7 @@ function MessageBubble({
     return () => {
       cancelled = true
     }
-  }, [isImage, imageLocalPath, imageLoading, message.imageMd5, message.imageDatName, imageCacheKey, session.username])
+  }, [isImage, imageLocalPath, imageLoading, message.imageMd5, message.imageDatName, imageCacheKey, session.username, captureImageResizeBaseline])
 
   useEffect(() => {
     if (!isImage) return
@@ -7342,15 +7723,21 @@ function MessageBubble({
         (payload.imageMd5 && payload.imageMd5 === message.imageMd5) ||
         (payload.imageDatName && payload.imageDatName === message.imageDatName)
       if (matchesCacheKey) {
-        imageDataUrlCache.set(imageCacheKey, payload.localPath)
-        setImageLocalPath(payload.localPath)
+        const cachedPath = imageDataUrlCache.get(imageCacheKey)
+        if (cachedPath !== payload.localPath) {
+          imageDataUrlCache.set(imageCacheKey, payload.localPath)
+        }
+        if (imageLocalPath !== payload.localPath) {
+          captureImageResizeBaseline()
+        }
+        setImageLocalPath((prev) => (prev === payload.localPath ? prev : payload.localPath))
         setImageError(false)
       }
     })
     return () => {
       unsubscribe?.()
     }
-  }, [isImage, imageCacheKey, message.imageDatName, message.imageMd5])
+  }, [isImage, imageCacheKey, imageLocalPath, message.imageDatName, message.imageMd5, captureImageResizeBaseline])
 
   // 图片进入视野前自动解密（懒加载）
   useEffect(() => {
@@ -7655,10 +8042,116 @@ function MessageBubble({
     void requestVoiceTranscript()
   }, [autoTranscribeVoiceEnabled, isVoice, voiceDataUrl, voiceTranscript, voiceTranscriptError, voiceTranscriptLoading, requestVoiceTranscript])
 
+  // 去除企业微信 ID 前缀
+  const cleanMessageContent = useCallback((content: string) => {
+    if (!content) return ''
+    return content.replace(/^[a-zA-Z0-9]+@openim:\n?/, '')
+  }, [])
+
+  // 解析混合文本和表情
+  const renderTextWithEmoji = useCallback((text: string) => {
+    if (!text) return text
+    const parts = text.split(/\[(.*?)\]/g)
+    return parts.map((part, index) => {
+      // 奇数索引是捕获组的内容（即括号内的文字）
+      if (index % 2 === 1) {
+        // @ts-ignore
+        const path = getEmojiPath(part as any)
+        if (path) {
+          // path 例如 'assets/face/微笑.png'，需要添加 base 前缀
+          return (
+            <img
+              key={index}
+              src={`${import.meta.env.BASE_URL}${path}`}
+              alt={`[${part}]`}
+              className="inline-emoji"
+              style={{ width: 22, height: 22, verticalAlign: 'bottom', margin: '0 1px' }}
+            />
+          )
+        }
+        return `[${part}]`
+      }
+      return part
+    })
+  }, [])
+
+  const cleanedParsedContent = useMemo(
+    () => cleanMessageContent(message.parsedContent || ''),
+    [cleanMessageContent, message.parsedContent]
+  )
+
+  const appMsgRawXml = message.rawContent || message.parsedContent || ''
+  const appMsgContainsTag = useMemo(
+    () => appMsgRawXml.includes('<appmsg') || appMsgRawXml.includes('&lt;appmsg'),
+    [appMsgRawXml]
+  )
+  const appMsgDoc = useMemo(() => {
+    if (!appMsgContainsTag) return null
+    try {
+      const start = appMsgRawXml.indexOf('<msg>')
+      const xml = start >= 0 ? appMsgRawXml.slice(start) : appMsgRawXml
+      const doc = new DOMParser().parseFromString(xml, 'text/xml')
+      if (doc.querySelector('parsererror')) return null
+      return doc
+    } catch {
+      return null
+    }
+  }, [appMsgContainsTag, appMsgRawXml])
+  const appMsgTextCache = useMemo(() => new Map<string, string>(), [appMsgDoc])
+  const queryAppMsgText = useCallback((selector: string): string => {
+    const cached = appMsgTextCache.get(selector)
+    if (cached !== undefined) return cached
+    const value = appMsgDoc?.querySelector(selector)?.textContent?.trim() || ''
+    appMsgTextCache.set(selector, value)
+    return value
+  }, [appMsgDoc, appMsgTextCache])
+
+  const locationMessageMeta = useMemo(() => {
+    if (message.localType !== 48) return null
+    const raw = message.rawContent || ''
+    const poiname = raw.match(/poiname="([^"]*)"/)?.[1] || message.locationPoiname || '位置'
+    const label = raw.match(/label="([^"]*)"/)?.[1] || message.locationLabel || ''
+    const lat = parseFloat(raw.match(/x="([^"]*)"/)?.[1] || String(message.locationLat || 0))
+    const lng = parseFloat(raw.match(/y="([^"]*)"/)?.[1] || String(message.locationLng || 0))
+    const zoom = 15
+    const tileX = Math.floor((lng + 180) / 360 * Math.pow(2, zoom))
+    const latRad = lat * Math.PI / 180
+    const tileY = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * Math.pow(2, zoom))
+    const mapTileUrl = (lat && lng)
+      ? `https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x=${tileX}&y=${tileY}&z=${zoom}`
+      : ''
+    return { poiname, label, lat, lng, mapTileUrl }
+  }, [message.localType, message.rawContent, message.locationPoiname, message.locationLabel, message.locationLat, message.locationLng])
+
+  // 检测是否为链接卡片消息
+  const isLinkMessage = String(message.localType) === '21474836529' || appMsgContainsTag
+  const bubbleClass = isSent ? 'sent' : 'received'
+
+  // 头像逻辑：
+  // - 自己发的：优先使用 myAvatarUrl，缺失则用 senderAvatarUrl (补救)
+  // - 群聊中对方发的：使用发送者头像
+  // - 私聊中对方发的：使用会话头像
+  const fallbackSenderName = String(message.senderDisplayName || message.senderUsername || '').trim() || undefined
+  const resolvedSenderName = senderName || fallbackSenderName
+  const resolvedSenderAvatarUrl = senderAvatarUrl || message.senderAvatarUrl
+  const avatarUrl = isSent
+    ? (myAvatarUrl || resolvedSenderAvatarUrl)
+    : (isGroupChat ? resolvedSenderAvatarUrl : session.avatarUrl)
+
+  // 是否有引用消息
+  const hasQuote = message.quotedContent && message.quotedContent.length > 0
+
+  const handlePlayVideo = useCallback(async () => {
+    if (!videoInfo?.videoUrl) return
+    try {
+      await window.electronAPI.window.openVideoPlayerWindow(videoInfo.videoUrl)
+    } catch (e) {
+      console.error('打开视频播放窗口失败:', e)
+    }
+  }, [videoInfo?.videoUrl])
+
   // Selection mode handling removed from here to allow normal rendering
   // We will wrap the output instead
-
-  // Regular rendering logic...
   if (isSystem) {
     return (
       <div
@@ -7693,60 +8186,6 @@ function MessageBubble({
     )
   }
 
-  // 检测是否为链接卡片消息
-  const isLinkMessage = String(message.localType) === '21474836529' ||
-    (message.rawContent && (message.rawContent.includes('<appmsg') || message.rawContent.includes('&lt;appmsg'))) ||
-    (message.parsedContent && (message.parsedContent.includes('<appmsg') || message.parsedContent.includes('&lt;appmsg')))
-  const bubbleClass = isSent ? 'sent' : 'received'
-
-  // 头像逻辑：
-  // - 自己发的：优先使用 myAvatarUrl，缺失则用 senderAvatarUrl (补救)
-  // - 群聊中对方发的：使用发送者头像
-  // - 私聊中对方发的：使用会话头像
-  const avatarUrl = isSent
-    ? (myAvatarUrl || senderAvatarUrl)
-    : (isGroupChat ? senderAvatarUrl : session.avatarUrl)
-  const avatarLetter = isSent
-    ? '我'
-    : getAvatarLetter(isGroupChat ? (senderName || message.senderUsername || '?') : (session.displayName || session.username))
-
-
-  // 是否有引用消息
-  const hasQuote = message.quotedContent && message.quotedContent.length > 0
-
-  // 去除企业微信 ID 前缀
-  const cleanMessageContent = (content: string) => {
-    if (!content) return ''
-    return content.replace(/^[a-zA-Z0-9]+@openim:\n?/, '')
-  }
-
-  // 解析混合文本和表情
-  const renderTextWithEmoji = (text: string) => {
-    if (!text) return text
-    const parts = text.split(/\[(.*?)\]/g)
-    return parts.map((part, index) => {
-      // 奇数索引是捕获组的内容（即括号内的文字）
-      if (index % 2 === 1) {
-        // @ts-ignore
-        const path = getEmojiPath(part as any)
-        if (path) {
-          // path 例如 'assets/face/微笑.png'，需要添加 base 前缀
-          return (
-            <img
-              key={index}
-              src={`${import.meta.env.BASE_URL}${path}`}
-              alt={`[${part}]`}
-              className="inline-emoji"
-              style={{ width: 22, height: 22, verticalAlign: 'bottom', margin: '0 1px' }}
-            />
-          )
-        }
-        return `[${part}]`
-      }
-      return part
-    })
-  }
-
   // 渲染消息内容
   const renderContent = () => {
     if (isImage) {
@@ -7775,8 +8214,14 @@ function MessageBubble({
                   alt="图片"
                   className="image-message"
                   onClick={() => { void handleOpenImageViewer() }}
-                  onLoad={() => setImageError(false)}
-                  onError={() => setImageError(true)}
+                  onLoad={() => {
+                    setImageError(false)
+                    stabilizeImageScrollAfterResize()
+                  }}
+                  onError={() => {
+                    imageResizeBaselineRef.current = null
+                    setImageError(true)
+                  }}
                 />
                 {imageLiveVideoPath && (
                   <div className="media-badge live">
@@ -7792,15 +8237,6 @@ function MessageBubble({
 
     // 视频消息
     if (isVideo) {
-      const handlePlayVideo = useCallback(async () => {
-        if (!videoInfo?.videoUrl) return
-        try {
-          await window.electronAPI.window.openVideoPlayerWindow(videoInfo.videoUrl)
-        } catch (e) {
-          console.error('打开视频播放窗口失败:', e)
-        }
-      }, [videoInfo?.videoUrl])
-
       // 未进入可视区域时显示占位符
       if (!isVideoVisible) {
         return (
@@ -8077,18 +8513,8 @@ function MessageBubble({
 
     // 位置消息
     if (message.localType === 48) {
-      const raw = message.rawContent || ''
-      const poiname = raw.match(/poiname="([^"]*)"/)?.[1] || message.locationPoiname || '位置'
-      const label = raw.match(/label="([^"]*)"/)?.[1] || message.locationLabel || ''
-      const lat = parseFloat(raw.match(/x="([^"]*)"/)?.[1] || String(message.locationLat || 0))
-      const lng = parseFloat(raw.match(/y="([^"]*)"/)?.[1] || String(message.locationLng || 0))
-      const zoom = 15
-      const tileX = Math.floor((lng + 180) / 360 * Math.pow(2, zoom))
-      const latRad = lat * Math.PI / 180
-      const tileY = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * Math.pow(2, zoom))
-      const mapTileUrl = (lat && lng)
-        ? `https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x=${tileX}&y=${tileY}&z=${zoom}`
-        : ''
+      if (!locationMessageMeta) return null
+      const { poiname, label, lat, lng, mapTileUrl } = locationMessageMeta
       return (
         <div className="location-message" onClick={() => window.electronAPI.shell.openExternal(`https://uri.amap.com/marker?position=${lng},${lat}&name=${encodeURIComponent(poiname || label)}`)}>
           <div className="location-text">
@@ -8114,28 +8540,15 @@ function MessageBubble({
 
     // 链接消息 (AppMessage)
     const appMsgRichPreview = (() => {
-      const rawXml = message.rawContent || ''
-      if (!rawXml || (!rawXml.includes('<appmsg') && !rawXml.includes('&lt;appmsg'))) return null
-
-      let doc: Document | null = null
-      const getDoc = () => {
-        if (doc) return doc
-        try {
-          const start = rawXml.indexOf('<msg>')
-          const xml = start >= 0 ? rawXml.slice(start) : rawXml
-          doc = new DOMParser().parseFromString(xml, 'text/xml')
-        } catch {
-          doc = null
-        }
-        return doc
-      }
-      const q = (selector: string) => getDoc()?.querySelector(selector)?.textContent?.trim() || ''
+      const rawXml = appMsgRawXml
+      if (!appMsgContainsTag) return null
+      const q = queryAppMsgText
 
       const xmlType = message.xmlType || q('appmsg > type') || q('type')
 
       // type 57: 引用回复消息，解析 refermsg 渲染为引用样式
       if (xmlType === '57') {
-        const replyText = q('title') || cleanMessageContent(message.parsedContent) || ''
+        const replyText = q('title') || cleanedParsedContent || ''
         const referContent = q('refermsg > content') || ''
         const referSender = q('refermsg > displayname') || ''
         const referType = q('refermsg > type') || ''
@@ -8177,7 +8590,7 @@ function MessageBubble({
         )
       }
 
-      const title = message.linkTitle || q('title') || cleanMessageContent(message.parsedContent) || 'Card'
+      const title = message.linkTitle || q('title') || cleanedParsedContent || 'Card'
       const desc = message.appMsgDesc || q('des')
       const url = message.linkUrl || q('url')
       const thumbUrl = message.linkThumb || message.appMsgThumbUrl || q('thumburl') || q('cdnthumburl') || q('cover') || q('coverurl')
@@ -8212,12 +8625,7 @@ function MessageBubble({
       // 对视频号提取真实标题，避免出现 "当前版本不支持该内容"
       let displayTitle = title
       if (kind === 'finder' && (!displayTitle || displayTitle.includes('不支持'))) {
-        try {
-          const d = new DOMParser().parseFromString(rawXml, 'text/xml')
-          displayTitle = d.querySelector('finderFeed desc')?.textContent?.trim() || desc || ''
-        } catch {
-          displayTitle = desc || ''
-        }
+        displayTitle = q('finderFeed > desc') || q('finderFeed desc') || desc || ''
       }
 
       const openExternal = (e: React.MouseEvent, nextUrl?: string) => {
@@ -8268,7 +8676,7 @@ function MessageBubble({
 
       if (kind === 'quote') {
         // 引用回复消息（appMsgKind='quote'，xmlType=57）
-        const replyText = message.linkTitle || q('title') || cleanMessageContent(message.parsedContent) || ''
+        const replyText = message.linkTitle || q('title') || cleanedParsedContent || ''
         const referContent = message.quotedContent || q('refermsg > content') || ''
         const referSender = message.quotedSender || q('refermsg > displayname') || ''
         return (
@@ -8284,14 +8692,7 @@ function MessageBubble({
 
       if (kind === 'red-packet') {
         // 专属红包卡片
-        const greeting = (() => {
-          try {
-            const d = getDoc()
-            if (!d) return ''
-            return d.querySelector('receivertitle')?.textContent?.trim() ||
-              d.querySelector('sendertitle')?.textContent?.trim() || ''
-          } catch { return '' }
-        })()
+        const greeting = q('receivertitle') || q('sendertitle') || ''
         return (
           <div className="hongbao-message">
             <div className="hongbao-icon">
@@ -8459,36 +8860,18 @@ function MessageBubble({
       return appMsgRichPreview
     }
 
-    const isAppMsg = message.rawContent?.includes('<appmsg') || (message.parsedContent && message.parsedContent.includes('<appmsg'))
-
-    if (isAppMsg) {
-      let title = '链接'
-      let desc = ''
-      let url = ''
-      let appMsgType = ''
-      let textAnnouncement = ''
-      let parsedDoc: Document | null = null
-
-      try {
-        const content = message.rawContent || message.parsedContent || ''
-        // 简单清理 XML 前缀（如 wxid:）
-        const xmlContent = content.substring(content.indexOf('<msg>'))
-
-        const parser = new DOMParser()
-        parsedDoc = parser.parseFromString(xmlContent, 'text/xml')
-
-        title = parsedDoc.querySelector('title')?.textContent || '链接'
-        desc = parsedDoc.querySelector('des')?.textContent || ''
-        url = parsedDoc.querySelector('url')?.textContent || ''
-        appMsgType = parsedDoc.querySelector('appmsg > type')?.textContent || parsedDoc.querySelector('type')?.textContent || ''
-        textAnnouncement = parsedDoc.querySelector('textannouncement')?.textContent || ''
-      } catch (e) {
-        console.error('解析 AppMsg 失败:', e)
-      }
+    if (appMsgContainsTag) {
+      const q = queryAppMsgText
+      const title = q('title') || '链接'
+      const desc = q('des')
+      const url = q('url')
+      const appMsgType = message.xmlType || q('appmsg > type') || q('type')
+      const textAnnouncement = q('textannouncement')
+      const parsedDoc: Document | null = appMsgDoc
 
       // 引用回复消息 (type=57)，防止被误判为链接
       if (appMsgType === '57') {
-        const replyText = parsedDoc?.querySelector('title')?.textContent?.trim() || cleanMessageContent(message.parsedContent) || ''
+        const replyText = parsedDoc?.querySelector('title')?.textContent?.trim() || cleanedParsedContent || ''
         const referContent = parsedDoc?.querySelector('refermsg > content')?.textContent?.trim() || ''
         const referSender = parsedDoc?.querySelector('refermsg > displayname')?.textContent?.trim() || ''
         const referType = parsedDoc?.querySelector('refermsg > type')?.textContent?.trim() || ''
@@ -8758,14 +9141,16 @@ function MessageBubble({
       // 没有 cdnUrl 或加载失败，显示占位符
       if ((!message.emojiCdnUrl && !message.emojiLocalPath) || emojiError) {
         return (
-          <div className="emoji-unavailable">
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-              <circle cx="12" cy="12" r="10" />
-              <path d="M8 15s1.5 2 4 2 4-2 4-2" />
-              <line x1="9" y1="9" x2="9.01" y2="9" />
-              <line x1="15" y1="9" x2="15.01" y2="9" />
-            </svg>
-            <span>表情包未缓存</span>
+          <div className="emoji-message-wrapper" ref={emojiContainerRef}>
+            <div className="emoji-unavailable">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <circle cx="12" cy="12" r="10" />
+                <path d="M8 15s1.5 2 4 2 4-2 4-2" />
+                <line x1="9" y1="9" x2="9.01" y2="9" />
+                <line x1="15" y1="9" x2="15.01" y2="9" />
+              </svg>
+              <span>表情包未缓存</span>
+            </div>
           </div>
         )
       }
@@ -8773,20 +9158,31 @@ function MessageBubble({
       // 显示加载中
       if (emojiLoading || !emojiLocalPath) {
         return (
-          <div className="emoji-loading">
-            <Loader2 size={20} className="spin" />
+          <div className="emoji-message-wrapper" ref={emojiContainerRef}>
+            <div className="emoji-loading">
+              <Loader2 size={20} className="spin" />
+            </div>
           </div>
         )
       }
 
       // 显示表情图片
       return (
-        <img
-          src={emojiLocalPath}
-          alt="表情"
-          className="emoji-image"
-          onError={() => setEmojiError(true)}
-        />
+        <div className="emoji-message-wrapper" ref={emojiContainerRef}>
+          <img
+            src={emojiLocalPath}
+            alt="表情"
+            className="emoji-image"
+            onLoad={() => {
+              setEmojiError(false)
+              stabilizeEmojiScrollAfterResize()
+            }}
+            onError={() => {
+              emojiResizeBaselineRef.current = null
+              setEmojiError(true)
+            }}
+          />
+        </div>
       )
     }
 
@@ -8801,13 +9197,13 @@ function MessageBubble({
             {message.quotedSender && <span className="quoted-sender">{message.quotedSender}</span>}
             <span className="quoted-text">{renderTextWithEmoji(cleanMessageContent(message.quotedContent || ''))}</span>
           </div>
-          <div className="message-text">{renderTextWithEmoji(cleanMessageContent(message.parsedContent))}</div>
+          <div className="message-text">{renderTextWithEmoji(cleanedParsedContent)}</div>
         </div>
       )
     }
 
     // 普通消息
-    return <div className="bubble-content">{renderTextWithEmoji(cleanMessageContent(message.parsedContent))}</div>
+    return <div className="bubble-content">{renderTextWithEmoji(cleanedParsedContent)}</div>
   }
 
   return (
@@ -8858,7 +9254,7 @@ function MessageBubble({
           <div className="bubble-avatar">
             <Avatar
               src={avatarUrl}
-              name={!isSent ? (isGroupChat ? (senderName || message.senderUsername || '?') : (session.displayName || session.username)) : '我'}
+              name={!isSent ? (isGroupChat ? (resolvedSenderName || '?') : (session.displayName || session.username)) : '我'}
               size={36}
               className="bubble-avatar"
             />
@@ -8867,7 +9263,7 @@ function MessageBubble({
             {/* 群聊中显示发送者名称 */}
             {isGroupChat && !isSent && (
               <div className="sender-name">
-                {senderName || message.senderUsername || '群成员'}
+                {resolvedSenderName || '群成员'}
               </div>
             )}
             {renderContent()}

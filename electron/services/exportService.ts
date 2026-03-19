@@ -2,6 +2,7 @@
 import * as path from 'path'
 import * as http from 'http'
 import * as https from 'https'
+import crypto from 'crypto'
 import { fileURLToPath } from 'url'
 import ExcelJS from 'exceljs'
 import { getEmojiPath } from 'wechat-emojis'
@@ -215,6 +216,8 @@ class ExportService {
   private readonly exportAggregatedSessionStatsCacheTtlMs = 60 * 1000
   private readonly exportStatsCacheMaxEntries = 16
   private readonly STOP_ERROR_CODE = 'WEFLOW_EXPORT_STOP_REQUESTED'
+  private mediaFileCachePopulatePending = new Map<string, Promise<string | null>>()
+  private mediaFileCacheReadyDirs = new Set<string>()
 
   constructor() {
     this.configService = new ConfigService()
@@ -447,6 +450,109 @@ class ExportService {
     } catch (e) {
       return { success: false, code: (e as NodeJS.ErrnoException | undefined)?.code }
     }
+  }
+
+  private getMediaFileCacheRoot(): string {
+    return path.join(this.configService.getCacheBasePath(), 'export-media-files')
+  }
+
+  private async ensureMediaFileCacheDir(dirPath: string): Promise<void> {
+    if (this.mediaFileCacheReadyDirs.has(dirPath)) return
+    await fs.promises.mkdir(dirPath, { recursive: true })
+    this.mediaFileCacheReadyDirs.add(dirPath)
+  }
+
+  private async getMediaFileStat(sourcePath: string): Promise<{ size: number; mtimeMs: number } | null> {
+    try {
+      const stat = await fs.promises.stat(sourcePath)
+      if (!stat.isFile()) return null
+      return {
+        size: Number.isFinite(stat.size) ? Math.max(0, Math.floor(stat.size)) : 0,
+        mtimeMs: Number.isFinite(stat.mtimeMs) ? Math.max(0, Math.floor(stat.mtimeMs)) : 0
+      }
+    } catch {
+      return null
+    }
+  }
+
+  private buildMediaFileCachePath(
+    kind: 'image' | 'video' | 'emoji',
+    sourcePath: string,
+    fileStat: { size: number; mtimeMs: number }
+  ): string {
+    const normalizedSource = path.resolve(sourcePath)
+    const rawKey = `${kind}\u001f${normalizedSource}\u001f${fileStat.size}\u001f${fileStat.mtimeMs}`
+    const digest = crypto.createHash('sha1').update(rawKey).digest('hex')
+    const ext = path.extname(normalizedSource) || ''
+    return path.join(this.getMediaFileCacheRoot(), kind, digest.slice(0, 2), `${digest}${ext}`)
+  }
+
+  private async resolveMediaFileCachePath(
+    kind: 'image' | 'video' | 'emoji',
+    sourcePath: string
+  ): Promise<{ cachePath: string; fileStat: { size: number; mtimeMs: number } } | null> {
+    const fileStat = await this.getMediaFileStat(sourcePath)
+    if (!fileStat) return null
+    const cachePath = this.buildMediaFileCachePath(kind, sourcePath, fileStat)
+    return { cachePath, fileStat }
+  }
+
+  private async populateMediaFileCache(
+    kind: 'image' | 'video' | 'emoji',
+    sourcePath: string
+  ): Promise<string | null> {
+    const resolved = await this.resolveMediaFileCachePath(kind, sourcePath)
+    if (!resolved) return null
+    const { cachePath } = resolved
+    if (await this.pathExists(cachePath)) return cachePath
+
+    const pending = this.mediaFileCachePopulatePending.get(cachePath)
+    if (pending) return pending
+
+    const task = (async () => {
+      try {
+        await this.ensureMediaFileCacheDir(path.dirname(cachePath))
+        if (await this.pathExists(cachePath)) return cachePath
+
+        const tempPath = `${cachePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+        const copied = await this.copyFileOptimized(sourcePath, tempPath)
+        if (!copied.success) {
+          await fs.promises.rm(tempPath, { force: true }).catch(() => { })
+          return null
+        }
+        await fs.promises.rename(tempPath, cachePath).catch(async (error) => {
+          const code = (error as NodeJS.ErrnoException | undefined)?.code
+          if (code === 'EEXIST') {
+            await fs.promises.rm(tempPath, { force: true }).catch(() => { })
+            return
+          }
+          await fs.promises.rm(tempPath, { force: true }).catch(() => { })
+          throw error
+        })
+        return cachePath
+      } catch {
+        return null
+      } finally {
+        this.mediaFileCachePopulatePending.delete(cachePath)
+      }
+    })()
+
+    this.mediaFileCachePopulatePending.set(cachePath, task)
+    return task
+  }
+
+  private async resolvePreferredMediaSource(
+    kind: 'image' | 'video' | 'emoji',
+    sourcePath: string
+  ): Promise<string> {
+    const resolved = await this.resolveMediaFileCachePath(kind, sourcePath)
+    if (!resolved) return sourcePath
+    if (await this.pathExists(resolved.cachePath)) {
+      return resolved.cachePath
+    }
+    // 未命中缓存时异步回填，不阻塞当前导出路径
+    void this.populateMediaFileCache(kind, sourcePath)
+    return sourcePath
   }
 
   private isMediaExportEnabled(options: ExportOptions): boolean {
@@ -2418,7 +2524,8 @@ class ExportService {
       const ext = path.extname(sourcePath) || '.jpg'
       const fileName = `${messageId}_${imageKey}${ext}`
       const destPath = path.join(imagesDir, fileName)
-      const copied = await this.copyFileOptimized(sourcePath, destPath)
+      const preferredSource = await this.resolvePreferredMediaSource('image', sourcePath)
+      const copied = await this.copyFileOptimized(preferredSource, destPath)
       if (!copied.success) {
         if (copied.code === 'ENOENT') {
           console.log(`[Export] 源图片文件不存在 (localId=${msg.localId}): ${sourcePath} → 将显示 [图片] 占位符`)
@@ -2639,7 +2746,8 @@ class ExportService {
       const key = msg.emojiMd5 || String(msg.localId)
       const fileName = `${key}${ext}`
       const destPath = path.join(emojisDir, fileName)
-      const copied = await this.copyFileOptimized(localPath, destPath)
+      const preferredSource = await this.resolvePreferredMediaSource('emoji', localPath)
+      const copied = await this.copyFileOptimized(preferredSource, destPath)
       if (!copied.success) return null
 
       return {
@@ -2681,7 +2789,8 @@ class ExportService {
       const fileName = path.basename(sourcePath)
       const destPath = path.join(videosDir, fileName)
 
-      const copied = await this.copyFileOptimized(sourcePath, destPath)
+      const preferredSource = await this.resolvePreferredMediaSource('video', sourcePath)
+      const copied = await this.copyFileOptimized(preferredSource, destPath)
       if (!copied.success) return null
 
       return {
