@@ -30,16 +30,105 @@ import { cloudControlService } from './services/cloudControlService'
 import { destroyNotificationWindow, registerNotificationHandlers, showNotification } from './windows/notificationWindow'
 import { httpService } from './services/httpService'
 import { messagePushService } from './services/messagePushService'
-
+import { bizService } from './services/bizService'
 
 // 配置自动更新
 autoUpdater.autoDownload = false
 autoUpdater.autoInstallOnAppQuit = true
 autoUpdater.disableDifferentialDownload = true  // 禁用差分更新，强制全量下载
-// Windows x64 与 arm64 使用不同更新通道，避免 latest.yml 互相覆盖导致下错架构安装包。
-if (process.platform === 'win32' && process.arch === 'arm64') {
-  autoUpdater.channel = 'latest-arm64'
+// 更新通道策略：
+// - 稳定版（如 4.3.0）默认走 latest
+// - 预览版（如 4.3.0-preview.26.1）默认走 preview
+// - 开发版（如 4.3.0-dev.26.3.4）默认走 dev
+// - 用户可在设置页切换稳定/预览/开发，切换后即时生效
+// 同时区分 Windows x64 / arm64，避免更新清单互相覆盖。
+const appVersion = app.getVersion()
+const defaultUpdateTrack: 'stable' | 'preview' | 'dev' = (() => {
+  if (/-preview\.\d+\.\d+$/i.test(appVersion)) return 'preview'
+  if (/-dev\.\d+\.\d+\.\d+$/i.test(appVersion)) return 'dev'
+  if (/(alpha|beta|rc)/i.test(appVersion)) return 'dev'
+  return 'stable'
+})()
+const isPrereleaseBuild = defaultUpdateTrack !== 'stable'
+let configService: ConfigService | null = null
+
+const normalizeUpdateTrack = (raw: unknown): 'stable' | 'preview' | 'dev' | null => {
+  if (raw === 'stable' || raw === 'preview' || raw === 'dev') return raw
+  return null
 }
+
+const getEffectiveUpdateTrack = (): 'stable' | 'preview' | 'dev' => {
+  const configuredTrack = normalizeUpdateTrack(configService?.get('updateChannel'))
+  return configuredTrack || defaultUpdateTrack
+}
+
+const isRemoteVersionNewer = (latestVersion: string, currentVersion: string): boolean => {
+  const latest = String(latestVersion || '').trim()
+  const current = String(currentVersion || '').trim()
+  if (!latest || !current) return false
+
+  const parseVersion = (version: string) => {
+    const normalized = version.replace(/^v/i, '')
+    const [main, pre = ''] = normalized.split('-', 2)
+    const core = main.split('.').map((segment) => Number.parseInt(segment, 10) || 0)
+    const prerelease = pre ? pre.split('.').map((segment) => /^\d+$/.test(segment) ? Number.parseInt(segment, 10) : segment) : []
+    return { core, prerelease }
+  }
+
+  const compareParsedVersion = (a: ReturnType<typeof parseVersion>, b: ReturnType<typeof parseVersion>): number => {
+    const maxLen = Math.max(a.core.length, b.core.length)
+    for (let i = 0; i < maxLen; i += 1) {
+      const left = a.core[i] || 0
+      const right = b.core[i] || 0
+      if (left > right) return 1
+      if (left < right) return -1
+    }
+
+    const aPre = a.prerelease
+    const bPre = b.prerelease
+    if (aPre.length === 0 && bPre.length === 0) return 0
+    if (aPre.length === 0) return 1
+    if (bPre.length === 0) return -1
+
+    const preMaxLen = Math.max(aPre.length, bPre.length)
+    for (let i = 0; i < preMaxLen; i += 1) {
+      const left = aPre[i]
+      const right = bPre[i]
+      if (left === undefined) return -1
+      if (right === undefined) return 1
+      if (left === right) continue
+
+      const leftNum = typeof left === 'number'
+      const rightNum = typeof right === 'number'
+      if (leftNum && rightNum) return left > right ? 1 : -1
+      if (leftNum) return -1
+      if (rightNum) return 1
+      return String(left) > String(right) ? 1 : -1
+    }
+
+    return 0
+  }
+
+  try {
+    return autoUpdater.currentVersion.compare(latest) < 0
+  } catch {
+    return compareParsedVersion(parseVersion(latest), parseVersion(current)) > 0
+  }
+}
+
+const applyAutoUpdateChannel = (reason: 'startup' | 'settings' = 'startup') => {
+  const track = getEffectiveUpdateTrack()
+  const baseUpdateChannel = track === 'stable' ? 'latest' : track
+  autoUpdater.allowPrerelease = track !== 'stable'
+  autoUpdater.allowDowngrade = isPrereleaseBuild && track === 'stable'
+  autoUpdater.channel =
+    process.platform === 'win32' && process.arch === 'arm64'
+      ? `${baseUpdateChannel}-arm64`
+      : baseUpdateChannel
+  console.log(`[Update](${reason}) 当前版本 ${appVersion}，渠道偏好: ${track}，更新通道: ${autoUpdater.channel}`)
+}
+
+applyAutoUpdateChannel('startup')
 const AUTO_UPDATE_ENABLED =
   process.env.AUTO_UPDATE_ENABLED === 'true' ||
   process.env.AUTO_UPDATE_ENABLED === '1' ||
@@ -87,7 +176,6 @@ function sanitizePathEnv() {
 sanitizePathEnv()
 
 // 单例服务
-let configService: ConfigService | null = null
 
 // 协议窗口实例
 let agreementWindow: BrowserWindow | null = null
@@ -241,6 +329,14 @@ const normalizeReleaseNotes = (rawReleaseNotes: unknown): string => {
     .trim()
 
   return cleaned
+}
+
+const getDialogReleaseNotes = (rawReleaseNotes: unknown): string => {
+  const track = getEffectiveUpdateTrack()
+  if (track !== 'stable') {
+    return '修复了一些已知问题'
+  }
+  return normalizeReleaseNotes(rawReleaseNotes)
 }
 
 type AnnualReportYearsLoadStrategy = 'cache' | 'native' | 'hybrid'
@@ -1110,6 +1206,7 @@ const removeMatchedEntriesInDir = async (
 // 注册 IPC 处理器
 function registerIpcHandlers() {
   registerNotificationHandlers()
+  bizService.registerHandlers()
   // 配置相关
   ipcMain.handle('config:get', async (_, key: string) => {
     return configService?.get(key as any)
@@ -1117,6 +1214,9 @@ function registerIpcHandlers() {
 
   ipcMain.handle('config:set', async (_, key: string, value: any) => {
     const result = configService?.set(key as any, value)
+    if (key === 'updateChannel') {
+      applyAutoUpdateChannel('settings')
+    }
     void messagePushService.handleConfigChanged(key)
     return result
   })
@@ -1238,11 +1338,11 @@ function registerIpcHandlers() {
       if (result && result.updateInfo) {
         const currentVersion = app.getVersion()
         const latestVersion = result.updateInfo.version
-        if (latestVersion !== currentVersion) {
+        if (isRemoteVersionNewer(latestVersion, currentVersion)) {
           return {
             hasUpdate: true,
             version: latestVersion,
-            releaseNotes: normalizeReleaseNotes(result.updateInfo.releaseNotes),
+            releaseNotes: getDialogReleaseNotes(result.updateInfo.releaseNotes),
             minimumVersion: (result.updateInfo as any).minimumVersion
           }
         }
@@ -2696,7 +2796,7 @@ function checkForUpdatesOnStartup() {
         const latestVersion = result.updateInfo.version
 
         // 检查是否有新版本
-        if (latestVersion !== currentVersion && mainWindow) {
+        if (isRemoteVersionNewer(latestVersion, currentVersion) && mainWindow) {
           // 检查该版本是否被用户忽略
           const ignoredVersion = configService?.get('ignoredUpdateVersion')
           if (ignoredVersion === latestVersion) {
@@ -2707,7 +2807,7 @@ function checkForUpdatesOnStartup() {
           // 通知渲染进程有新版本
           mainWindow.webContents.send('app:updateAvailable', {
             version: latestVersion,
-            releaseNotes: normalizeReleaseNotes(result.updateInfo.releaseNotes),
+            releaseNotes: getDialogReleaseNotes(result.updateInfo.releaseNotes),
             minimumVersion: (result.updateInfo as any).minimumVersion
           })
         }
@@ -2741,6 +2841,7 @@ app.whenReady().then(async () => {
   // 初始化配置服务
   updateSplashProgress(5, '正在加载配置...')
   configService = new ConfigService()
+  applyAutoUpdateChannel('startup')
 
   // 将用户主题配置推送给 Splash 窗口
   if (splashWindow && !splashWindow.isDestroyed()) {
