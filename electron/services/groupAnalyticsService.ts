@@ -5,6 +5,7 @@ import { ConfigService } from './config'
 import { wcdbService } from './wcdbService'
 import { chatService } from './chatService'
 import type { Message } from './chatService'
+import type { ChatStatistics } from './analyticsService'
 
 export interface GroupChatInfo {
   username: string
@@ -47,6 +48,19 @@ export interface MediaTypeCount {
 export interface GroupMediaStats {
   typeCounts: MediaTypeCount[]
   total: number
+}
+
+export interface GroupMemberAnalytics {
+  statistics: ChatStatistics
+  timeDistribution: Record<number, number>
+  commonPhrases?: Array<{ phrase: string; count: number }>
+  commonEmojis?: Array<{ emoji: string; count: number }>
+}
+
+export interface GroupMemberMessagesPage {
+  messages: Message[]
+  hasMore: boolean
+  nextCursor: number
 }
 
 interface GroupMemberContactInfo {
@@ -224,10 +238,9 @@ class GroupAnalyticsService {
     }
 
     try {
-      const escapedChatroomId = chatroomId.replace(/'/g, "''")
-      const roomResult = await wcdbService.execQuery('contact', null, `SELECT * FROM chat_room WHERE username='${escapedChatroomId}' LIMIT 1`)
-      if (roomResult.success && roomResult.rows && roomResult.rows.length > 0) {
-        const owner = tryResolve(roomResult.rows[0])
+      const roomExt = await wcdbService.getChatRoomExtBuffer(chatroomId)
+      if (roomExt.success && roomExt.extBuffer) {
+        const owner = tryResolve({ ext_buffer: roomExt.extBuffer })
         if (owner) return owner
       }
     } catch {
@@ -252,23 +265,75 @@ class GroupAnalyticsService {
   }
 
   /**
-   * 从 DLL 获取群成员的群昵称
+   * 从后端获取群成员群昵称，并在前端进行唯一性净化防串号。
    */
   private async getGroupNicknamesForRoom(chatroomId: string, candidates: string[] = []): Promise<Map<string, string>> {
     try {
-      const escapedChatroomId = chatroomId.replace(/'/g, "''")
-      const sql = `SELECT ext_buffer FROM chat_room WHERE username='${escapedChatroomId}' LIMIT 1`
-      const result = await wcdbService.execQuery('contact', null, sql)
-      if (!result.success || !result.rows || result.rows.length === 0) {
+      const dllResult = await wcdbService.getGroupNicknames(chatroomId)
+      if (!dllResult.success || !dllResult.nicknames) {
         return new Map<string, string>()
       }
-
-      const extBuffer = this.decodeExtBuffer((result.rows[0] as any).ext_buffer)
-      if (!extBuffer) return new Map<string, string>()
-      return this.parseGroupNicknamesFromExtBuffer(extBuffer, candidates)
+      return this.buildTrustedGroupNicknameMap(Object.entries(dllResult.nicknames), candidates)
     } catch (e) {
-      console.error('getGroupNicknamesForRoom error:', e)
+      console.error('getGroupNicknamesForRoom service error:', e)
       return new Map<string, string>()
+    }
+  }
+
+  private normalizeGroupNicknameIdentity(value: string): string {
+    const raw = String(value || '').trim()
+    if (!raw) return ''
+    return raw.toLowerCase()
+  }
+
+  private buildTrustedGroupNicknameMap(
+    entries: Iterable<[string, string]>,
+    candidates: string[] = []
+  ): Map<string, string> {
+    const candidateSet = new Set(
+      this.buildGroupNicknameIdCandidates(candidates)
+        .map((id) => this.normalizeGroupNicknameIdentity(id))
+        .filter(Boolean)
+    )
+
+    const buckets = new Map<string, Set<string>>()
+    for (const [memberIdRaw, nicknameRaw] of entries) {
+      const identity = this.normalizeGroupNicknameIdentity(memberIdRaw || '')
+      if (!identity) continue
+      if (candidateSet.size > 0 && !candidateSet.has(identity)) continue
+
+      const nickname = this.normalizeGroupNickname(nicknameRaw || '')
+      if (!nickname) continue
+
+      const slot = buckets.get(identity)
+      if (slot) {
+        slot.add(nickname)
+      } else {
+        buckets.set(identity, new Set([nickname]))
+      }
+    }
+
+    const trusted = new Map<string, string>()
+    for (const [identity, nicknameSet] of buckets.entries()) {
+      if (nicknameSet.size !== 1) continue
+      trusted.set(identity, Array.from(nicknameSet)[0])
+    }
+    return trusted
+  }
+
+  private mergeGroupNicknameEntries(
+    target: Map<string, string>,
+    entries: Iterable<[string, string]>
+  ): void {
+    for (const [memberIdRaw, nicknameRaw] of entries) {
+      const nickname = this.normalizeGroupNickname(nicknameRaw || '')
+      if (!nickname) continue
+      for (const alias of this.buildIdCandidates([memberIdRaw])) {
+        if (!alias) continue
+        if (!target.has(alias)) target.set(alias, nickname)
+        const lower = alias.toLowerCase()
+        if (!target.has(lower)) target.set(lower, nickname)
+      }
     }
   }
 
@@ -444,6 +509,16 @@ class GroupAnalyticsService {
     return Array.from(set)
   }
 
+  private buildGroupNicknameIdCandidates(values: Array<string | undefined | null>): string[] {
+    const set = new Set<string>()
+    for (const rawValue of values) {
+      const raw = String(rawValue || '').trim()
+      if (!raw) continue
+      set.add(raw)
+    }
+    return Array.from(set)
+  }
+
   private toNonNegativeInteger(value: unknown): number {
     const parsed = Number(value)
     if (!Number.isFinite(parsed)) return 0
@@ -550,19 +625,9 @@ class GroupAnalyticsService {
       const batch = candidates.slice(i, i + batchSize)
       if (batch.length === 0) continue
 
-      const inList = batch.map((username) => `'${username.replace(/'/g, "''")}'`).join(',')
-      const lightweightSql = `
-        SELECT username, user_name, encrypt_username, encrypt_user_name, remark, nick_name, alias, local_type
-        FROM contact
-        WHERE username IN (${inList})
-      `
-      let result = await wcdbService.execQuery('contact', null, lightweightSql)
-      if (!result.success || !result.rows) {
-        // 兼容历史/变体列名，轻查询失败时回退全字段查询，避免好友标识丢失
-        result = await wcdbService.execQuery('contact', null, `SELECT * FROM contact WHERE username IN (${inList})`)
-      }
-      if (!result.success || !result.rows) continue
-      appendContactsToLookup(result.rows as Record<string, unknown>[])
+      const result = await wcdbService.getContactsCompact(batch)
+      if (!result.success || !result.contacts) continue
+      appendContactsToLookup(result.contacts as Record<string, unknown>[])
     }
     return lookup
   }
@@ -642,30 +707,23 @@ class GroupAnalyticsService {
   }
 
   private resolveGroupNicknameByCandidates(groupNicknames: Map<string, string>, candidates: string[]): string {
-    const idCandidates = this.buildIdCandidates(candidates)
+    const idCandidates = this.buildGroupNicknameIdCandidates(candidates)
     if (idCandidates.length === 0) return ''
 
+    let resolved = ''
     for (const id of idCandidates) {
-      const exact = this.normalizeGroupNickname(groupNicknames.get(id) || '')
-      if (exact) return exact
-    }
-
-    for (const id of idCandidates) {
-      const lower = id.toLowerCase()
-      let found = ''
-      let matched = 0
-      for (const [key, value] of groupNicknames.entries()) {
-        if (String(key || '').toLowerCase() !== lower) continue
-        const normalized = this.normalizeGroupNickname(value || '')
-        if (!normalized) continue
-        found = normalized
-        matched += 1
-        if (matched > 1) return ''
+      const normalizedId = this.normalizeGroupNicknameIdentity(id)
+      if (!normalizedId) continue
+      const candidateNickname = this.normalizeGroupNickname(groupNicknames.get(normalizedId) || '')
+      if (!candidateNickname) continue
+      if (!resolved) {
+        resolved = candidateNickname
+        continue
       }
-      if (matched === 1 && found) return found
+      if (resolved !== candidateNickname) return ''
     }
 
-    return ''
+    return resolved
   }
 
   private sanitizeWorksheetName(name: string): string {
@@ -741,34 +799,269 @@ class GroupAnalyticsService {
     return ''
   }
 
+  private normalizeCursorTimestamp(value: number): number {
+    if (!Number.isFinite(value) || value <= 0) return 0
+    const normalized = Math.floor(value)
+    return normalized > 10000000000 ? Math.floor(normalized / 1000) : normalized
+  }
+
+  private extractRowSenderUsername(row: Record<string, any>, myWxid?: string): string {
+    const isSendRaw = row.computed_is_send ?? row.is_send ?? row.isSend ?? row.WCDB_CT_is_send
+    if (isSendRaw != null && parseInt(isSendRaw, 10) === 1 && myWxid) {
+      return myWxid
+    }
+
+    const candidates = [
+      row.sender_username,
+      row.senderUsername,
+      row.sender,
+      row.WCDB_CT_sender_username
+    ]
+    for (const candidate of candidates) {
+      const value = String(candidate || '').trim()
+      if (value) return value
+    }
+    for (const [key, value] of Object.entries(row)) {
+      const normalizedKey = key.toLowerCase()
+      if (
+        normalizedKey === 'sender_username' ||
+        normalizedKey === 'senderusername' ||
+        normalizedKey === 'sender' ||
+        normalizedKey === 'wcdb_ct_sender_username'
+      ) {
+        const normalizedValue = String(value || '').trim()
+        if (normalizedValue) return normalizedValue
+      }
+    }
+    
+    // Fallback: fast extract from raw content to avoid full parse
+    const rawContent = String(row.StrContent || row.message_content || row.content || row.msg_content || '').trim()
+    if (rawContent) {
+      const match = /^\s*([a-zA-Z0-9_@-]{4,}):(?!\/\/)\s*(?:\r?\n|<br\s*\/?>)/i.exec(rawContent)
+      if (match && match[1]) {
+        return match[1].trim()
+      }
+    }
+    
+    return ''
+  }
+
+  private parseSingleMessageRow(row: Record<string, any>): Message | null {
+    try {
+      const mapped = chatService.mapRowsToMessagesForApi([row])
+      if (Array.isArray(mapped) && mapped.length > 0) {
+        const msg = mapped[0]
+        if (!msg.localType) {
+          msg.localType = parseInt(row.Type || row.type || row.local_type || row.msg_type || '0', 10)
+        }
+        if (!msg.createTime) {
+          msg.createTime = parseInt(row.CreateTime || row.create_time || row.createTime || row.msg_time || '0', 10)
+        }
+        return msg
+      }
+      return null
+    } catch {
+      return null
+    }
+  }
+
+  private async openMemberMessageCursor(
+    chatroomId: string,
+    batchSize: number,
+    ascending: boolean,
+    startTime: number,
+    endTime: number
+  ): Promise<{ success: boolean; cursor?: number; error?: string }> {
+    const beginTimestamp = this.normalizeCursorTimestamp(startTime)
+    const endTimestamp = this.normalizeCursorTimestamp(endTime)
+    const liteResult = await wcdbService.openMessageCursorLite(chatroomId, batchSize, ascending, beginTimestamp, endTimestamp)
+    if (liteResult.success && liteResult.cursor) return liteResult
+    return wcdbService.openMessageCursor(chatroomId, batchSize, ascending, beginTimestamp, endTimestamp)
+  }
+
   private async collectMessagesByMember(
     chatroomId: string,
     memberUsername: string,
     startTime: number,
     endTime: number
   ): Promise<{ success: boolean; data?: Message[]; error?: string }> {
-    const batchSize = 500
+    const batchSize = 800
     const matchedMessages: Message[] = []
-    let offset = 0
+    const senderMatchCache = new Map<string, boolean>()
+    const matchesTargetSender = (sender: string | null | undefined): boolean => {
+      const key = String(sender || '').trim().toLowerCase()
+      if (!key) return false
+      const cached = senderMatchCache.get(key)
+      if (typeof cached === 'boolean') return cached
+      const matched = this.isSameAccountIdentity(memberUsername, sender)
+      senderMatchCache.set(key, matched)
+      return matched
+    }
 
-    while (true) {
-      const batch = await chatService.getMessages(chatroomId, offset, batchSize, startTime, endTime, true)
-      if (!batch.success || !batch.messages) {
-        return { success: false, error: batch.error || '获取群消息失败' }
-      }
+    const cursorResult = await this.openMemberMessageCursor(chatroomId, batchSize, true, startTime, endTime)
+    if (!cursorResult.success || !cursorResult.cursor) {
+      return { success: false, error: cursorResult.error || '创建群消息游标失败' }
+    }
 
-      for (const message of batch.messages) {
-        if (this.isSameAccountIdentity(memberUsername, message.senderUsername)) {
-          matchedMessages.push(message)
+    const cursor = cursorResult.cursor
+    try {
+      while (true) {
+        const batch = await wcdbService.fetchMessageBatch(cursor)
+        if (!batch.success) {
+          return { success: false, error: batch.error || '获取群消息失败' }
         }
-      }
+        const rows = Array.isArray(batch.rows) ? batch.rows as Record<string, any>[] : []
+        if (rows.length === 0) break
 
-      const fetchedCount = batch.messages.length
-      if (fetchedCount <= 0 || !batch.hasMore) break
-      offset += fetchedCount
+        for (const row of rows) {
+          const senderFromRow = this.extractRowSenderUsername(row, String(this.configService.get('myWxid') || '').trim())
+          if (senderFromRow && !matchesTargetSender(senderFromRow)) {
+            continue
+          }
+          const message = this.parseSingleMessageRow(row)
+          if (!message) continue
+          if (matchesTargetSender(message.senderUsername)) {
+            matchedMessages.push(message)
+          }
+        }
+
+        if (!batch.hasMore) break
+      }
+    } finally {
+      await wcdbService.closeMessageCursor(cursor)
     }
 
     return { success: true, data: matchedMessages }
+  }
+
+  async getGroupMemberMessages(
+    chatroomId: string,
+    memberUsername: string,
+    options?: { startTime?: number; endTime?: number; limit?: number; cursor?: number }
+  ): Promise<{ success: boolean; data?: GroupMemberMessagesPage; error?: string }> {
+    try {
+      const conn = await this.ensureConnected()
+      if (!conn.success) return { success: false, error: conn.error }
+
+      const normalizedChatroomId = String(chatroomId || '').trim()
+      const normalizedMemberUsername = String(memberUsername || '').trim()
+      if (!normalizedChatroomId) return { success: false, error: '群聊ID不能为空' }
+      if (!normalizedMemberUsername) return { success: false, error: '成员ID不能为空' }
+
+      const startTimeValue = Number.isFinite(options?.startTime) && typeof options?.startTime === 'number'
+        ? Math.max(0, Math.floor(options.startTime))
+        : 0
+      const endTimeValue = Number.isFinite(options?.endTime) && typeof options?.endTime === 'number'
+        ? Math.max(0, Math.floor(options.endTime))
+        : 0
+      const limit = Number.isFinite(options?.limit) && typeof options?.limit === 'number'
+        ? Math.max(1, Math.min(100, Math.floor(options.limit)))
+        : 50
+      let cursor = Number.isFinite(options?.cursor) && typeof options?.cursor === 'number'
+        ? Math.max(0, Math.floor(options.cursor))
+        : 0
+
+      const matchedMessages: Message[] = []
+      const senderMatchCache = new Map<string, boolean>()
+      const matchesTargetSender = (sender: string | null | undefined): boolean => {
+        const key = String(sender || '').trim().toLowerCase()
+        if (!key) return false
+        const cached = senderMatchCache.get(key)
+        if (typeof cached === 'boolean') return cached
+        const matched = this.isSameAccountIdentity(normalizedMemberUsername, sender)
+        senderMatchCache.set(key, matched)
+        return matched
+      }
+      const batchSize = Math.max(limit * 4, 240)
+      let hasMore = false
+
+      const cursorResult = await this.openMemberMessageCursor(
+        normalizedChatroomId,
+        batchSize,
+        false,
+        startTimeValue,
+        endTimeValue
+      )
+      if (!cursorResult.success || !cursorResult.cursor) {
+        return { success: false, error: cursorResult.error || '创建群成员消息游标失败' }
+      }
+
+      let consumedRows = 0
+      const dbCursor = cursorResult.cursor
+
+      try {
+        while (matchedMessages.length < limit) {
+          const batch = await wcdbService.fetchMessageBatch(dbCursor)
+          if (!batch.success) {
+            return { success: false, error: batch.error || '获取群成员消息失败' }
+          }
+
+          const rows = Array.isArray(batch.rows) ? batch.rows as Record<string, any>[] : []
+          if (rows.length === 0) {
+            hasMore = false
+            break
+          }
+
+          let startIndex = 0
+          if (cursor > consumedRows) {
+            const skipCount = Math.min(cursor - consumedRows, rows.length)
+            consumedRows += skipCount
+            startIndex = skipCount
+            if (startIndex >= rows.length) {
+              if (!batch.hasMore) {
+                hasMore = false
+                break
+              }
+              continue
+            }
+          }
+
+          for (let index = startIndex; index < rows.length; index += 1) {
+            const row = rows[index]
+            consumedRows += 1
+
+            const senderFromRow = this.extractRowSenderUsername(row, String(this.configService.get('myWxid') || '').trim())
+            if (senderFromRow && !matchesTargetSender(senderFromRow)) {
+              continue
+            }
+
+            const message = this.parseSingleMessageRow(row)
+            if (!message) continue
+            if (!matchesTargetSender(message.senderUsername)) {
+              continue
+            }
+
+            matchedMessages.push(message)
+            if (matchedMessages.length >= limit) {
+              cursor = consumedRows
+              hasMore = index < rows.length - 1 || batch.hasMore === true
+              break
+            }
+          }
+
+          if (matchedMessages.length >= limit) break
+
+          cursor = consumedRows
+          if (!batch.hasMore) {
+            hasMore = false
+            break
+          }
+        }
+      } finally {
+        await wcdbService.closeMessageCursor(dbCursor)
+      }
+
+      return {
+        success: true,
+        data: {
+          messages: matchedMessages,
+          hasMore,
+          nextCursor: cursor
+        }
+      }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
   }
 
   async getGroupChats(): Promise<{ success: boolean; data?: GroupChatInfo[]; error?: string }> {
@@ -1202,6 +1495,154 @@ class GroupAnalyticsService {
       const total = mediaCounts.reduce((sum, item) => sum + item.count, 0)
 
       return { success: true, data: { typeCounts: mediaCounts, total } }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  async getGroupMemberAnalytics(
+    chatroomId: string,
+    memberUsername: string,
+    startTime?: number,
+    endTime?: number
+  ): Promise<{ success: boolean; data?: GroupMemberAnalytics; error?: string }> {
+    try {
+      const conn = await this.ensureConnected()
+      if (!conn.success) return { success: false, error: conn.error }
+
+      const normalizedChatroomId = String(chatroomId || '').trim()
+      const normalizedMemberUsername = String(memberUsername || '').trim()
+
+      const batchSize = 10000
+      const senderMatchCache = new Map<string, boolean>()
+      const matchesTargetSender = (sender: string | null | undefined): boolean => {
+        const key = String(sender || '').trim().toLowerCase()
+        if (!key) return false
+        const cached = senderMatchCache.get(key)
+        if (typeof cached === 'boolean') return cached
+        const matched = this.isSameAccountIdentity(normalizedMemberUsername, sender)
+        senderMatchCache.set(key, matched)
+        return matched
+      }
+
+      const cursorResult = await this.openMemberMessageCursor(normalizedChatroomId, batchSize, true, startTime || 0, endTime || 0)
+      if (!cursorResult.success || !cursorResult.cursor) {
+        return { success: false, error: cursorResult.error || '创建游标失败' }
+      }
+
+      const cursor = cursorResult.cursor
+      const stats: ChatStatistics = {
+        totalMessages: 0,
+        textMessages: 0,
+        imageMessages: 0,
+        voiceMessages: 0,
+        videoMessages: 0,
+        emojiMessages: 0,
+        otherMessages: 0,
+        sentMessages: 0, // In group, we only fetch messages of this member, so sentMessages = totalMessages
+        receivedMessages: 0, // No meaning here
+        firstMessageTime: null,
+        lastMessageTime: null,
+        activeDays: 0,
+        messageTypeCounts: {}
+      }
+      
+      const hourlyDistribution: Record<number, number> = {}
+      for (let i = 0; i < 24; i++) hourlyDistribution[i] = 0
+      const dailySet = new Set<string>()
+      const textTypes = [1, 244813135921]
+
+      const phraseCounts = new Map<string, number>()
+      const emojiCounts = new Map<string, number>()
+
+      const myWxid = String(this.configService.get('myWxid') || '').trim()
+
+      try {
+        while (true) {
+          const batch = await wcdbService.fetchMessageBatch(cursor)
+          if (!batch.success) {
+            return { success: false, error: batch.error || '获取分析数据失败' }
+          }
+          const rows = Array.isArray(batch.rows) ? batch.rows as Record<string, any>[] : []
+          if (rows.length === 0) break
+
+          for (const row of rows) {
+            let senderFromRow = this.extractRowSenderUsername(row, myWxid)
+            
+            const isSendRaw = row.computed_is_send ?? row.is_send ?? row.isSend ?? row.WCDB_CT_is_send
+            const isSend = isSendRaw != null ? parseInt(isSendRaw, 10) === 1 : false
+            
+            if (isSend) {
+              senderFromRow = myWxid
+            }
+
+            if (!senderFromRow || !matchesTargetSender(senderFromRow)) {
+              continue
+            }
+            
+            const msgType = parseInt(row.Type || row.type || row.local_type || row.msg_type || '0', 10)
+            const createTime = parseInt(row.CreateTime || row.create_time || row.createTime || row.msg_time || '0', 10)
+            
+            let content = String(row.StrContent || row.message_content || row.content || row.msg_content || '')
+            if (content) {
+              content = content.replace(/^\s*([a-zA-Z0-9_@-]{4,}):(?!\/\/)\s*(?:\r?\n|<br\s*\/?>)/i, '')
+            }
+
+            stats.totalMessages++
+            if (textTypes.includes(msgType)) {
+              stats.textMessages++
+              if (content) {
+                const text = content.trim()
+                if (text && text.length <= 20) {
+                  phraseCounts.set(text, (phraseCounts.get(text) || 0) + 1)
+                }
+                const emojiMatches = text.match(/\[.*?\]/g)
+                if (emojiMatches) {
+                  for (const em of emojiMatches) {
+                    emojiCounts.set(em, (emojiCounts.get(em) || 0) + 1)
+                  }
+                }
+              }
+            }
+            else if (msgType === 3) stats.imageMessages++
+            else if (msgType === 34) stats.voiceMessages++
+            else if (msgType === 43) stats.videoMessages++
+            else if (msgType === 47) stats.emojiMessages++
+            else stats.otherMessages++
+
+            stats.sentMessages++
+            
+            stats.messageTypeCounts[msgType] = (stats.messageTypeCounts[msgType] || 0) + 1
+            
+            if (createTime > 0) {
+              if (stats.firstMessageTime === null || createTime < stats.firstMessageTime) stats.firstMessageTime = createTime
+              if (stats.lastMessageTime === null || createTime > stats.lastMessageTime) stats.lastMessageTime = createTime
+              
+              const d = new Date(createTime * 1000)
+              const hour = d.getHours()
+              hourlyDistribution[hour]++
+              dailySet.add(`${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`)
+            }
+          }
+          if (!batch.hasMore) break
+        }
+      } finally {
+        await wcdbService.closeMessageCursor(cursor)
+      }
+      
+      stats.activeDays = dailySet.size
+
+      const commonPhrases = Array.from(phraseCounts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([phrase, count]) => ({ phrase, count }))
+        
+      const commonEmojis = Array.from(emojiCounts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([emoji, count]) => ({ emoji, count }))
+
+      return { success: true, data: { statistics: stats, timeDistribution: hourlyDistribution, commonPhrases, commonEmojis } }
     } catch (e) {
       return { success: false, error: String(e) }
     }

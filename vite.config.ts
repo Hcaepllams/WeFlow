@@ -4,6 +4,10 @@ import electron from 'vite-plugin-electron'
 import renderer from 'vite-plugin-electron-renderer'
 import { resolve } from 'path'
 
+const handleElectronOnStart = (options: { reload: () => void }) => {
+  options.reload()
+}
+
 export default defineConfig({
   base: './',
   server: {
@@ -11,6 +15,7 @@ export default defineConfig({
     strictPort: false  // 如果3000被占用，自动尝试下一个
   },
   build: {
+    chunkSizeWarningLimit: 900,
     commonjsOptions: {
       ignoreDynamicRequires: true
     }
@@ -23,6 +28,7 @@ export default defineConfig({
     electron([
       {
         entry: 'electron/main.ts',
+        onstart: handleElectronOnStart,
         vite: {
           build: {
             outDir: 'dist-electron',
@@ -34,7 +40,8 @@ export default defineConfig({
                 'whisper-node',
                 'shelljs',
                 'exceljs',
-                'node-llama-cpp'
+                'node-llama-cpp',
+                '@vscode/sudo-prompt'
               ]
             }
           }
@@ -42,6 +49,7 @@ export default defineConfig({
       },
       {
         entry: 'electron/annualReportWorker.ts',
+        onstart: handleElectronOnStart,
         vite: {
           build: {
             outDir: 'dist-electron',
@@ -60,6 +68,7 @@ export default defineConfig({
       },
       {
         entry: 'electron/dualReportWorker.ts',
+        onstart: handleElectronOnStart,
         vite: {
           build: {
             outDir: 'dist-electron',
@@ -78,6 +87,7 @@ export default defineConfig({
       },
       {
         entry: 'electron/imageSearchWorker.ts',
+        onstart: handleElectronOnStart,
         vite: {
           build: {
             outDir: 'dist-electron',
@@ -92,6 +102,7 @@ export default defineConfig({
       },
       {
         entry: 'electron/wcdbWorker.ts',
+        onstart: handleElectronOnStart,
         vite: {
           build: {
             outDir: 'dist-electron',
@@ -111,6 +122,7 @@ export default defineConfig({
       },
       {
         entry: 'electron/transcribeWorker.ts',
+        onstart: handleElectronOnStart,
         vite: {
           build: {
             outDir: 'dist-electron',
@@ -127,10 +139,29 @@ export default defineConfig({
         }
       },
       {
+        entry: 'electron/exportWorker.ts',
+        onstart: handleElectronOnStart,
+        vite: {
+          build: {
+            outDir: 'dist-electron',
+            rollupOptions: {
+              external: [
+                'better-sqlite3',
+                'koffi',
+                'fsevents',
+                'exceljs'
+              ],
+              output: {
+                entryFileNames: 'exportWorker.js',
+                inlineDynamicImports: true
+              }
+            }
+          }
+        }
+      },
+      {
         entry: 'electron/preload.ts',
-        onstart(options) {
-          options.reload()
-        },
+        onstart: handleElectronOnStart,
         vite: {
           build: {
             outDir: 'dist-electron'
@@ -141,6 +172,7 @@ export default defineConfig({
     renderer()
   ],
   resolve: {
+    dedupe: ['react', 'react-dom'],
     alias: {
       '@': resolve(__dirname, 'src')
     }

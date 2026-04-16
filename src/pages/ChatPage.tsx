@@ -1,17 +1,28 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Link, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture, Newspaper } from 'lucide-react'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { createPortal } from 'react-dom'
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
+import { useShallow } from 'zustand/react/shallow'
 import { useChatStore } from '../stores/chatStore'
-import { useBatchTranscribeStore } from '../stores/batchTranscribeStore'
+import { useBatchTranscribeStore, type BatchVoiceTaskType } from '../stores/batchTranscribeStore'
 import { useBatchImageDecryptStore } from '../stores/batchImageDecryptStore'
-import type { ChatSession, Message } from '../types/models'
+import type { ChatRecordItem, ChatSession, Message } from '../types/models'
 import { getEmojiPath } from 'wechat-emojis'
 import { VoiceTranscribeDialog } from '../components/VoiceTranscribeDialog'
 import { LivePhotoIcon } from '../components/LivePhotoIcon'
 import { AnimatedStreamingText } from '../components/AnimatedStreamingText'
 import JumpToDatePopover from '../components/JumpToDatePopover'
+import { ContactSnsTimelineDialog } from '../components/Sns/ContactSnsTimelineDialog'
+import { type ContactSnsTimelineTarget, isSingleContactSession } from '../components/Sns/contactSnsTimeline'
 import * as configService from '../services/config'
+import BizPage, { BizAccountList, BizMessageArea, BizAccount } from './BizPage'
+import {
+  finishBackgroundTask,
+  isBackgroundTaskCancelRequested,
+  registerBackgroundTask,
+  updateBackgroundTask
+} from '../services/backgroundTaskMonitor'
 import {
   emitOpenSingleExport,
   onExportSessionStatus,
@@ -25,6 +36,370 @@ const SYSTEM_MESSAGE_TYPES = [
   10000,        // 系统消息
   266287972401, // 拍一拍
 ]
+
+const OFFICIAL_ACCOUNTS_VIRTUAL_ID = 'official_accounts_virtual'
+
+interface PendingInSessionSearchPayload {
+  sessionId: string
+  keyword: string
+  firstMsgTime: number
+  results: Message[]
+}
+
+interface PendingFootprintJumpPayload {
+  sessionId: string
+  localId: number
+  createTime: number
+}
+
+type GlobalMsgSearchPhase = 'idle' | 'seed' | 'backfill' | 'done'
+type GlobalMsgSearchResult = Message & { sessionId: string }
+
+interface GlobalMsgPrefixCacheEntry {
+  keyword: string
+  matchedSessionIds: Set<string>
+  completed: boolean
+}
+
+type QuoteLayout = configService.QuoteLayout
+
+const GLOBAL_MSG_PER_SESSION_LIMIT = 10
+const GLOBAL_MSG_SEED_LIMIT = 120
+const GLOBAL_MSG_BACKFILL_CONCURRENCY = 3
+const GLOBAL_MSG_LEGACY_CONCURRENCY = 6
+const GLOBAL_MSG_SEARCH_CANCELED_ERROR = '__WEFLOW_GLOBAL_MSG_SEARCH_CANCELED__'
+const GLOBAL_MSG_SHADOW_COMPARE_SAMPLE_RATE = 0.2
+const GLOBAL_MSG_SHADOW_COMPARE_STORAGE_KEY = 'weflow.debug.searchShadowCompare'
+const MESSAGE_LIST_SCROLL_IDLE_MS = 160
+const MESSAGE_TOP_WHEEL_LOAD_COOLDOWN_MS = 160
+const MESSAGE_EDGE_TRIGGER_DISTANCE_PX = 96
+
+type RequestIdleCallbackCompat = (callback: () => void, options?: { timeout?: number }) => number
+
+function scheduleWhenIdle(task: () => void, options?: { timeout?: number; fallbackDelay?: number }): void {
+  const requestIdleCallbackFn = (
+    globalThis as typeof globalThis & { requestIdleCallback?: RequestIdleCallbackCompat }
+  ).requestIdleCallback
+
+  if (typeof requestIdleCallbackFn === 'function') {
+    requestIdleCallbackFn(task, options?.timeout !== undefined ? { timeout: options.timeout } : undefined)
+    return
+  }
+
+  window.setTimeout(task, options?.fallbackDelay ?? 0)
+}
+
+function isGlobalMsgSearchCanceled(error: unknown): boolean {
+  return String(error || '') === GLOBAL_MSG_SEARCH_CANCELED_ERROR
+}
+
+function normalizeGlobalMsgSearchSessionId(value: unknown): string | null {
+  const sessionId = String(value || '').trim()
+  if (!sessionId) return null
+  return sessionId
+}
+
+function normalizeGlobalMsgSearchMessages(
+  messages: Message[] | undefined,
+  fallbackSessionId?: string
+): GlobalMsgSearchResult[] {
+  if (!Array.isArray(messages) || messages.length === 0) return []
+  const dedup = new Set<string>()
+  const normalized: GlobalMsgSearchResult[] = []
+  const normalizedFallback = normalizeGlobalMsgSearchSessionId(fallbackSessionId)
+
+  for (const message of messages) {
+    const raw = message as Message & { sessionId?: string; _session_id?: string }
+    const sessionId = normalizeGlobalMsgSearchSessionId(raw.sessionId || raw._session_id || normalizedFallback)
+    if (!sessionId) continue
+    const uniqueKey = raw.localId > 0
+      ? `${sessionId}::local:${raw.localId}`
+      : `${sessionId}::key:${raw.messageKey || ''}:${raw.createTime || 0}`
+    if (dedup.has(uniqueKey)) continue
+    dedup.add(uniqueKey)
+    normalized.push({ ...message, sessionId })
+  }
+
+  return normalized
+}
+
+function buildGlobalMsgSearchSessionMap(messages: GlobalMsgSearchResult[]): Map<string, GlobalMsgSearchResult[]> {
+  const map = new Map<string, GlobalMsgSearchResult[]>()
+  for (const message of messages) {
+    if (!message.sessionId) continue
+    const list = map.get(message.sessionId) || []
+    if (list.length >= GLOBAL_MSG_PER_SESSION_LIMIT) continue
+    list.push(message)
+    map.set(message.sessionId, list)
+  }
+  return map
+}
+
+function flattenGlobalMsgSearchSessionMap(map: Map<string, GlobalMsgSearchResult[]>): GlobalMsgSearchResult[] {
+  const all: GlobalMsgSearchResult[] = []
+  for (const list of map.values()) {
+    if (list.length > 0) all.push(...list)
+  }
+  return sortMessagesByCreateTimeDesc(all)
+}
+
+function normalizeChatRecordText(value?: string): string {
+  return String(value || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function hasRenderableChatRecordName(value?: string): boolean {
+  return value !== undefined && value !== null && String(value).length > 0
+}
+
+function getChatRecordPreviewText(item: ChatRecordItem): string {
+  const text = normalizeChatRecordText(item.datadesc) || normalizeChatRecordText(item.datatitle)
+  if (item.datatype === 17) {
+    return normalizeChatRecordText(item.chatRecordTitle) || normalizeChatRecordText(item.datatitle) || '聊天记录'
+  }
+  if (item.datatype === 2 || item.datatype === 3) return '[媒体消息]'
+  if (item.datatype === 43) return '[视频]'
+  if (item.datatype === 34) return '[语音]'
+  if (item.datatype === 47) return '[表情]'
+  return text || '[媒体消息]'
+}
+
+function buildChatRecordPreviewItems(recordList: ChatRecordItem[], maxVisible = 3): ChatRecordItem[] {
+  if (recordList.length <= maxVisible) return recordList.slice(0, maxVisible)
+  const firstNestedIndex = recordList.findIndex(item => item.datatype === 17)
+  if (firstNestedIndex < 0 || firstNestedIndex < maxVisible) {
+    return recordList.slice(0, maxVisible)
+  }
+  if (maxVisible <= 1) {
+    return [recordList[firstNestedIndex]]
+  }
+  return [
+    ...recordList.slice(0, maxVisible - 1),
+    recordList[firstNestedIndex]
+  ]
+}
+
+interface SolitaireEntry {
+  index: string
+  text: string
+}
+
+interface SolitaireContent {
+  title: string
+  introLines: string[]
+  entries: SolitaireEntry[]
+}
+
+function parseSolitaireContent(rawTitle: string): SolitaireContent {
+  const lines = String(rawTitle || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+
+  const title = lines[0] || '接龙'
+  const introLines: string[] = []
+  const entries: SolitaireEntry[] = []
+  let hasStartedEntries = false
+
+  for (const line of lines.slice(1)) {
+    const entryMatch = /^(\d+)[.．、]\s*(.+)$/.exec(line)
+    if (entryMatch) {
+      hasStartedEntries = true
+      entries.push({
+        index: entryMatch[1],
+        text: entryMatch[2].trim()
+      })
+      continue
+    }
+
+    if (hasStartedEntries && entries.length > 0) {
+      const previous = entries[entries.length - 1]
+      previous.text = `${previous.text} ${line}`.trim()
+    } else {
+      introLines.push(line)
+    }
+  }
+
+  return { title, introLines, entries }
+}
+
+function composeGlobalMsgSearchResults(
+  seedMap: Map<string, GlobalMsgSearchResult[]>,
+  authoritativeMap: Map<string, GlobalMsgSearchResult[]>
+): GlobalMsgSearchResult[] {
+  const merged = new Map<string, GlobalMsgSearchResult[]>()
+  for (const [sessionId, seedRows] of seedMap.entries()) {
+    if (authoritativeMap.has(sessionId)) {
+      merged.set(sessionId, authoritativeMap.get(sessionId) || [])
+    } else {
+      merged.set(sessionId, seedRows)
+    }
+  }
+  for (const [sessionId, rows] of authoritativeMap.entries()) {
+    if (!merged.has(sessionId)) merged.set(sessionId, rows)
+  }
+  return flattenGlobalMsgSearchSessionMap(merged)
+}
+
+function shouldRunGlobalMsgShadowCompareSample(): boolean {
+  if (!import.meta.env.DEV) return false
+  try {
+    const forced = window.localStorage.getItem(GLOBAL_MSG_SHADOW_COMPARE_STORAGE_KEY)
+    if (forced === '1') return true
+    if (forced === '0') return false
+  } catch {
+    // ignore storage read failures
+  }
+  return Math.random() < GLOBAL_MSG_SHADOW_COMPARE_SAMPLE_RATE
+}
+
+function buildGlobalMsgSearchSessionLocalIds(results: GlobalMsgSearchResult[]): Record<string, number[]> {
+  const grouped = new Map<string, number[]>()
+  for (const row of results) {
+    if (!row.sessionId || row.localId <= 0) continue
+    const list = grouped.get(row.sessionId) || []
+    list.push(row.localId)
+    grouped.set(row.sessionId, list)
+  }
+  const output: Record<string, number[]> = {}
+  for (const [sessionId, localIds] of grouped.entries()) {
+    output[sessionId] = localIds
+  }
+  return output
+}
+
+function sortMessagesByCreateTimeDesc<T extends Pick<Message, 'createTime' | 'localId'>>(items: T[]): T[] {
+  return [...items].sort((a, b) => {
+    const timeDiff = (b.createTime || 0) - (a.createTime || 0)
+    if (timeDiff !== 0) return timeDiff
+    return (b.localId || 0) - (a.localId || 0)
+  })
+}
+
+function isRenderableImageSrc(value?: string | null): boolean {
+  const src = String(value || '').trim()
+  if (!src) return false
+  return /^(https?:\/\/|data:image\/|blob:|file:\/\/|\/)/i.test(src)
+}
+
+function normalizeSearchIdentityText(value?: string | null): string | undefined {
+  const normalized = String(value || '').trim()
+  if (!normalized) return undefined
+  const lower = normalized.toLowerCase()
+  if (normalized === '未知' || lower === 'unknown' || lower === 'null' || lower === 'undefined') {
+    return undefined
+  }
+  if (lower.startsWith('unknown_sender_')) {
+    return undefined
+  }
+  return normalized
+}
+
+function normalizeSearchAvatarUrl(value?: string | null): string | undefined {
+  const normalized = String(value || '').trim()
+  if (!normalized) return undefined
+  const lower = normalized.toLowerCase()
+  if (lower === 'null' || lower === 'undefined') {
+    return undefined
+  }
+  return normalized
+}
+
+function resolveSessionDisplayName(
+  displayName?: string | null,
+  sessionId?: string | null
+): string | undefined {
+  const normalizedSessionId = String(sessionId || '').trim()
+  const normalizedDisplayName = normalizeSearchIdentityText(displayName)
+  if (!normalizedDisplayName) return undefined
+  if (normalizedSessionId && normalizedDisplayName === normalizedSessionId) return undefined
+  return normalizedDisplayName
+}
+
+function isFoldPlaceholderSession(sessionId?: string | null): boolean {
+  return String(sessionId || '').toLowerCase().includes('placeholder_foldgroup')
+}
+
+function isWxidLikeSearchIdentity(value?: string | null): boolean {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return false
+  if (normalized.startsWith('wxid_')) return true
+  const suffixMatch = normalized.match(/^(.+)_([a-z0-9]{4})$/i)
+  return Boolean(suffixMatch && suffixMatch[1].startsWith('wxid_'))
+}
+
+function resolveSearchSenderDisplayName(
+  displayName?: string | null,
+  senderUsername?: string | null,
+  sessionId?: string | null
+): string | undefined {
+  const normalizedDisplayName = normalizeSearchIdentityText(displayName)
+  if (!normalizedDisplayName) return undefined
+
+  const normalizedSenderUsername = normalizeSearchIdentityText(senderUsername)
+  const normalizedSessionId = normalizeSearchIdentityText(sessionId)
+
+  if (normalizedSessionId && normalizedDisplayName === normalizedSessionId) {
+    return undefined
+  }
+  if (isWxidLikeSearchIdentity(normalizedDisplayName)) {
+    return undefined
+  }
+  if (
+    normalizedSenderUsername &&
+    normalizedDisplayName === normalizedSenderUsername &&
+    isWxidLikeSearchIdentity(normalizedSenderUsername)
+  ) {
+    return undefined
+  }
+
+  return normalizedDisplayName
+}
+
+function resolveSearchSenderUsernameFallback(value?: string | null): string | undefined {
+  const normalized = normalizeSearchIdentityText(value)
+  if (!normalized || isWxidLikeSearchIdentity(normalized)) {
+    return undefined
+  }
+  return normalized
+}
+
+function buildSearchIdentityCandidates(value?: string | null): string[] {
+  const normalized = normalizeSearchIdentityText(value)
+  if (!normalized) return []
+  const lower = normalized.toLowerCase()
+  const candidates = new Set<string>([lower])
+  if (lower.startsWith('wxid_')) {
+    const match = lower.match(/^(wxid_[^_]+)/i)
+    if (match?.[1]) {
+      candidates.add(match[1])
+    }
+  }
+  return [...candidates]
+}
+
+function isCurrentUserSearchIdentity(
+  senderUsername?: string | null,
+  myWxid?: string | null
+): boolean {
+  const senderCandidates = buildSearchIdentityCandidates(senderUsername)
+  const selfCandidates = buildSearchIdentityCandidates(myWxid)
+  if (senderCandidates.length === 0 || selfCandidates.length === 0) {
+    return false
+  }
+
+  for (const sender of senderCandidates) {
+    for (const self of selfCandidates) {
+      if (sender === self) return true
+      if (sender.startsWith(self + '_')) return true
+      if (self.startsWith(sender + '_')) return true
+    }
+  }
+  return false
+}
 
 interface XmlField {
   key: string;
@@ -156,6 +531,8 @@ const CHAT_SESSION_WINDOW_CACHE_TTL_MS = 12 * 60 * 60 * 1000
 const CHAT_SESSION_WINDOW_CACHE_MAX_SESSIONS = 30
 const CHAT_SESSION_WINDOW_CACHE_MAX_MESSAGES = 300
 const GROUP_MEMBERS_PANEL_CACHE_TTL_MS = 10 * 60 * 1000
+const SESSION_CONTACT_PROFILE_RETRY_INTERVAL_MS = 15 * 1000
+const SESSION_CONTACT_PROFILE_CACHE_TTL_MS = 3 * 24 * 60 * 60 * 1000
 
 function buildChatSessionListCacheKey(scope: string): string {
   return `weflow.chat.sessions.v1::${scope || 'default'}`
@@ -204,8 +581,13 @@ function formatYmdHmDateTime(timestamp?: number): string {
 interface ChatPageProps {
   standaloneSessionWindow?: boolean
   initialSessionId?: string | null
+  standaloneSource?: string | null
+  standaloneInitialDisplayName?: string | null
+  standaloneInitialAvatarUrl?: string | null
+  standaloneInitialContactType?: string | null
 }
 
+type StandaloneLoadStage = 'idle' | 'connecting' | 'loading' | 'ready'
 
 interface SessionDetail {
   wxid: string
@@ -260,6 +642,13 @@ interface SessionExportCacheMeta {
   source: 'memory' | 'disk' | 'fresh'
 }
 
+interface SessionContactProfile {
+  displayName?: string
+  avatarUrl?: string
+  alias?: string
+  updatedAt: number
+}
+
 type GroupMessageCountStatus = 'loading' | 'ready' | 'failed'
 
 interface GroupPanelMember {
@@ -274,6 +663,263 @@ interface GroupPanelMember {
   isFriend: boolean
   messageCount: number
   messageCountStatus: GroupMessageCountStatus
+}
+
+const QUOTED_SENDER_CACHE_TTL_MS = 10 * 60 * 1000
+const quotedSenderDisplayCache = new Map<string, { displayName: string; updatedAt: number }>()
+const quotedSenderDisplayLoading = new Map<string, Promise<string | undefined>>()
+const quotedGroupMembersCache = new Map<string, { members: GroupPanelMember[]; updatedAt: number }>()
+const quotedGroupMembersLoading = new Map<string, Promise<GroupPanelMember[]>>()
+
+function buildQuotedSenderCacheKey(
+  sessionId: string,
+  senderUsername: string,
+  isGroupChat: boolean
+): string {
+  const normalizedSessionId = normalizeSearchIdentityText(sessionId) || String(sessionId || '').trim()
+  const normalizedSender = normalizeSearchIdentityText(senderUsername) || String(senderUsername || '').trim()
+  return `${isGroupChat ? 'group' : 'direct'}::${normalizedSessionId}::${normalizedSender}`
+}
+
+function isSameQuotedSenderIdentity(left?: string | null, right?: string | null): boolean {
+  const leftCandidates = buildSearchIdentityCandidates(left)
+  const rightCandidates = buildSearchIdentityCandidates(right)
+  if (leftCandidates.length === 0 || rightCandidates.length === 0) {
+    return false
+  }
+
+  for (const leftCandidate of leftCandidates) {
+    for (const rightCandidate of rightCandidates) {
+      if (leftCandidate === rightCandidate) return true
+      if (leftCandidate.startsWith(rightCandidate + '_')) return true
+      if (rightCandidate.startsWith(leftCandidate + '_')) return true
+    }
+  }
+
+  return false
+}
+
+function normalizeQuotedGroupMember(member: Partial<GroupPanelMember> | null | undefined): GroupPanelMember | null {
+  const username = String(member?.username || '').trim()
+  if (!username) return null
+
+  const displayName = String(member?.displayName || '').trim()
+  const nickname = String(member?.nickname || '').trim()
+  const remark = String(member?.remark || '').trim()
+  const alias = String(member?.alias || '').trim()
+  const groupNickname = String(member?.groupNickname || '').trim()
+
+  return {
+    username,
+    displayName: displayName || groupNickname || remark || nickname || alias || username,
+    avatarUrl: member?.avatarUrl,
+    nickname,
+    alias,
+    remark,
+    groupNickname,
+    isOwner: Boolean(member?.isOwner),
+    isFriend: Boolean(member?.isFriend),
+    messageCount: Number.isFinite(member?.messageCount) ? Math.max(0, Math.floor(member?.messageCount as number)) : 0,
+    messageCountStatus: 'ready'
+  }
+}
+
+function resolveQuotedSenderFallbackDisplayName(
+  sessionId: string,
+  senderUsername?: string | null,
+  fallbackDisplayName?: string | null
+): string | undefined {
+  const resolved = resolveSearchSenderDisplayName(fallbackDisplayName, senderUsername, sessionId)
+  if (resolved) return resolved
+  return resolveSearchSenderUsernameFallback(senderUsername)
+}
+
+function resolveQuotedSenderUsername(
+  fromusr?: string | null,
+  chatusr?: string | null
+): string {
+  const normalizedChatUsr = String(chatusr || '').trim()
+  const normalizedFromUsr = String(fromusr || '').trim()
+
+  if (normalizedChatUsr) {
+    return normalizedChatUsr
+  }
+
+  if (normalizedFromUsr.endsWith('@chatroom')) {
+    return ''
+  }
+
+  return normalizedFromUsr
+}
+
+function resolveQuotedGroupMemberDisplayName(member: GroupPanelMember): string | undefined {
+  const remark = normalizeSearchIdentityText(member.remark)
+  if (remark) return remark
+
+  const groupNickname = normalizeSearchIdentityText(member.groupNickname)
+  if (groupNickname) return groupNickname
+
+  const nickname = normalizeSearchIdentityText(member.nickname)
+  if (nickname) return nickname
+
+  const displayName = resolveSearchSenderDisplayName(member.displayName, member.username)
+  if (displayName) return displayName
+
+  const alias = normalizeSearchIdentityText(member.alias)
+  if (alias) return alias
+
+  return resolveSearchSenderUsernameFallback(member.username)
+}
+
+function resolveQuotedPrivateDisplayName(contact: any): string | undefined {
+  const remark = normalizeSearchIdentityText(contact?.remark)
+  if (remark) return remark
+
+  const nickname = normalizeSearchIdentityText(
+    contact?.nickName || contact?.nick_name || contact?.nickname
+  )
+  if (nickname) return nickname
+
+  const alias = normalizeSearchIdentityText(contact?.alias)
+  if (alias) return alias
+
+  return undefined
+}
+
+async function getQuotedGroupMembers(chatroomId: string): Promise<GroupPanelMember[]> {
+  const normalizedChatroomId = String(chatroomId || '').trim()
+  if (!normalizedChatroomId || !normalizedChatroomId.includes('@chatroom')) {
+    return []
+  }
+
+  const cached = quotedGroupMembersCache.get(normalizedChatroomId)
+  if (cached && Date.now() - cached.updatedAt < QUOTED_SENDER_CACHE_TTL_MS) {
+    return cached.members
+  }
+
+  const pending = quotedGroupMembersLoading.get(normalizedChatroomId)
+  if (pending) return pending
+
+  const request = window.electronAPI.groupAnalytics.getGroupMembersPanelData(
+    normalizedChatroomId,
+    { forceRefresh: false, includeMessageCounts: false }
+  ).then((result) => {
+    const members = Array.isArray(result.data)
+      ? result.data
+        .map((member) => normalizeQuotedGroupMember(member as Partial<GroupPanelMember>))
+        .filter((member): member is GroupPanelMember => Boolean(member))
+      : []
+
+    if (members.length > 0) {
+      quotedGroupMembersCache.set(normalizedChatroomId, {
+        members,
+        updatedAt: Date.now()
+      })
+      return members
+    }
+
+    return cached?.members || []
+  }).catch(() => cached?.members || []).finally(() => {
+    quotedGroupMembersLoading.delete(normalizedChatroomId)
+  })
+
+  quotedGroupMembersLoading.set(normalizedChatroomId, request)
+  return request
+}
+
+async function resolveQuotedSenderDisplayName(options: {
+  sessionId: string
+  senderUsername?: string | null
+  fallbackDisplayName?: string | null
+  isGroupChat?: boolean
+  myWxid?: string | null
+}): Promise<string | undefined> {
+  const normalizedSessionId = String(options.sessionId || '').trim()
+  const normalizedSender = String(options.senderUsername || '').trim()
+  const fallbackDisplayName = resolveQuotedSenderFallbackDisplayName(
+    normalizedSessionId,
+    normalizedSender,
+    options.fallbackDisplayName
+  )
+
+  if (!normalizedSender) {
+    return fallbackDisplayName
+  }
+
+  const cacheKey = buildQuotedSenderCacheKey(normalizedSessionId, normalizedSender, Boolean(options.isGroupChat))
+  const cached = quotedSenderDisplayCache.get(cacheKey)
+  if (cached && Date.now() - cached.updatedAt < QUOTED_SENDER_CACHE_TTL_MS) {
+    return cached.displayName
+  }
+
+  const pending = quotedSenderDisplayLoading.get(cacheKey)
+  if (pending) return pending
+
+  const request = (async (): Promise<string | undefined> => {
+    if (options.isGroupChat) {
+      const members = await getQuotedGroupMembers(normalizedSessionId)
+      const matchedMember = members.find((member) => isSameQuotedSenderIdentity(member.username, normalizedSender))
+      const groupDisplayName = matchedMember ? resolveQuotedGroupMemberDisplayName(matchedMember) : undefined
+      if (groupDisplayName) {
+        quotedSenderDisplayCache.set(cacheKey, {
+          displayName: groupDisplayName,
+          updatedAt: Date.now()
+        })
+        return groupDisplayName
+      }
+    }
+
+    if (isCurrentUserSearchIdentity(normalizedSender, options.myWxid)) {
+      const selfDisplayName = fallbackDisplayName || '我'
+      quotedSenderDisplayCache.set(cacheKey, {
+        displayName: selfDisplayName,
+        updatedAt: Date.now()
+      })
+      return selfDisplayName
+    }
+
+    try {
+      const contact = await window.electronAPI.chat.getContact(normalizedSender)
+      const contactDisplayName = resolveQuotedPrivateDisplayName(contact)
+      if (contactDisplayName) {
+        quotedSenderDisplayCache.set(cacheKey, {
+          displayName: contactDisplayName,
+          updatedAt: Date.now()
+        })
+        return contactDisplayName
+      }
+    } catch {
+      // ignore contact lookup failures and fall back below
+    }
+
+    try {
+      const profile = await window.electronAPI.chat.getContactAvatar(normalizedSender)
+      const profileDisplayName = normalizeSearchIdentityText(profile?.displayName)
+      if (profileDisplayName && !isWxidLikeSearchIdentity(profileDisplayName)) {
+        quotedSenderDisplayCache.set(cacheKey, {
+          displayName: profileDisplayName,
+          updatedAt: Date.now()
+        })
+        return profileDisplayName
+      }
+    } catch {
+      // ignore avatar lookup failures and keep fallback usable
+    }
+
+    if (fallbackDisplayName) {
+      quotedSenderDisplayCache.set(cacheKey, {
+        displayName: fallbackDisplayName,
+        updatedAt: Date.now()
+      })
+    }
+
+    return fallbackDisplayName
+  })().finally(() => {
+    quotedSenderDisplayLoading.delete(cacheKey)
+  })
+
+  quotedSenderDisplayLoading.set(cacheKey, request)
+  return request
 }
 
 interface SessionListCachePayload {
@@ -312,25 +958,102 @@ interface LoadMessagesOptions {
   deferGroupSenderWarmup?: boolean
   forceInitialLimit?: number
   switchRequestSeq?: number
+  inSessionJumpRequestSeq?: number
 }
 
-// 全局头像加载队列管理器已移至 src/utils/AvatarLoadQueue.ts
 // 全局头像加载队列管理器已移至 src/utils/AvatarLoadQueue.ts
 import { avatarLoadQueue } from '../utils/AvatarLoadQueue'
 import { Avatar } from '../components/Avatar'
 
 // 头像组件 - 支持骨架屏加载和懒加载（优化：限制并发，使用 memo 避免不必要的重渲染）
+// 高亮搜索关键词组件
+const HighlightText = React.memo(({ text, keyword }: { text: string; keyword: string }) => {
+  if (!keyword) return <>{text}</>
+
+  const lowerText = text.toLowerCase()
+  const lowerKeyword = keyword.toLowerCase()
+  const matchIndex = lowerText.indexOf(lowerKeyword)
+
+  if (matchIndex === -1) return <>{text}</>
+
+  // 如果匹配位置在后面且文本过长，截断前面部分
+  const maxLength = 50
+  let displayText = text
+
+  if (text.length > maxLength && matchIndex > 20) {
+    const start = Math.max(0, matchIndex - 15)
+    displayText = '...' + text.slice(start)
+  }
+
+  const parts = displayText.split(new RegExp(`(${keyword})`, 'gi'))
+  return (
+    <>
+      {parts.map((part, i) =>
+        part.toLowerCase() === lowerKeyword ?
+          <span key={i} className="highlight">{part}</span> : part
+      )}
+    </>
+  )
+})
+
+const HighlightTextNoTruncate = React.memo(({ text, keyword }: { text: string; keyword: string }) => {
+  if (!keyword) return <>{text}</>
+
+  const lowerText = text.toLowerCase()
+  const lowerKeyword = keyword.toLowerCase()
+  const matchIndex = lowerText.indexOf(lowerKeyword)
+
+  if (matchIndex === -1) return <>{text}</>
+
+  const escapedKeyword = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const matchEnd = matchIndex + keyword.length
+  const maxDisplayLength = 25
+
+  // 如果匹配位置不在开头，或文本过长，则居中显示
+  if (matchIndex > 5 || text.length > maxDisplayLength) {
+    const start = Math.max(0, matchIndex - 8)
+    const end = Math.min(text.length, matchEnd + 15)
+    const prefix = start > 0 ? '...' : ''
+    const suffix = end < text.length ? '...' : ''
+    const middleText = text.slice(start, end)
+
+    const parts = middleText.split(new RegExp(`(${escapedKeyword})`, 'gi'))
+    return (
+      <>
+        {prefix}
+        {parts.map((part, i) =>
+          part.toLowerCase() === lowerKeyword ?
+            <span key={i} className="highlight">{part}</span> : part
+        )}
+        {suffix}
+      </>
+    )
+  }
+
+  const parts = text.split(new RegExp(`(${escapedKeyword})`, 'gi'))
+  return (
+    <>
+      {parts.map((part, i) =>
+        part.toLowerCase() === lowerKeyword ?
+          <span key={i} className="highlight">{part}</span> : part
+      )}
+    </>
+  )
+})
+
 // 会话项组件（使用 memo 优化，避免不必要的重渲染）
 const SessionItem = React.memo(function SessionItem({
   session,
   isActive,
   onSelect,
-  formatTime
+  formatTime,
+  searchKeyword
 }: {
   session: ChatSession
   isActive: boolean
   onSelect: (session: ChatSession) => void
   formatTime: (timestamp: number) => string
+  searchKeyword?: string
 }) {
   const timeText = useMemo(() =>
     formatTime(session.lastTimestamp || session.sortTimestamp),
@@ -338,28 +1061,70 @@ const SessionItem = React.memo(function SessionItem({
   )
 
   const isFoldEntry = session.username.toLowerCase().includes('placeholder_foldgroup')
+  const isBizEntry = session.username === OFFICIAL_ACCOUNTS_VIRTUAL_ID
 
   // 折叠入口：专属名称和图标
   if (isFoldEntry) {
     return (
       <div
-        className={`session-item fold-entry`}
+        className={`session-item fold-entry ${isActive ? 'active' : ''}`}
         onClick={() => onSelect(session)}
       >
         <div className="fold-entry-avatar">
-          <FolderClosed size={22} />
+          <MessageSquare size={22} />
         </div>
         <div className="session-info">
           <div className="session-top">
-            <span className="session-name">折叠的群聊</span>
+            <span className="session-name">折叠的聊天</span>
+            <span className="session-time">{timeText}</span>
           </div>
           <div className="session-bottom">
-            <span className="session-summary">{session.summary || ''}</span>
+            <span className="session-summary">{session.summary || '暂无消息'}</span>
           </div>
         </div>
       </div>
     )
   }
+
+  // 公众号入口：专属名称和图标
+  if (isBizEntry) {
+    return (
+      <div
+        className={`session-item biz-entry ${isActive ? 'active' : ''}`}
+        onClick={() => onSelect(session)}
+      >
+        <div className="biz-entry-avatar">
+          <Newspaper size={22} />
+        </div>
+        <div className="session-info">
+          <div className="session-top">
+            <span className="session-name">订阅号/服务号</span>
+            <span className="session-time">{timeText}</span>
+          </div>
+          <div className="session-bottom">
+            <span className="session-summary">{session.summary || '查看公众号历史消息'}</span>
+            <div className="session-badges">
+              {session.unreadCount > 0 && (
+                <span className="unread-badge">
+                  {session.unreadCount > 99 ? '99+' : session.unreadCount}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // 根据匹配字段显示不同的 summary
+  const summaryContent = useMemo(() => {
+    if (session.matchedField === 'wxid') {
+      return <span className="session-summary">wxid：<HighlightTextNoTruncate text={session.username} keyword={searchKeyword || ''} /></span>
+    } else if (session.matchedField === 'alias' && session.alias) {
+      return <span className="session-summary">微信号：<HighlightTextNoTruncate text={session.alias} keyword={searchKeyword || ''} /></span>
+    }
+    return <span className="session-summary">{session.summary || '暂无消息'}</span>
+  }, [session.matchedField, session.username, session.alias, session.summary, searchKeyword])
 
   return (
     <div
@@ -374,11 +1139,20 @@ const SessionItem = React.memo(function SessionItem({
       />
       <div className="session-info">
         <div className="session-top">
-          <span className="session-name">{session.displayName || session.username}</span>
+          <span className="session-name">
+            {(() => {
+              const shouldHighlight = (session.matchedField as any) === 'name' && searchKeyword
+              return shouldHighlight ? (
+                <HighlightText text={session.displayName || session.username} keyword={searchKeyword} />
+              ) : (
+                session.displayName || session.username
+              )
+            })()}
+          </span>
           <span className="session-time">{timeText}</span>
         </div>
         <div className="session-bottom">
-          <span className="session-summary">{session.summary || '暂无消息'}</span>
+          {summaryContent}
           <div className="session-badges">
             {session.isMuted && <BellOff size={12} className="mute-icon" />}
             {session.unreadCount > 0 && (
@@ -397,27 +1171,42 @@ const SessionItem = React.memo(function SessionItem({
     prevProps.session.displayName === nextProps.session.displayName &&
     prevProps.session.avatarUrl === nextProps.session.avatarUrl &&
     prevProps.session.summary === nextProps.session.summary &&
+    prevProps.session.matchedField === nextProps.session.matchedField &&
+    prevProps.session.alias === nextProps.session.alias &&
     prevProps.session.unreadCount === nextProps.session.unreadCount &&
     prevProps.session.lastTimestamp === nextProps.session.lastTimestamp &&
     prevProps.session.sortTimestamp === nextProps.session.sortTimestamp &&
     prevProps.session.isMuted === nextProps.session.isMuted &&
-    prevProps.isActive === nextProps.isActive
+    prevProps.isActive === nextProps.isActive &&
+    prevProps.searchKeyword === nextProps.searchKeyword
   )
 })
 
 
 
 function ChatPage(props: ChatPageProps) {
-  const { standaloneSessionWindow = false, initialSessionId = null } = props
+  const {
+    standaloneSessionWindow = false,
+    initialSessionId = null,
+    standaloneSource = null,
+    standaloneInitialDisplayName = null,
+    standaloneInitialAvatarUrl = null,
+    standaloneInitialContactType = null
+  } = props
   const normalizedInitialSessionId = useMemo(() => String(initialSessionId || '').trim(), [initialSessionId])
+  const normalizedStandaloneSource = useMemo(() => String(standaloneSource || '').trim().toLowerCase(), [standaloneSource])
+  const normalizedStandaloneInitialDisplayName = useMemo(() => String(standaloneInitialDisplayName || '').trim(), [standaloneInitialDisplayName])
+  const normalizedStandaloneInitialAvatarUrl = useMemo(() => String(standaloneInitialAvatarUrl || '').trim(), [standaloneInitialAvatarUrl])
+  const normalizedStandaloneInitialContactType = useMemo(() => String(standaloneInitialContactType || '').trim().toLowerCase(), [standaloneInitialContactType])
+  const shouldHideStandaloneDetailButton = standaloneSessionWindow && normalizedStandaloneSource === 'export'
   const navigate = useNavigate()
+  const location = useLocation()
 
   const {
     isConnected,
     isConnecting,
     connectionError,
     sessions,
-    filteredSessions,
     currentSessionId,
     isLoadingSessions,
     messages,
@@ -429,7 +1218,6 @@ function ChatPage(props: ChatPageProps) {
     setConnecting,
     setConnectionError,
     setSessions,
-    setFilteredSessions,
     setCurrentSession,
     setLoadingSessions,
     setMessages,
@@ -440,15 +1228,56 @@ function ChatPage(props: ChatPageProps) {
     hasMoreLater,
     setHasMoreLater,
     setSearchKeyword
-  } = useChatStore()
+  } = useChatStore(useShallow((state) => ({
+    isConnected: state.isConnected,
+    isConnecting: state.isConnecting,
+    connectionError: state.connectionError,
+    sessions: state.sessions,
+    currentSessionId: state.currentSessionId,
+    isLoadingSessions: state.isLoadingSessions,
+    messages: state.messages,
+    isLoadingMessages: state.isLoadingMessages,
+    isLoadingMore: state.isLoadingMore,
+    hasMoreMessages: state.hasMoreMessages,
+    searchKeyword: state.searchKeyword,
+    setConnected: state.setConnected,
+    setConnecting: state.setConnecting,
+    setConnectionError: state.setConnectionError,
+    setSessions: state.setSessions,
+    setCurrentSession: state.setCurrentSession,
+    setLoadingSessions: state.setLoadingSessions,
+    setMessages: state.setMessages,
+    appendMessages: state.appendMessages,
+    setLoadingMessages: state.setLoadingMessages,
+    setLoadingMore: state.setLoadingMore,
+    setHasMoreMessages: state.setHasMoreMessages,
+    hasMoreLater: state.hasMoreLater,
+    setHasMoreLater: state.setHasMoreLater,
+    setSearchKeyword: state.setSearchKeyword
+  })))
 
   const messageListRef = useRef<HTMLDivElement>(null)
+  const [messageListScrollParent, setMessageListScrollParent] = useState<HTMLDivElement | null>(null)
+  const messageVirtuosoRef = useRef<VirtuosoHandle | null>(null)
+  const visibleMessageRangeRef = useRef<{ startIndex: number; endIndex: number }>({ startIndex: 0, endIndex: 0 })
+  const topRangeLoadLockRef = useRef(false)
+  const bottomRangeLoadLockRef = useRef(false)
+  const topRangeLoadLastTriggerAtRef = useRef(0)
+  const suppressAutoLoadLaterRef = useRef(false)
+  const suppressAutoScrollOnNextMessageGrowthRef = useRef(false)
+  const prependingHistoryRef = useRef(false)
+  const isMessageListScrollingRef = useRef(false)
+  const messageListScrollTimeoutRef = useRef<number | null>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const sidebarRef = useRef<HTMLDivElement>(null)
+  const handleMessageListScrollParentRef = useCallback((node: HTMLDivElement | null) => {
+    messageListRef.current = node
+    setMessageListScrollParent(node)
+  }, [])
 
   const getMessageKey = useCallback((msg: Message): string => {
-    if (msg.localId && msg.localId > 0) return `l:${msg.localId}`
-    return `t:${msg.createTime}:${msg.sortSeq || 0}:${msg.serverId || 0}`
+    if (msg.messageKey) return msg.messageKey
+    return `fallback:${msg.serverId || 0}:${msg.createTime}:${msg.sortSeq || 0}:${msg.localId || 0}:${msg.senderUsername || ''}:${msg.localType || 0}`
   }, [])
   const initialRevealTimerRef = useRef<number | null>(null)
   const sessionListRef = useRef<HTMLDivElement>(null)
@@ -490,14 +1319,23 @@ function ChatPage(props: ChatPageProps) {
   const [highlightedMessageKeys, setHighlightedMessageKeys] = useState<string[]>([])
   const [isRefreshingSessions, setIsRefreshingSessions] = useState(false)
   const [foldedView, setFoldedView] = useState(false) // 是否在"折叠的群聊"视图
+  const [bizView, setBizView] = useState(false) // 是否在"公众号"视图
+  const [selectedBizAccount, setSelectedBizAccount] = useState<BizAccount | null>(null)
   const [hasInitialMessages, setHasInitialMessages] = useState(false)
   const [isSessionSwitching, setIsSessionSwitching] = useState(false)
   const [noMessageTable, setNoMessageTable] = useState(false)
-  const [fallbackDisplayName, setFallbackDisplayName] = useState<string | null>(null)
+  const [fallbackDisplayName, setFallbackDisplayName] = useState<string | null>(normalizedStandaloneInitialDisplayName || null)
+  const [fallbackAvatarUrl, setFallbackAvatarUrl] = useState<string | null>(normalizedStandaloneInitialAvatarUrl || null)
+  const [standaloneLoadStage, setStandaloneLoadStage] = useState<StandaloneLoadStage>(
+    standaloneSessionWindow && normalizedInitialSessionId ? 'connecting' : 'idle'
+  )
+  const [standaloneInitialLoadRequested, setStandaloneInitialLoadRequested] = useState(false)
   const [showVoiceTranscribeDialog, setShowVoiceTranscribeDialog] = useState(false)
+  const [autoTranscribeVoiceEnabled, setAutoTranscribeVoiceEnabled] = useState(false)
   const [pendingVoiceTranscriptRequest, setPendingVoiceTranscriptRequest] = useState<{ sessionId: string; messageId: string } | null>(null)
   const [inProgressExportSessionIds, setInProgressExportSessionIds] = useState<Set<string>>(new Set())
   const [isPreparingExportDialog, setIsPreparingExportDialog] = useState(false)
+  const [chatSnsTimelineTarget, setChatSnsTimelineTarget] = useState<ContactSnsTimelineTarget | null>(null)
   const [exportPrepareHint, setExportPrepareHint] = useState('')
 
   // 消息右键菜单
@@ -507,20 +1345,51 @@ function ChatPage(props: ChatPageProps) {
 
   // 多选模式
   const [isSelectionMode, setIsSelectionMode] = useState(false)
-  const [selectedMessages, setSelectedMessages] = useState<Set<number>>(new Set())
+  const [selectedMessages, setSelectedMessages] = useState<Set<string>>(new Set())
 
   // 编辑消息额外状态
   const [editMode, setEditMode] = useState<'raw' | 'fields'>('raw')
   const [tempFields, setTempFields] = useState<XmlField[]>([])
 
   // 批量语音转文字相关状态（进度/结果 由全局 store 管理）
-  const { isBatchTranscribing, progress: batchTranscribeProgress, showToast: showBatchProgress, startTranscribe, updateProgress, finishTranscribe, setShowToast: setShowBatchProgress } = useBatchTranscribeStore()
-  const { isBatchDecrypting, progress: batchDecryptProgress, startDecrypt, updateProgress: updateDecryptProgress, finishDecrypt, setShowToast: setShowBatchDecryptToast } = useBatchImageDecryptStore()
+  const {
+    isBatchTranscribing,
+    runningBatchVoiceTaskType,
+    batchTranscribeProgress,
+    startTranscribe,
+    updateProgress,
+    finishTranscribe,
+    setShowBatchProgress
+  } = useBatchTranscribeStore(useShallow((state) => ({
+    isBatchTranscribing: state.isBatchTranscribing,
+    runningBatchVoiceTaskType: state.taskType,
+    batchTranscribeProgress: state.progress,
+    startTranscribe: state.startTranscribe,
+    updateProgress: state.updateProgress,
+    finishTranscribe: state.finishTranscribe,
+    setShowBatchProgress: state.setShowToast
+  })))
+  const {
+    isBatchDecrypting,
+    batchDecryptProgress,
+    startDecrypt,
+    updateDecryptProgress,
+    finishDecrypt,
+    setShowBatchDecryptToast
+  } = useBatchImageDecryptStore(useShallow((state) => ({
+    isBatchDecrypting: state.isBatchDecrypting,
+    batchDecryptProgress: state.progress,
+    startDecrypt: state.startDecrypt,
+    updateDecryptProgress: state.updateProgress,
+    finishDecrypt: state.finishDecrypt,
+    setShowBatchDecryptToast: state.setShowToast
+  })))
   const [showBatchConfirm, setShowBatchConfirm] = useState(false)
   const [batchVoiceCount, setBatchVoiceCount] = useState(0)
   const [batchVoiceMessages, setBatchVoiceMessages] = useState<Message[] | null>(null)
   const [batchVoiceDates, setBatchVoiceDates] = useState<string[]>([])
   const [batchSelectedDates, setBatchSelectedDates] = useState<Set<string>>(new Set())
+  const [batchVoiceTaskType, setBatchVoiceTaskType] = useState<BatchVoiceTaskType>('transcribe')
   const [showBatchDecryptConfirm, setShowBatchDecryptConfirm] = useState(false)
   const [batchImageMessages, setBatchImageMessages] = useState<BatchImageDecryptCandidate[] | null>(null)
   const [batchImageDates, setBatchImageDates] = useState<string[]>([])
@@ -532,6 +1401,29 @@ function ChatPage(props: ChatPageProps) {
   const [isDeleting, setIsDeleting] = useState(false)
   const [deleteProgress, setDeleteProgress] = useState({ current: 0, total: 0 })
   const [cancelDeleteRequested, setCancelDeleteRequested] = useState(false)
+  // 会话内搜索
+  const [showInSessionSearch, setShowInSessionSearch] = useState(false)
+  const [inSessionQuery, setInSessionQuery] = useState('')
+  const [inSessionResults, setInSessionResults] = useState<Message[]>([])
+  const [inSessionSearching, setInSessionSearching] = useState(false)
+  const [inSessionEnriching, setInSessionEnriching] = useState(false)
+  const [inSessionSearchError, setInSessionSearchError] = useState<string | null>(null)
+  const inSessionSearchRef = useRef<HTMLInputElement>(null)
+  const inSessionResultJumpTimerRef = useRef<number | null>(null)
+  const inSessionResultJumpRequestSeqRef = useRef(0)
+  // 全局消息搜索
+  const [showGlobalMsgSearch, setShowGlobalMsgSearch] = useState(false)
+  const [globalMsgQuery, setGlobalMsgQuery] = useState('')
+  const [globalMsgResults, setGlobalMsgResults] = useState<GlobalMsgSearchResult[]>([])
+  const [globalMsgSearching, setGlobalMsgSearching] = useState(false)
+  const [globalMsgSearchPhase, setGlobalMsgSearchPhase] = useState<GlobalMsgSearchPhase>('idle')
+  const [globalMsgIsBackfilling, setGlobalMsgIsBackfilling] = useState(false)
+  const [globalMsgAuthoritativeSessionCount, setGlobalMsgAuthoritativeSessionCount] = useState(0)
+  const [globalMsgSearchError, setGlobalMsgSearchError] = useState<string | null>(null)
+  const pendingInSessionSearchRef = useRef<PendingInSessionSearchPayload | null>(null)
+  const pendingFootprintJumpRef = useRef<PendingFootprintJumpPayload | null>(null)
+  const pendingGlobalMsgSearchReplayRef = useRef<string | null>(null)
+  const globalMsgPrefixCacheRef = useRef<GlobalMsgPrefixCacheEntry | null>(null)
 
   // 自定义删除确认对话框
   const [deleteConfirm, setDeleteConfirm] = useState<{
@@ -546,11 +1438,17 @@ function ChatPage(props: ChatPageProps) {
   const enrichCancelledRef = useRef(false)
   const isScrollingRef = useRef(false)
   const sessionScrollTimeoutRef = useRef<number | null>(null)
+  const pendingSessionContactEnrichRef = useRef<Set<string>>(new Set())
+  const sessionContactEnrichAttemptAtRef = useRef<Map<string, number>>(new Map())
+  const sessionContactProfileCacheRef = useRef<Map<string, SessionContactProfile>>(new Map())
 
 
   const highlightedMessageSet = useMemo(() => new Set(highlightedMessageKeys), [highlightedMessageKeys])
   const messageKeySetRef = useRef<Set<string>>(new Set())
   const lastMessageTimeRef = useRef(0)
+  const isMessageListAtBottomRef = useRef(true)
+  const lastObservedMessageCountRef = useRef(0)
+  const lastVisibleSenderWarmupAtRef = useRef(0)
   const sessionMapRef = useRef<Map<string, ChatSession>>(new Map())
   const sessionsRef = useRef<ChatSession[]>([])
   const currentSessionRef = useRef<string | null>(null)
@@ -558,8 +1456,6 @@ function ChatPage(props: ChatPageProps) {
   const sessionSwitchRequestSeqRef = useRef(0)
   const initialLoadRequestedSessionRef = useRef<string | null>(null)
   const prevSessionRef = useRef<string | null>(null)
-  const isLoadingMessagesRef = useRef(false)
-  const isLoadingMoreRef = useRef(false)
   const isConnectedRef = useRef(false)
   const isRefreshingRef = useRef(false)
   const searchKeywordRef = useRef('')
@@ -574,13 +1470,84 @@ function ChatPage(props: ChatPageProps) {
   const sessionWindowCacheRef = useRef<Map<string, SessionWindowCacheEntry>>(new Map())
   const previewPersistTimerRef = useRef<number | null>(null)
   const sessionListPersistTimerRef = useRef<number | null>(null)
+  const scrollBottomButtonArmTimerRef = useRef<number | null>(null)
+  const suppressScrollToBottomButtonRef = useRef(false)
   const pendingExportRequestIdRef = useRef<string | null>(null)
   const exportPrepareLongWaitTimerRef = useRef<number | null>(null)
   const jumpDatesRequestSeqRef = useRef(0)
   const jumpDateCountsRequestSeqRef = useRef(0)
 
+  const suppressScrollToBottomButton = useCallback((delayMs = 180) => {
+    suppressScrollToBottomButtonRef.current = true
+    if (scrollBottomButtonArmTimerRef.current !== null) {
+      window.clearTimeout(scrollBottomButtonArmTimerRef.current)
+      scrollBottomButtonArmTimerRef.current = null
+    }
+    scrollBottomButtonArmTimerRef.current = window.setTimeout(() => {
+      suppressScrollToBottomButtonRef.current = false
+      scrollBottomButtonArmTimerRef.current = null
+    }, delayMs)
+  }, [])
+
+  const markMessageListScrolling = useCallback(() => {
+    isMessageListScrollingRef.current = true
+    if (messageListScrollTimeoutRef.current !== null) {
+      window.clearTimeout(messageListScrollTimeoutRef.current)
+      messageListScrollTimeoutRef.current = null
+    }
+    messageListScrollTimeoutRef.current = window.setTimeout(() => {
+      isMessageListScrollingRef.current = false
+      messageListScrollTimeoutRef.current = null
+    }, MESSAGE_LIST_SCROLL_IDLE_MS)
+  }, [])
+
   const isGroupChatSession = useCallback((username: string) => {
     return username.includes('@chatroom')
+  }, [])
+
+  const mergeSessionContactPresentation = useCallback((session: ChatSession, previousSession?: ChatSession): ChatSession => {
+    const username = String(session.username || '').trim()
+    if (!username || isFoldPlaceholderSession(username)) {
+      return session
+    }
+
+    const now = Date.now()
+    const cacheMap = sessionContactProfileCacheRef.current
+    const cachedProfile = cacheMap.get(username)
+    if (cachedProfile && now - cachedProfile.updatedAt > SESSION_CONTACT_PROFILE_CACHE_TTL_MS) {
+      cacheMap.delete(username)
+    }
+    const profile = cacheMap.get(username)
+
+    const sessionDisplayName = resolveSessionDisplayName(session.displayName, username)
+    const previousDisplayName = resolveSessionDisplayName(previousSession?.displayName, username)
+    const profileDisplayName = resolveSessionDisplayName(profile?.displayName, username)
+    const resolvedDisplayName = sessionDisplayName || previousDisplayName || profileDisplayName || session.displayName || username
+
+    const sessionAvatarUrl = normalizeSearchAvatarUrl(session.avatarUrl)
+    const previousAvatarUrl = normalizeSearchAvatarUrl(previousSession?.avatarUrl)
+    const profileAvatarUrl = normalizeSearchAvatarUrl(profile?.avatarUrl)
+    const resolvedAvatarUrl = sessionAvatarUrl || previousAvatarUrl || profileAvatarUrl
+
+    const sessionAlias = normalizeSearchIdentityText(session.alias)
+    const previousAlias = normalizeSearchIdentityText(previousSession?.alias)
+    const profileAlias = normalizeSearchIdentityText(profile?.alias)
+    const resolvedAlias = sessionAlias || previousAlias || profileAlias
+
+    if (
+      resolvedDisplayName === session.displayName &&
+      resolvedAvatarUrl === session.avatarUrl &&
+      resolvedAlias === session.alias
+    ) {
+      return session
+    }
+
+    return {
+      ...session,
+      displayName: resolvedDisplayName,
+      avatarUrl: resolvedAvatarUrl,
+      alias: resolvedAlias
+    }
   }, [])
 
   const clearExportPrepareState = useCallback(() => {
@@ -1042,6 +2009,13 @@ function ChatPage(props: ChatPageProps) {
   const loadSessionDetail = useCallback(async (sessionId: string) => {
     const normalizedSessionId = String(sessionId || '').trim()
     if (!normalizedSessionId) return
+    const taskId = registerBackgroundTask({
+      sourcePage: 'chat',
+      title: '聊天页会话详情统计',
+      detail: `准备读取 ${sessionMapRef.current.get(normalizedSessionId)?.displayName || normalizedSessionId} 的详情`,
+      progressText: '基础信息',
+      cancelable: true
+    })
 
     const requestSeq = ++detailRequestSeqRef.current
     const mappedSession = sessionMapRef.current.get(normalizedSessionId) || sessionsRef.current.find((s) => s.username === normalizedSessionId)
@@ -1105,8 +2079,23 @@ function ChatPage(props: ChatPageProps) {
     }
 
     try {
+      updateBackgroundTask(taskId, {
+        detail: '正在读取会话基础详情',
+        progressText: '基础信息'
+      })
       const result = await window.electronAPI.chat.getSessionDetailFast(normalizedSessionId)
-      if (requestSeq !== detailRequestSeqRef.current) return
+      if (isBackgroundTaskCancelRequested(taskId)) {
+        finishBackgroundTask(taskId, 'canceled', {
+          detail: '已停止后续加载，当前基础查询结束后未继续补充统计'
+        })
+        return
+      }
+      if (requestSeq !== detailRequestSeqRef.current) {
+        finishBackgroundTask(taskId, 'canceled', {
+          detail: '会话已切换，旧详情任务已停止'
+        })
+        return
+      }
       if (result.success && result.detail) {
         setSessionDetail((prev) => ({
           wxid: normalizedSessionId,
@@ -1145,15 +2134,30 @@ function ChatPage(props: ChatPageProps) {
     }
 
     try {
+      updateBackgroundTask(taskId, {
+        detail: '正在读取补充信息与导出统计',
+        progressText: '补充统计'
+      })
       const [extraResultSettled, statsResultSettled] = await Promise.allSettled([
         window.electronAPI.chat.getSessionDetailExtra(normalizedSessionId),
         window.electronAPI.chat.getExportSessionStats(
           [normalizedSessionId],
-          { includeRelations: false, forceRefresh: true, preferAccurateSpecialTypes: true }
+          { includeRelations: false, allowStaleCache: true, cacheOnly: true }
         )
       ])
 
-      if (requestSeq !== detailRequestSeqRef.current) return
+      if (isBackgroundTaskCancelRequested(taskId)) {
+        finishBackgroundTask(taskId, 'canceled', {
+          detail: '已停止后续加载，补充统计结果未继续写入'
+        })
+        return
+      }
+      if (requestSeq !== detailRequestSeqRef.current) {
+        finishBackgroundTask(taskId, 'canceled', {
+          detail: '会话已切换，旧补充统计任务已停止'
+        })
+        return
+      }
 
       if (extraResultSettled.status === 'fulfilled' && extraResultSettled.value.success) {
         const detail = extraResultSettled.value.detail
@@ -1171,6 +2175,7 @@ function ChatPage(props: ChatPageProps) {
       }
 
       let refreshIncludeRelations = false
+      let shouldRefreshStatsInBackground = false
       if (statsResultSettled.status === 'fulfilled' && statsResultSettled.value.success) {
         const metric = statsResultSettled.value.data?.[normalizedSessionId] as SessionExportMetric | undefined
         const cacheMeta = statsResultSettled.value.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
@@ -1188,9 +2193,54 @@ function ChatPage(props: ChatPageProps) {
             }
           })
         }
+        shouldRefreshStatsInBackground = !metric || Boolean(cacheMeta?.stale)
+      } else {
+        shouldRefreshStatsInBackground = true
+      }
+      finishBackgroundTask(taskId, 'completed', {
+        detail: '聊天页会话详情统计完成',
+        progressText: '已完成'
+      })
+
+      if (shouldRefreshStatsInBackground) {
+        setIsRefreshingDetailStats(true)
+        void (async () => {
+          try {
+            const freshResult = await window.electronAPI.chat.getExportSessionStats(
+              [normalizedSessionId],
+              { includeRelations: false, forceRefresh: true }
+            )
+            if (requestSeq !== detailRequestSeqRef.current) return
+            if (freshResult.success && freshResult.data) {
+              const freshMetric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
+              const freshMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+              if (freshMetric) {
+                applySessionDetailStats(normalizedSessionId, freshMetric, freshMeta, false)
+              } else if (freshMeta) {
+                setSessionDetail((prev) => {
+                  if (!prev || prev.wxid !== normalizedSessionId) return prev
+                  return {
+                    ...prev,
+                    statsUpdatedAt: freshMeta.updatedAt,
+                    statsStale: freshMeta.stale
+                  }
+                })
+              }
+            }
+          } catch (error) {
+            console.error('聊天页后台刷新会话统计失败:', error)
+          } finally {
+            if (requestSeq === detailRequestSeqRef.current) {
+              setIsRefreshingDetailStats(false)
+            }
+          }
+        })()
       }
     } catch (e) {
       console.error('加载会话详情补充统计失败:', e)
+      finishBackgroundTask(taskId, 'failed', {
+        detail: String(e)
+      })
     } finally {
       if (requestSeq === detailRequestSeqRef.current) {
         setIsLoadingDetailExtra(false)
@@ -1203,13 +2253,31 @@ function ChatPage(props: ChatPageProps) {
     if (!normalizedSessionId || isLoadingRelationStats) return
 
     const requestSeq = detailRequestSeqRef.current
+    const taskId = registerBackgroundTask({
+      sourcePage: 'chat',
+      title: '聊天页关系统计补算',
+      detail: `正在补算 ${normalizedSessionId} 的共同好友与关联数据`,
+      progressText: '关系统计',
+      cancelable: true
+    })
     setIsLoadingRelationStats(true)
     try {
       const relationResult = await window.electronAPI.chat.getExportSessionStats(
         [normalizedSessionId],
         { includeRelations: true, forceRefresh: true, preferAccurateSpecialTypes: true }
       )
-      if (requestSeq !== detailRequestSeqRef.current) return
+      if (isBackgroundTaskCancelRequested(taskId)) {
+        finishBackgroundTask(taskId, 'canceled', {
+          detail: '已停止后续加载，当前关系统计查询结束后未继续刷新'
+        })
+        return
+      }
+      if (requestSeq !== detailRequestSeqRef.current) {
+        finishBackgroundTask(taskId, 'canceled', {
+          detail: '会话已切换，旧关系统计任务已停止'
+        })
+        return
+      }
 
       const metric = relationResult.success && relationResult.data
         ? relationResult.data[normalizedSessionId] as SessionExportMetric | undefined
@@ -1229,11 +2297,26 @@ function ChatPage(props: ChatPageProps) {
         setIsRefreshingDetailStats(true)
         void (async () => {
           try {
+            updateBackgroundTask(taskId, {
+              detail: '正在刷新关系统计结果',
+              progressText: '关系统计刷新'
+            })
             const freshResult = await window.electronAPI.chat.getExportSessionStats(
               [normalizedSessionId],
               { includeRelations: true, forceRefresh: true, preferAccurateSpecialTypes: true }
             )
-            if (requestSeq !== detailRequestSeqRef.current) return
+            if (isBackgroundTaskCancelRequested(taskId)) {
+              finishBackgroundTask(taskId, 'canceled', {
+                detail: '已停止后续加载，刷新结果未继续写入'
+              })
+              return
+            }
+            if (requestSeq !== detailRequestSeqRef.current) {
+              finishBackgroundTask(taskId, 'canceled', {
+                detail: '会话已切换，旧关系统计刷新任务已停止'
+              })
+              return
+            }
             if (freshResult.success && freshResult.data) {
               const freshMetric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
               const freshMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
@@ -1241,17 +2324,32 @@ function ChatPage(props: ChatPageProps) {
                 applySessionDetailStats(normalizedSessionId, freshMetric, freshMeta, true)
               }
             }
+            finishBackgroundTask(taskId, 'completed', {
+              detail: '聊天页关系统计补算完成',
+              progressText: '已完成'
+            })
           } catch (error) {
             console.error('刷新会话关系统计失败:', error)
+            finishBackgroundTask(taskId, 'failed', {
+              detail: String(error)
+            })
           } finally {
             if (requestSeq === detailRequestSeqRef.current) {
               setIsRefreshingDetailStats(false)
             }
           }
         })()
+      } else {
+        finishBackgroundTask(taskId, 'completed', {
+          detail: '聊天页关系统计补算完成',
+          progressText: '已完成'
+        })
       }
     } catch (error) {
       console.error('加载会话关系统计失败:', error)
+      finishBackgroundTask(taskId, 'failed', {
+        detail: String(error)
+      })
     } finally {
       if (requestSeq === detailRequestSeqRef.current) {
         setIsLoadingRelationStats(false)
@@ -1685,6 +2783,13 @@ function ChatPage(props: ChatPageProps) {
   const handleAccountChanged = useCallback(async () => {
     senderAvatarCache.clear()
     senderAvatarLoading.clear()
+    quotedSenderDisplayCache.clear()
+    quotedSenderDisplayLoading.clear()
+    quotedGroupMembersCache.clear()
+    quotedGroupMembersLoading.clear()
+    sessionContactProfileCacheRef.current.clear()
+    pendingSessionContactEnrichRef.current.clear()
+    sessionContactEnrichAttemptAtRef.current.clear()
     preloadImageKeysRef.current.clear()
     lastPreloadSessionRef.current = null
     pendingSessionLoadRef.current = null
@@ -1708,13 +2813,17 @@ function ChatPage(props: ChatPageProps) {
     setIsLoadingGroupMembers(false)
     setCurrentSession(null)
     setSessions([])
-    setFilteredSessions([])
     setMessages([])
+    setShowScrollToBottom(false)
+    suppressScrollToBottomButton(260)
     setSearchKeyword('')
     setConnectionError(null)
     setConnected(false)
     setConnecting(false)
     setHasMoreMessages(true)
+    setFoldedView(false)
+    setBizView(false)
+    setSelectedBizAccount(null)
     setHasMoreLater(false)
     const scope = await resolveChatCacheScope()
     hydrateSessionListCache(scope)
@@ -1727,7 +2836,6 @@ function ChatPage(props: ChatPageProps) {
     setConnecting,
     setConnectionError,
     setCurrentSession,
-    setFilteredSessions,
     setHasMoreLater,
     setHasMoreMessages,
     setMessages,
@@ -1735,8 +2843,27 @@ function ChatPage(props: ChatPageProps) {
     setSessionDetail,
     setShowDetailPanel,
     setShowGroupMembersPanel,
+    suppressScrollToBottomButton,
     setSessions
   ])
+
+  useEffect(() => {
+    let canceled = false
+    void configService.getAutoTranscribeVoice()
+      .then((enabled) => {
+        if (!canceled) {
+          setAutoTranscribeVoiceEnabled(Boolean(enabled))
+        }
+      })
+      .catch(() => {
+        if (!canceled) {
+          setAutoTranscribeVoiceEnabled(false)
+        }
+      })
+    return () => {
+      canceled = true
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -1754,7 +2881,12 @@ function ChatPage(props: ChatPageProps) {
   // 同步 currentSessionId 到 ref
   useEffect(() => {
     currentSessionRef.current = currentSessionId
-  }, [currentSessionId])
+    isMessageListAtBottomRef.current = true
+    topRangeLoadLockRef.current = false
+    bottomRangeLoadLockRef.current = false
+    setShowScrollToBottom(false)
+    suppressScrollToBottomButton(260)
+  }, [currentSessionId, suppressScrollToBottomButton])
 
   const hydrateSessionStatuses = useCallback(async (sessionList: ChatSession[]) => {
     const usernames = sessionList.map((s) => s.username).filter(Boolean)
@@ -1808,11 +2940,9 @@ function ChatPage(props: ChatPageProps) {
       if (result.success && result.sessions) {
         // 确保 sessions 是数组
         const sessionsArray = Array.isArray(result.sessions) ? result.sessions : []
-        const nextSessions = options?.silent ? mergeSessions(sessionsArray) : sessionsArray
+        const nextSessions = mergeSessions(sessionsArray)
         // 确保 nextSessions 也是数组
         if (Array.isArray(nextSessions)) {
-
-
           setSessions(nextSessions)
           sessionsRef.current = nextSessions
           persistSessionListCache(scope, nextSessions)
@@ -1821,11 +2951,12 @@ function ChatPage(props: ChatPageProps) {
           void enrichSessionsContactInfo(nextSessions)
         } else {
           console.error('mergeSessions returned non-array:', nextSessions)
-          setSessions(sessionsArray)
-          sessionsRef.current = sessionsArray
-          persistSessionListCache(scope, sessionsArray)
-          void hydrateSessionStatuses(sessionsArray)
-          void enrichSessionsContactInfo(sessionsArray)
+          const fallbackSessions = sessionsArray.map((session) => mergeSessionContactPresentation(session))
+          setSessions(fallbackSessions)
+          sessionsRef.current = fallbackSessions
+          persistSessionListCache(scope, fallbackSessions)
+          void hydrateSessionStatuses(fallbackSessions)
+          void enrichSessionsContactInfo(fallbackSessions)
         }
       } else if (!result.success) {
         setConnectionError(result.error || '获取会话失败')
@@ -1842,104 +2973,101 @@ function ChatPage(props: ChatPageProps) {
     }
   }
 
-  // 分批异步加载联系人信息（优化性能：防止重复加载，滚动时暂停，只在空闲时加载）
+  // 分批异步加载联系人信息（优化：缓存优先 + 可持续队列 + 首屏优先批次）
   const enrichSessionsContactInfo = async (sessions: ChatSession[]) => {
-    if (sessions.length === 0) return
+    if (Array.isArray(sessions) && sessions.length > 0) {
+      const now = Date.now()
+      for (const session of sessions) {
+        const username = String(session.username || '').trim()
+        if (!username || isFoldPlaceholderSession(username)) continue
 
-    // 防止重复加载
-    if (isEnrichingRef.current) {
+        const profileCache = sessionContactProfileCacheRef.current
+        const cachedProfile = profileCache.get(username)
+        if (cachedProfile && now - cachedProfile.updatedAt > SESSION_CONTACT_PROFILE_CACHE_TTL_MS) {
+          profileCache.delete(username)
+        }
 
-      return
+        const hasAvatar = Boolean(normalizeSearchAvatarUrl(session.avatarUrl))
+        const hasDisplayName = Boolean(resolveSessionDisplayName(session.displayName, username))
+        if (hasAvatar && hasDisplayName) continue
+
+        const profile = profileCache.get(username)
+        const profileHasAvatar = Boolean(normalizeSearchAvatarUrl(profile?.avatarUrl))
+        const profileHasDisplayName = Boolean(resolveSessionDisplayName(profile?.displayName, username))
+        if (profileHasAvatar && profileHasDisplayName) continue
+
+        const lastAttemptAt = sessionContactEnrichAttemptAtRef.current.get(username) || 0
+        if (now - lastAttemptAt < SESSION_CONTACT_PROFILE_RETRY_INTERVAL_MS) continue
+
+        pendingSessionContactEnrichRef.current.add(username)
+      }
     }
+
+    if (pendingSessionContactEnrichRef.current.size === 0) return
+    if (isEnrichingRef.current) return
 
     isEnrichingRef.current = true
     enrichCancelledRef.current = false
-
-
     const totalStart = performance.now()
-
-    // 移除初始 500ms 延迟，让后台加载与 UI 渲染并行
-
-    // 检查是否被取消
-    if (enrichCancelledRef.current) {
-      isEnrichingRef.current = false
-      return
-    }
+    const batchSize = 8
+    let processedBatchCount = 0
 
     try {
-      // 找出需要加载联系人信息的会话（没有头像或者没有显示名称的）
-      const needEnrich = sessions.filter(s => !s.avatarUrl || !s.displayName || s.displayName === s.username)
-      if (needEnrich.length === 0) {
-
-        isEnrichingRef.current = false
-        return
-      }
-
-
-
-      // 批量补齐联系人，平衡吞吐和 UI 流畅性
-      const batchSize = 8
-      let loadedCount = 0
-
-      for (let i = 0; i < needEnrich.length; i += batchSize) {
-        // 如果正在滚动，暂停加载
+      while (!enrichCancelledRef.current && pendingSessionContactEnrichRef.current.size > 0) {
         if (isScrollingRef.current) {
-
-          // 等待滚动结束
           while (isScrollingRef.current && !enrichCancelledRef.current) {
             await new Promise(resolve => setTimeout(resolve, 120))
           }
-          if (enrichCancelledRef.current) break
         }
-
-        // 检查是否被取消
         if (enrichCancelledRef.current) break
 
+        const usernames = Array.from(pendingSessionContactEnrichRef.current).slice(0, batchSize)
+        if (usernames.length === 0) break
+        usernames.forEach((username) => pendingSessionContactEnrichRef.current.delete(username))
+
+        const attemptAt = Date.now()
+        usernames.forEach((username) => sessionContactEnrichAttemptAtRef.current.set(username, attemptAt))
+
         const batchStart = performance.now()
-        const batch = needEnrich.slice(i, i + batchSize)
-        const usernames = batch.map(s => s.username)
+        const shouldRunImmediately = processedBatchCount < 2
+        if (shouldRunImmediately) {
+          await loadContactInfoBatch(usernames)
+        } else {
+          await new Promise<void>((resolve) => {
+            scheduleWhenIdle(() => {
+              void loadContactInfoBatch(usernames).finally(resolve)
+            }, { timeout: 700, fallbackDelay: 80 })
+          })
+        }
+        processedBatchCount += 1
 
-        // 使用 requestIdleCallback 延迟执行，避免阻塞UI
-        await new Promise<void>((resolve) => {
-          if ('requestIdleCallback' in window) {
-            window.requestIdleCallback(() => {
-              void loadContactInfoBatch(usernames).then(() => resolve())
-            }, { timeout: 700 })
-          } else {
-            setTimeout(() => {
-              void loadContactInfoBatch(usernames).then(() => resolve())
-            }, 80)
-          }
-        })
-
-        loadedCount += batch.length
         const batchTime = performance.now() - batchStart
         if (batchTime > 200) {
-          console.warn(`[性能监控] 批次 ${Math.floor(i / batchSize) + 1}/${Math.ceil(needEnrich.length / batchSize)} 耗时: ${batchTime.toFixed(2)}ms (已加载: ${loadedCount}/${needEnrich.length})`)
+          console.warn(`[性能监控] 联系人批次 ${processedBatchCount} 耗时: ${batchTime.toFixed(2)}ms, batch=${usernames.length}`)
         }
 
-        // 批次间延迟，给UI更多时间（DLL调用可能阻塞，需要更长的延迟）
-        if (i + batchSize < needEnrich.length && !enrichCancelledRef.current) {
-          const delay = isScrollingRef.current ? 260 : 120
+        if (!enrichCancelledRef.current && pendingSessionContactEnrichRef.current.size > 0) {
+          const delay = isScrollingRef.current ? 220 : 90
           await new Promise(resolve => setTimeout(resolve, delay))
         }
       }
 
       const totalTime = performance.now() - totalStart
-      if (!enrichCancelledRef.current) {
-
-      } else {
-
+      if (totalTime > 500) {
+        console.info(`[性能监控] 联系人补齐总耗时: ${totalTime.toFixed(2)}ms`)
       }
     } catch (e) {
       console.error('加载联系人信息失败:', e)
     } finally {
       isEnrichingRef.current = false
+      if (!enrichCancelledRef.current && pendingSessionContactEnrichRef.current.size > 0) {
+        void enrichSessionsContactInfo([])
+      }
     }
   }
 
   // 联系人信息更新队列（防抖批量更新，避免频繁重渲染）
-  const contactUpdateQueueRef = useRef<Map<string, { displayName?: string; avatarUrl?: string }>>(new Map())
+  const contactUpdateQueueRef = useRef<Map<string, { displayName?: string; avatarUrl?: string; alias?: string }>>(new Map())
   const contactUpdateTimerRef = useRef<number | null>(null)
   const lastUpdateTimeRef = useRef(0)
 
@@ -1973,12 +3101,14 @@ function ChatPage(props: ChatPageProps) {
         if (update) {
           const newDisplayName = update.displayName || session.displayName || session.username
           const newAvatarUrl = update.avatarUrl || session.avatarUrl
-          if (newDisplayName !== session.displayName || newAvatarUrl !== session.avatarUrl) {
+          const newAlias = update.alias || session.alias
+          if (newDisplayName !== session.displayName || newAvatarUrl !== session.avatarUrl || newAlias !== session.alias) {
             hasChanges = true
             return {
               ...session,
               displayName: newDisplayName,
-              avatarUrl: newAvatarUrl
+              avatarUrl: newAvatarUrl,
+              alias: newAlias
             }
           }
         }
@@ -1988,6 +3118,7 @@ function ChatPage(props: ChatPageProps) {
       if (hasChanges) {
         const updateStart = performance.now()
         setSessions(updatedSessions)
+        sessionsRef.current = updatedSessions
         lastUpdateTimeRef.current = Date.now()
         const updateTime = performance.now() - updateStart
         if (updateTime > 50) {
@@ -2004,18 +3135,18 @@ function ChatPage(props: ChatPageProps) {
   const loadContactInfoBatch = async (usernames: string[]) => {
     const startTime = performance.now()
     try {
-      // 在 DLL 调用前让出控制权（使用 setTimeout 0 代替 setImmediate）
+      // 在数据服务调用前让出控制权（使用 setTimeout 0 代替 setImmediate）
       await new Promise(resolve => setTimeout(resolve, 0))
 
       const dllStart = performance.now()
       const result = await window.electronAPI.chat.enrichSessionsContactInfo(usernames) as {
         success: boolean
-        contacts?: Record<string, { displayName?: string; avatarUrl?: string }>
+        contacts?: Record<string, { displayName?: string; avatarUrl?: string; alias?: string }>
         error?: string
       }
       const dllTime = performance.now() - dllStart
 
-      // DLL 调用后再次让出控制权
+      //数据服务调用后再次让出控制权
       await new Promise(resolve => setTimeout(resolve, 0))
 
       const totalTime = performance.now() - startTime
@@ -2027,18 +3158,34 @@ function ChatPage(props: ChatPageProps) {
         // 将更新加入队列，用于侧边栏更新
         const contacts = result.contacts || {}
         for (const [username, contact] of Object.entries(contacts)) {
-          contactUpdateQueueRef.current.set(username, contact)
+          const normalizedDisplayName = resolveSessionDisplayName(contact.displayName, username) || contact.displayName
+          const normalizedAvatarUrl = normalizeSearchAvatarUrl(contact.avatarUrl)
+          const normalizedAlias = normalizeSearchIdentityText(contact.alias)
+          contactUpdateQueueRef.current.set(username, {
+            displayName: normalizedDisplayName,
+            avatarUrl: normalizedAvatarUrl,
+            alias: normalizedAlias
+          })
+
+          if (normalizedDisplayName || normalizedAvatarUrl || normalizedAlias) {
+            sessionContactProfileCacheRef.current.set(username, {
+              displayName: normalizedDisplayName,
+              avatarUrl: normalizedAvatarUrl,
+              alias: normalizedAlias,
+              updatedAt: Date.now()
+            })
+          }
 
           // 如果是自己的信息且当前个人头像为空，同步更新
-          if (myWxid && username === myWxid && contact.avatarUrl && !myAvatarUrl) {
+          if (myWxid && username === myWxid && normalizedAvatarUrl && !myAvatarUrl) {
 
-            setMyAvatarUrl(contact.avatarUrl)
+            setMyAvatarUrl(normalizedAvatarUrl)
           }
 
           // 【核心优化】同步更新全局发送者头像缓存，供 MessageBubble 使用
           senderAvatarCache.set(username, {
-            avatarUrl: contact.avatarUrl,
-            displayName: contact.displayName
+            avatarUrl: normalizedAvatarUrl,
+            displayName: normalizedDisplayName
           })
         }
         // 触发批量更新
@@ -2093,7 +3240,11 @@ function ChatPage(props: ChatPageProps) {
           flashNewMessages(newOnes.map(getMessageKey))
           // 滚动到底部
           requestAnimationFrame(() => {
-            if (messageListRef.current) {
+            const latestMessages = useChatStore.getState().messages || []
+            const lastIndex = latestMessages.length - 1
+            if (lastIndex >= 0 && messageVirtuosoRef.current) {
+              messageVirtuosoRef.current.scrollToIndex({ index: lastIndex, align: 'end', behavior: 'auto' })
+            } else if (messageListRef.current) {
               messageListRef.current.scrollTop = messageListRef.current.scrollHeight
             }
           })
@@ -2142,7 +3293,11 @@ function ChatPage(props: ChatPageProps) {
         flashNewMessages(newMessages.map(getMessageKey))
         // 滚动到底部
         requestAnimationFrame(() => {
-          if (messageListRef.current) {
+          const currentMessages = useChatStore.getState().messages || []
+          const lastIndex = currentMessages.length - 1
+          if (lastIndex >= 0 && messageVirtuosoRef.current) {
+            messageVirtuosoRef.current.scrollToIndex({ index: lastIndex, align: 'end', behavior: 'auto' })
+          } else if (messageListRef.current) {
             messageListRef.current.scrollTop = messageListRef.current.scrollHeight
           }
         })
@@ -2173,18 +3328,31 @@ function ChatPage(props: ChatPageProps) {
     }
 
     if (defer) {
-      if ('requestIdleCallback' in window) {
-        window.requestIdleCallback(() => {
-          runWarmup()
-        }, { timeout: 1200 })
-      } else {
-        globalThis.setTimeout(runWarmup, 120)
-      }
+      scheduleWhenIdle(runWarmup, { timeout: 1200, fallbackDelay: 120 })
       return
     }
 
     runWarmup()
   }, [loadContactInfoBatch])
+
+  const scheduleGroupSenderWarmup = useCallback((usernames: string[], defer = false) => {
+    if (!Array.isArray(usernames) || usernames.length === 0) return
+    const run = () => warmupGroupSenderProfiles(usernames, false)
+    if (!defer && !isMessageListScrollingRef.current) {
+      run()
+      return
+    }
+
+    const runWhenIdle = () => {
+      if (isMessageListScrollingRef.current) {
+        window.setTimeout(runWhenIdle, MESSAGE_LIST_SCROLL_IDLE_MS)
+        return
+      }
+      run()
+    }
+
+    scheduleWhenIdle(runWhenIdle, { timeout: 1200, fallbackDelay: MESSAGE_LIST_SCROLL_IDLE_MS })
+  }, [warmupGroupSenderProfiles])
 
   // 加载消息
   const loadMessages = async (
@@ -2195,11 +3363,15 @@ function ChatPage(props: ChatPageProps) {
     ascending = false,
     options: LoadMessagesOptions = {}
   ) => {
+    const isPrependHistoryLoad = offset > 0 && !ascending
+    if (isPrependHistoryLoad) {
+      prependingHistoryRef.current = true
+    }
     const listEl = messageListRef.current
     const session = sessionMapRef.current.get(sessionId)
     const unreadCount = session?.unreadCount ?? 0
 
-    let messageLimit = currentBatchSizeRef.current
+    let messageLimit: number
 
     if (offset === 0) {
       const preferredLimit = Number.isFinite(options.forceInitialLimit)
@@ -2214,6 +3386,8 @@ function ChatPage(props: ChatPageProps) {
 
 
     if (offset === 0) {
+      suppressScrollToBottomButton(260)
+      setShowScrollToBottom(false)
       setLoadingMessages(true)
       // 切会话时保留旧内容作为过渡，避免大面积闪烁
       setHasInitialMessages(true)
@@ -2221,7 +3395,12 @@ function ChatPage(props: ChatPageProps) {
       setLoadingMore(true)
     }
 
-    // 记录加载前的第一条消息元素
+    const visibleRange = visibleMessageRangeRef.current
+    const visibleStartIndex = Math.min(
+      Math.max(visibleRange.startIndex, 0),
+      Math.max(messages.length - 1, 0)
+    )
+    // 记录加载前的第一条消息元素（非虚拟列表回退路径）
     const firstMsgEl = listEl?.querySelector('.message-wrapper') as HTMLElement | null
 
     try {
@@ -2233,7 +3412,17 @@ function ChatPage(props: ChatPageProps) {
         success: boolean;
         messages?: Message[];
         hasMore?: boolean;
+        nextOffset?: number;
         error?: string
+      }
+      const isStaleSwitchRequest = Boolean(
+        options.switchRequestSeq && options.switchRequestSeq !== sessionSwitchRequestSeqRef.current
+      )
+      const isStaleInSessionJumpRequest = Boolean(
+        options.inSessionJumpRequestSeq && options.inSessionJumpRequestSeq !== inSessionResultJumpRequestSeqRef.current
+      )
+      if (isStaleSwitchRequest || isStaleInSessionJumpRequest) {
+        return
       }
       if (options.switchRequestSeq && options.switchRequestSeq !== sessionSwitchRequestSeqRef.current) {
         return
@@ -2242,58 +3431,92 @@ function ChatPage(props: ChatPageProps) {
         return
       }
       if (result.success && result.messages) {
+        const resultMessages = result.messages
         if (offset === 0) {
-          setMessages(result.messages)
-          persistSessionPreviewCache(sessionId, result.messages)
-          if (result.messages.length === 0) {
+          setMessages(resultMessages)
+          persistSessionPreviewCache(sessionId, resultMessages)
+          if (resultMessages.length === 0) {
             setNoMessageTable(true)
             setHasMoreMessages(false)
           }
 
           // 群聊发送者信息补齐改为非阻塞执行，避免影响首屏切换
           const isGroup = sessionId.includes('@chatroom')
-          if (isGroup && result.messages.length > 0) {
-            const unknownSenders = [...new Set(result.messages
+          if (isGroup && resultMessages.length > 0) {
+            const unknownSenders = [...new Set(resultMessages
               .filter(m => m.isSend !== 1 && m.senderUsername && !senderAvatarCache.has(m.senderUsername))
               .map(m => m.senderUsername as string)
             )]
             if (unknownSenders.length > 0) {
-              warmupGroupSenderProfiles(unknownSenders, options.deferGroupSenderWarmup === true)
+              scheduleGroupSenderWarmup(unknownSenders, options.deferGroupSenderWarmup === true)
             }
           }
 
           // 日期跳转时滚动到顶部，否则滚动到底部
           requestAnimationFrame(() => {
-            if (messageListRef.current) {
-              if (isDateJumpRef.current) {
+            if (isDateJumpRef.current) {
+              if (messageVirtuosoRef.current && resultMessages.length > 0) {
+                messageVirtuosoRef.current.scrollToIndex({ index: 0, align: 'start', behavior: 'auto' })
+              } else if (messageListRef.current) {
                 messageListRef.current.scrollTop = 0
-                isDateJumpRef.current = false
-              } else {
-                messageListRef.current.scrollTop = messageListRef.current.scrollHeight
               }
+              isDateJumpRef.current = false
+              return
+            }
+
+            const lastIndex = resultMessages.length - 1
+            if (lastIndex >= 0 && messageVirtuosoRef.current) {
+              messageVirtuosoRef.current.scrollToIndex({ index: lastIndex, align: 'end', behavior: 'auto' })
+            } else if (messageListRef.current) {
+              messageListRef.current.scrollTop = messageListRef.current.scrollHeight
             }
           })
         } else {
-          appendMessages(result.messages, true)
+          const existingMessageKeys = messageKeySetRef.current
+          const incomingSeen = new Set<string>()
+          let prependedInsertedCount = 0
+          for (const row of resultMessages) {
+            const key = getMessageKey(row)
+            if (incomingSeen.has(key)) continue
+            incomingSeen.add(key)
+            if (!existingMessageKeys.has(key)) {
+              prependedInsertedCount += 1
+            }
+          }
+
+          suppressAutoScrollOnNextMessageGrowthRef.current = true
+          appendMessages(resultMessages, true)
 
           // 加载更多也同样处理发送者信息预取
           const isGroup = sessionId.includes('@chatroom')
           if (isGroup) {
-            const unknownSenders = [...new Set(result.messages
+            const unknownSenders = [...new Set(resultMessages
               .filter(m => m.isSend !== 1 && m.senderUsername && !senderAvatarCache.has(m.senderUsername))
               .map(m => m.senderUsername as string)
             )]
             if (unknownSenders.length > 0) {
-              warmupGroupSenderProfiles(unknownSenders, false)
+              scheduleGroupSenderWarmup(unknownSenders, false)
             }
           }
 
-          // 加载更多后保持位置：让之前的第一条消息保持在原来的视觉位置
-          if (firstMsgEl && listEl) {
-            requestAnimationFrame(() => {
+          // 加载更早消息后保持视口锚点，避免跳屏
+          requestAnimationFrame(() => {
+            if (messageVirtuosoRef.current) {
+              const latestMessages = useChatStore.getState().messages || []
+              const anchorIndex = Math.min(
+                Math.max(visibleStartIndex + prependedInsertedCount, 0),
+                Math.max(latestMessages.length - 1, 0)
+              )
+              if (latestMessages.length > 0) {
+                messageVirtuosoRef.current.scrollToIndex({ index: anchorIndex, align: 'start', behavior: 'auto' })
+              }
+              return
+            }
+
+            if (firstMsgEl && listEl) {
               listEl.scrollTop = firstMsgEl.offsetTop - 80
-            })
-          }
+            }
+          })
         }
         // 日期跳转(ascending=true)：不往上加载更早的，往下加载更晚的
         if (ascending) {
@@ -2309,7 +3532,10 @@ function ChatPage(props: ChatPageProps) {
             }
           }
         }
-        setCurrentOffset(offset + result.messages.length)
+        const nextOffset = typeof result.nextOffset === 'number'
+          ? result.nextOffset
+          : offset + resultMessages.length
+        setCurrentOffset(nextOffset)
       } else if (!result.success) {
         setNoMessageTable(true)
         setHasMoreMessages(false)
@@ -2322,6 +3548,11 @@ function ChatPage(props: ChatPageProps) {
         setMessages([])
       }
     } finally {
+      if (isPrependHistoryLoad) {
+        requestAnimationFrame(() => {
+          prependingHistoryRef.current = false
+        })
+      }
       setLoadingMessages(false)
       setLoadingMore(false)
       if (offset === 0 && pendingSessionLoadRef.current === sessionId) {
@@ -2329,13 +3560,21 @@ function ChatPage(props: ChatPageProps) {
           pendingSessionLoadRef.current = null
           initialLoadRequestedSessionRef.current = null
           setIsSessionSwitching(false)
+
+          // 处理从全局搜索跳转过来的情况
+          const pendingSearch = pendingInSessionSearchRef.current
+          if (pendingSearch?.sessionId === sessionId) {
+            pendingInSessionSearchRef.current = null
+            void applyPendingInSessionSearch(sessionId, pendingSearch, options.switchRequestSeq)
+          }
         }
       }
     }
   }
 
-  const handleJumpDateSelect = useCallback((date: Date) => {
-    if (!currentSessionId) return
+  const handleJumpDateSelect = useCallback((date: Date, options: { sessionId?: string; switchRequestSeq?: number } = {}) => {
+    const targetSessionId = String(options.sessionId || currentSessionRef.current || currentSessionId || '').trim()
+    if (!targetSessionId) return
     const targetDate = new Date(date)
     const end = Math.floor(targetDate.setHours(23, 59, 59, 999) / 1000)
     // 日期跳转采用“锚点定位”而非“当天过滤”：
@@ -2344,9 +3583,397 @@ function ChatPage(props: ChatPageProps) {
     setCurrentOffset(0)
     setJumpStartTime(0)
     setJumpEndTime(end)
+    suppressAutoLoadLaterRef.current = true
     setShowJumpPopover(false)
-    void loadMessages(currentSessionId, 0, 0, end, false)
+    void loadMessages(targetSessionId, 0, 0, end, false, {
+      switchRequestSeq: options.switchRequestSeq,
+      forceInitialLimit: 120
+    })
   }, [currentSessionId, loadMessages])
+
+  const cancelInSessionSearchTasks = useCallback(() => {
+    inSessionSearchGenRef.current += 1
+    if (inSessionSearchTimerRef.current) {
+      clearTimeout(inSessionSearchTimerRef.current)
+      inSessionSearchTimerRef.current = null
+    }
+    setInSessionSearching(false)
+    setInSessionEnriching(false)
+  }, [])
+
+  const cancelInSessionSearchJump = useCallback(() => {
+    inSessionResultJumpRequestSeqRef.current += 1
+    if (inSessionResultJumpTimerRef.current) {
+      window.clearTimeout(inSessionResultJumpTimerRef.current)
+      inSessionResultJumpTimerRef.current = null
+    }
+  }, [])
+
+  const resolveSearchSessionContext = useCallback((sessionId?: string) => {
+    const normalizedSessionId = String(sessionId || currentSessionRef.current || currentSessionId || '').trim()
+    const currentSearchSession = normalizedSessionId && Array.isArray(sessions)
+      ? sessions.find(session => session.username === normalizedSessionId)
+      : undefined
+    const resolvedSession = currentSearchSession
+      ? (
+          standaloneSessionWindow &&
+          normalizedInitialSessionId &&
+          currentSearchSession.username === normalizedInitialSessionId
+            ? {
+                ...currentSearchSession,
+                displayName: currentSearchSession.displayName || fallbackDisplayName || currentSearchSession.username,
+                avatarUrl: currentSearchSession.avatarUrl || fallbackAvatarUrl || undefined
+              }
+            : currentSearchSession
+        )
+      : (
+          normalizedSessionId
+            ? {
+                username: normalizedSessionId,
+                displayName: fallbackDisplayName || normalizedSessionId,
+                avatarUrl: fallbackAvatarUrl || undefined
+              } as ChatSession
+            : undefined
+        )
+    const isGroupSearchSession = Boolean(
+      resolvedSession && (
+        isGroupChatSession(resolvedSession.username) ||
+        (
+          standaloneSessionWindow &&
+          resolvedSession.username === normalizedInitialSessionId &&
+          normalizedStandaloneInitialContactType === 'group'
+        )
+      )
+    )
+    const isDirectSearchSession = Boolean(
+      resolvedSession &&
+      isSingleContactSession(resolvedSession.username) &&
+      !isGroupSearchSession
+    )
+    return {
+      normalizedSessionId,
+      resolvedSession,
+      isDirectSearchSession,
+      isGroupSearchSession,
+      resolvedSessionDisplayName: normalizeSearchIdentityText(resolvedSession?.displayName) || normalizedSessionId || undefined,
+      resolvedSessionAvatarUrl: normalizeSearchAvatarUrl(resolvedSession?.avatarUrl)
+    }
+  }, [
+    currentSessionId,
+    fallbackAvatarUrl,
+    fallbackDisplayName,
+    normalizedInitialSessionId,
+    normalizedStandaloneInitialContactType,
+    sessions,
+    standaloneSessionWindow,
+    isGroupChatSession
+  ])
+
+  const hydrateInSessionSearchResults = useCallback((rawMessages: Message[], sessionId?: string) => {
+    const sortedMessages = sortMessagesByCreateTimeDesc(rawMessages || [])
+    if (sortedMessages.length === 0) return []
+
+    const {
+      normalizedSessionId,
+      isDirectSearchSession,
+      isGroupSearchSession,
+      resolvedSessionDisplayName,
+      resolvedSessionAvatarUrl
+    } = resolveSearchSessionContext(sessionId)
+    const resolvedSessionUsernameFallback = resolveSearchSenderUsernameFallback(normalizedSessionId)
+
+    return sortedMessages.map((message) => {
+      const senderUsername = normalizeSearchIdentityText(message.senderUsername) || message.senderUsername
+      const inferredSelfFromSender = isGroupSearchSession && isCurrentUserSearchIdentity(senderUsername, myWxid)
+      const senderDisplayName = resolveSearchSenderDisplayName(
+        message.senderDisplayName,
+        senderUsername,
+        normalizedSessionId
+      )
+      const senderUsernameFallback = resolveSearchSenderUsernameFallback(senderUsername)
+      const senderAvatarUrl = normalizeSearchAvatarUrl(message.senderAvatarUrl)
+      const nextIsSend = inferredSelfFromSender ? 1 : message.isSend
+      const nextSenderDisplayName = nextIsSend === 1
+        ? (senderDisplayName || '我')
+        : (
+            senderDisplayName ||
+            (isDirectSearchSession ? resolvedSessionDisplayName : undefined) ||
+            senderUsernameFallback ||
+            (isDirectSearchSession ? resolvedSessionUsernameFallback : undefined) ||
+            '未知'
+          )
+      const nextSenderAvatarUrl = nextIsSend === 1
+        ? (senderAvatarUrl || myAvatarUrl)
+        : (senderAvatarUrl || (isDirectSearchSession ? resolvedSessionAvatarUrl : undefined))
+
+      if (
+        senderUsername === message.senderUsername &&
+        nextIsSend === message.isSend &&
+        nextSenderDisplayName === message.senderDisplayName &&
+        nextSenderAvatarUrl === message.senderAvatarUrl
+      ) {
+        return message
+      }
+
+      return {
+        ...message,
+        isSend: nextIsSend,
+        senderUsername,
+        senderDisplayName: nextSenderDisplayName,
+        senderAvatarUrl: nextSenderAvatarUrl
+      }
+    })
+  }, [currentSessionId, myAvatarUrl, myWxid, resolveSearchSessionContext])
+
+  const enrichMessagesWithSenderProfiles = useCallback(async (rawMessages: Message[], sessionId?: string) => {
+    let messages = hydrateInSessionSearchResults(rawMessages, sessionId)
+    if (messages.length === 0) return []
+
+    const sessionContext = resolveSearchSessionContext(sessionId)
+    const { normalizedSessionId, isDirectSearchSession, isGroupSearchSession } = sessionContext
+    let resolvedSessionDisplayName = sessionContext.resolvedSessionDisplayName
+    let resolvedSessionAvatarUrl = sessionContext.resolvedSessionAvatarUrl
+
+    if (
+      normalizedSessionId &&
+      isDirectSearchSession &&
+      (
+        !resolvedSessionAvatarUrl ||
+        !resolvedSessionDisplayName ||
+        resolvedSessionDisplayName === normalizedSessionId
+      )
+    ) {
+      try {
+        const result = await window.electronAPI.chat.enrichSessionsContactInfo([normalizedSessionId])
+        const profile = result.success && result.contacts ? result.contacts[normalizedSessionId] : undefined
+        const profileDisplayName = resolveSearchSenderDisplayName(
+          profile?.displayName,
+          normalizedSessionId,
+          normalizedSessionId
+        )
+        const profileAvatarUrl = normalizeSearchAvatarUrl(profile?.avatarUrl)
+        if (profileDisplayName) {
+          resolvedSessionDisplayName = profileDisplayName
+        }
+        if (profileAvatarUrl) {
+          resolvedSessionAvatarUrl = profileAvatarUrl
+        }
+        if (profileDisplayName || profileAvatarUrl) {
+          messages = messages.map((message) => {
+            if (message.isSend === 1) return message
+            const preservedDisplayName = resolveSearchSenderDisplayName(
+              message.senderDisplayName,
+              message.senderUsername,
+              normalizedSessionId
+            )
+            return {
+              ...message,
+              senderDisplayName: preservedDisplayName ||
+                profileDisplayName ||
+                resolvedSessionDisplayName ||
+                resolveSearchSenderUsernameFallback(message.senderUsername) ||
+                message.senderDisplayName,
+              senderAvatarUrl: normalizeSearchAvatarUrl(message.senderAvatarUrl) || profileAvatarUrl || resolvedSessionAvatarUrl || message.senderAvatarUrl
+            }
+          })
+        }
+      } catch {
+        // ignore session profile enrichment errors and keep raw search results usable
+      }
+    }
+
+    if (normalizedSessionId && isGroupSearchSession) {
+      const missingSenderMessages = messages.filter((message) => {
+        if (message.localId <= 0) return false
+        if (message.isSend === 1) return false
+        return !normalizeSearchIdentityText(message.senderUsername)
+      })
+
+      if (missingSenderMessages.length > 0) {
+        const messageByLocalId = new Map<number, Message>()
+        for (let index = 0; index < missingSenderMessages.length; index += 8) {
+          const batch = missingSenderMessages.slice(index, index + 8)
+          const detailResults = await Promise.allSettled(
+            batch.map(async (message) => {
+              const result = await window.electronAPI.chat.getMessage(normalizedSessionId, message.localId)
+              if (!result.success || !result.message) return null
+              return {
+                localId: message.localId,
+                message: hydrateInSessionSearchResults([{
+                  ...message,
+                  ...result.message,
+                  parsedContent: message.parsedContent || result.message.parsedContent,
+                  rawContent: message.rawContent || result.message.rawContent,
+                  content: message.content || result.message.content
+                } as Message], normalizedSessionId)[0]
+              }
+            })
+          )
+
+          for (const detail of detailResults) {
+            if (detail.status !== 'fulfilled' || !detail.value?.message) continue
+            messageByLocalId.set(detail.value.localId, detail.value.message)
+          }
+        }
+
+        if (messageByLocalId.size > 0) {
+          messages = messages.map(message => messageByLocalId.get(message.localId) || message)
+        }
+      }
+    }
+
+    const profileMap = new Map<string, { avatarUrl?: string; displayName?: string }>()
+    const pendingLoads: Array<Promise<void>> = []
+    const missingUsernames: string[] = []
+
+    const usernames = [...new Set(
+      messages
+        .map((message) => normalizeSearchIdentityText(message.senderUsername))
+        .filter((username): username is string => Boolean(username))
+    )]
+
+    for (const username of usernames) {
+      const cached = senderAvatarCache.get(username)
+      if (cached) {
+        profileMap.set(username, cached)
+        continue
+      }
+
+      const pending = senderAvatarLoading.get(username)
+      if (pending) {
+        pendingLoads.push(
+          pending.then((profile) => {
+            if (profile) {
+              profileMap.set(username, profile)
+            }
+          }).catch(() => {})
+        )
+        continue
+      }
+
+      missingUsernames.push(username)
+    }
+
+    if (pendingLoads.length > 0) {
+      await Promise.allSettled(pendingLoads)
+    }
+
+    if (missingUsernames.length > 0) {
+      try {
+        const result = await window.electronAPI.chat.enrichSessionsContactInfo(missingUsernames)
+        if (result.success && result.contacts) {
+          for (const [username, profile] of Object.entries(result.contacts)) {
+            const normalizedProfile = {
+              avatarUrl: profile.avatarUrl,
+              displayName: profile.displayName
+            }
+            profileMap.set(username, normalizedProfile)
+            senderAvatarCache.set(username, normalizedProfile)
+          }
+        }
+      } catch {
+        // ignore sender enrichment errors and keep raw search results usable
+      }
+    }
+
+    return messages.map((message) => {
+      const sender = normalizeSearchIdentityText(message.senderUsername)
+      const profile = sender ? profileMap.get(sender) : undefined
+      const inferredSelfFromSender = isGroupSearchSession && isCurrentUserSearchIdentity(sender, myWxid)
+      const profileDisplayName = resolveSearchSenderDisplayName(
+        profile?.displayName,
+        sender,
+        normalizedSessionId
+      )
+      const currentSenderDisplayName = resolveSearchSenderDisplayName(
+        message.senderDisplayName,
+        sender,
+        normalizedSessionId
+      )
+      const senderUsernameFallback = resolveSearchSenderUsernameFallback(sender)
+      const sessionUsernameFallback = resolveSearchSenderUsernameFallback(normalizedSessionId)
+      const currentSenderAvatarUrl = normalizeSearchAvatarUrl(message.senderAvatarUrl)
+      const nextIsSend = inferredSelfFromSender ? 1 : message.isSend
+      const nextSenderDisplayName = nextIsSend === 1
+        ? (currentSenderDisplayName || profileDisplayName || '我')
+        : (
+            profileDisplayName ||
+            currentSenderDisplayName ||
+            (isDirectSearchSession ? resolvedSessionDisplayName : undefined) ||
+            senderUsernameFallback ||
+            (isDirectSearchSession ? sessionUsernameFallback : undefined) ||
+            '未知'
+          )
+      const nextSenderAvatarUrl = nextIsSend === 1
+        ? (currentSenderAvatarUrl || myAvatarUrl || normalizeSearchAvatarUrl(profile?.avatarUrl))
+        : (
+            currentSenderAvatarUrl ||
+            normalizeSearchAvatarUrl(profile?.avatarUrl) ||
+            (isDirectSearchSession ? resolvedSessionAvatarUrl : undefined)
+          )
+
+      if (
+        sender === message.senderUsername &&
+        nextIsSend === message.isSend &&
+        nextSenderDisplayName === message.senderDisplayName &&
+        nextSenderAvatarUrl === message.senderAvatarUrl
+      ) {
+        return message
+      }
+
+      return {
+        ...message,
+        isSend: nextIsSend,
+        senderUsername: sender || message.senderUsername,
+        senderDisplayName: nextSenderDisplayName,
+        senderAvatarUrl: nextSenderAvatarUrl
+      }
+    })
+  }, [
+    currentSessionId,
+    hydrateInSessionSearchResults,
+    myAvatarUrl,
+    myWxid,
+    resolveSearchSessionContext
+  ])
+
+  const applyPendingInSessionSearch = useCallback(async (
+    sessionId: string,
+    payload: PendingInSessionSearchPayload,
+    switchRequestSeq?: number
+  ) => {
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId) return
+    if (payload.sessionId !== normalizedSessionId) return
+    if (switchRequestSeq && switchRequestSeq !== sessionSwitchRequestSeqRef.current) return
+    if (currentSessionRef.current !== normalizedSessionId) return
+
+    const immediateResults = hydrateInSessionSearchResults(payload.results || [], normalizedSessionId)
+    setShowInSessionSearch(true)
+    setInSessionQuery(payload.keyword)
+    setInSessionSearchError(null)
+    setInSessionResults(immediateResults)
+
+    if (payload.firstMsgTime > 0) {
+      handleJumpDateSelect(new Date(payload.firstMsgTime * 1000), {
+        sessionId: normalizedSessionId,
+        switchRequestSeq
+      })
+    }
+
+    setInSessionEnriching(true)
+    void enrichMessagesWithSenderProfiles(immediateResults, normalizedSessionId).then((enrichedResults) => {
+      if (switchRequestSeq && switchRequestSeq !== sessionSwitchRequestSeqRef.current) return
+      if (currentSessionRef.current !== normalizedSessionId) return
+      setInSessionResults(enrichedResults)
+    }).catch(() => {
+      // ignore sender enrichment errors and keep current search results usable
+    }).finally(() => {
+      if (switchRequestSeq && switchRequestSeq !== sessionSwitchRequestSeqRef.current) return
+      if (currentSessionRef.current !== normalizedSessionId) return
+      setInSessionEnriching(false)
+    })
+  }, [enrichMessagesWithSenderProfiles, handleJumpDateSelect, hydrateInSessionSearchResults])
 
   // 加载更晚的消息
   const loadLaterMessages = useCallback(async () => {
@@ -2408,11 +4035,26 @@ function ChatPage(props: ChatPageProps) {
   }, [appendMessages, getMessageKey])
 
   // 选择会话
-  const selectSessionById = useCallback((sessionId: string) => {
+  const selectSessionById = useCallback((sessionId: string, options: { force?: boolean } = {}) => {
     const normalizedSessionId = String(sessionId || '').trim()
-    if (!normalizedSessionId || normalizedSessionId === currentSessionId) return
+    if (!normalizedSessionId || (!options.force && normalizedSessionId === currentSessionId)) return
     const switchRequestSeq = sessionSwitchRequestSeqRef.current + 1
     sessionSwitchRequestSeqRef.current = switchRequestSeq
+    currentSessionRef.current = normalizedSessionId
+
+    const pendingSearch = pendingInSessionSearchRef.current
+    const shouldPreservePendingSearch = pendingSearch?.sessionId === normalizedSessionId
+    cancelInSessionSearchTasks()
+    cancelInSessionSearchJump()
+
+    // 清空会话内搜索状态（除非是从全局搜索跳转过来）
+    if (!shouldPreservePendingSearch) {
+      pendingInSessionSearchRef.current = null
+      setShowInSessionSearch(false)
+      setInSessionQuery('')
+      setInSessionResults([])
+      setInSessionSearchError(null)
+    }
 
     setCurrentSession(normalizedSessionId, { preserveMessages: false })
     setNoMessageTable(false)
@@ -2422,6 +4064,13 @@ function ChatPage(props: ChatPageProps) {
       pendingSessionLoadRef.current = null
       initialLoadRequestedSessionRef.current = null
       setIsSessionSwitching(false)
+
+      // 处理从全局搜索跳转过来的情况
+      if (pendingSearch?.sessionId === normalizedSessionId) {
+        pendingInSessionSearchRef.current = null
+        void applyPendingInSessionSearch(normalizedSessionId, pendingSearch, switchRequestSeq)
+      }
+
       void refreshSessionIncrementally(normalizedSessionId, switchRequestSeq)
     } else {
       pendingSessionLoadRef.current = normalizedSessionId
@@ -2457,7 +4106,10 @@ function ChatPage(props: ChatPageProps) {
     restoreSessionWindowCache,
     refreshSessionIncrementally,
     hydrateSessionPreview,
-    loadMessages
+    loadMessages,
+    cancelInSessionSearchJump,
+    cancelInSessionSearchTasks,
+    applyPendingInSessionSearch
   ])
 
   // 选择会话
@@ -2465,6 +4117,12 @@ function ChatPage(props: ChatPageProps) {
     // 点击折叠群入口，切换到折叠群视图
     if (session.username.toLowerCase().includes('placeholder_foldgroup')) {
       setFoldedView(true)
+      return
+    }
+    // 点击公众号入口，切换到公众号视图
+    if (session.username === OFFICIAL_ACCOUNTS_VIRTUAL_ID) {
+      setBizView(true)
+      setSelectedBizAccount(null) // 切入时默认不选中任何公众号
       return
     }
     selectSessionById(session.username)
@@ -2480,43 +4138,491 @@ function ChatPage(props: ChatPageProps) {
     setSearchKeyword('')
   }
 
-  // 滚动加载更多 + 显示/隐藏回到底部按钮（优化：节流，避免频繁执行）
-  const scrollTimeoutRef = useRef<number | null>(null)
-  const handleScroll = useCallback(() => {
-    if (!messageListRef.current) return
+  // 会话内搜索
+  const inSessionSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const inSessionSearchGenRef = useRef(0)
+  const handleInSessionSearch = useCallback(async (keyword: string) => {
+    setInSessionQuery(keyword)
+    if (inSessionSearchTimerRef.current) clearTimeout(inSessionSearchTimerRef.current)
+    inSessionSearchTimerRef.current = null
+    inSessionSearchGenRef.current += 1
+    if (!keyword.trim() || !currentSessionId) {
+      setInSessionResults([])
+      setInSessionSearchError(null)
+      setInSessionSearching(false)
+      setInSessionEnriching(false)
+      return
+    }
+    setInSessionSearchError(null)
+    const gen = inSessionSearchGenRef.current
+    const sid = currentSessionId
+    inSessionSearchTimerRef.current = setTimeout(async () => {
+      if (gen !== inSessionSearchGenRef.current) return
+      setInSessionSearching(true)
+      try {
+        const res = await window.electronAPI.chat.searchMessages(keyword.trim(), sid, 50, 0)
+        if (!res?.success) {
+          throw new Error(res?.error || '搜索失败')
+        }
+        if (gen !== inSessionSearchGenRef.current || currentSessionRef.current !== sid) return
+        const messages = hydrateInSessionSearchResults(res?.messages || [], sid)
+        setInSessionResults(messages)
+        setInSessionSearchError(null)
 
-    // 节流：延迟执行，避免滚动时频繁计算
-    if (scrollTimeoutRef.current) {
-      cancelAnimationFrame(scrollTimeoutRef.current)
+        setInSessionEnriching(true)
+        void enrichMessagesWithSenderProfiles(messages, sid).then((enriched) => {
+          if (gen !== inSessionSearchGenRef.current || currentSessionRef.current !== sid) return
+          setInSessionResults(enriched)
+        }).catch(() => {
+          // ignore sender enrichment errors and keep current search results usable
+        }).finally(() => {
+          if (gen !== inSessionSearchGenRef.current || currentSessionRef.current !== sid) return
+          setInSessionEnriching(false)
+        })
+      } catch (error) {
+        if (gen !== inSessionSearchGenRef.current || currentSessionRef.current !== sid) return
+        setInSessionResults([])
+        setInSessionSearchError(error instanceof Error ? error.message : String(error))
+        setInSessionEnriching(false)
+      } finally {
+        if (gen === inSessionSearchGenRef.current) setInSessionSearching(false)
+      }
+    }, 500)
+  }, [currentSessionId, enrichMessagesWithSenderProfiles, hydrateInSessionSearchResults])
+
+  const handleToggleInSessionSearch = useCallback(() => {
+    setShowInSessionSearch(v => {
+      if (v) {
+        cancelInSessionSearchTasks()
+        cancelInSessionSearchJump()
+        setInSessionQuery('')
+        setInSessionResults([])
+        setInSessionSearchError(null)
+      } else {
+        setTimeout(() => inSessionSearchRef.current?.focus(), 50)
+      }
+      return !v
+    })
+  }, [cancelInSessionSearchJump, cancelInSessionSearchTasks])
+
+  // 全局消息搜索
+  const globalMsgSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const globalMsgSearchGenRef = useRef(0)
+  const ensureGlobalMsgSearchNotStale = useCallback((gen: number) => {
+    if (gen !== globalMsgSearchGenRef.current) {
+      throw new Error(GLOBAL_MSG_SEARCH_CANCELED_ERROR)
+    }
+  }, [])
+
+  const runLegacyGlobalMsgSearch = useCallback(async (
+    keyword: string,
+    sessionList: ChatSession[],
+    gen: number
+  ): Promise<GlobalMsgSearchResult[]> => {
+    const results: GlobalMsgSearchResult[] = []
+    for (let index = 0; index < sessionList.length; index += GLOBAL_MSG_LEGACY_CONCURRENCY) {
+      ensureGlobalMsgSearchNotStale(gen)
+      const chunk = sessionList.slice(index, index + GLOBAL_MSG_LEGACY_CONCURRENCY)
+      const chunkResults = await Promise.allSettled(
+        chunk.map(async (session) => {
+          const res = await window.electronAPI.chat.searchMessages(keyword, session.username, GLOBAL_MSG_PER_SESSION_LIMIT, 0)
+          if (!res?.success) {
+            throw new Error(res?.error || `搜索失败: ${session.username}`)
+          }
+          return normalizeGlobalMsgSearchMessages(res?.messages || [], session.username)
+        })
+      )
+      ensureGlobalMsgSearchNotStale(gen)
+
+      for (const item of chunkResults) {
+        if (item.status === 'rejected') {
+          throw item.reason instanceof Error ? item.reason : new Error(String(item.reason))
+        }
+        if (item.value.length > 0) {
+          results.push(...item.value)
+        }
+      }
+    }
+    return sortMessagesByCreateTimeDesc(results)
+  }, [ensureGlobalMsgSearchNotStale])
+
+  const compareGlobalMsgSearchShadow = useCallback((
+    keyword: string,
+    stagedResults: GlobalMsgSearchResult[],
+    legacyResults: GlobalMsgSearchResult[]
+  ) => {
+    const stagedMap = buildGlobalMsgSearchSessionLocalIds(stagedResults)
+    const legacyMap = buildGlobalMsgSearchSessionLocalIds(legacyResults)
+    const stagedSessions = Object.keys(stagedMap).sort()
+    const legacySessions = Object.keys(legacyMap).sort()
+
+    let mismatch = stagedSessions.length !== legacySessions.length
+    if (!mismatch) {
+      for (let i = 0; i < stagedSessions.length; i += 1) {
+        if (stagedSessions[i] !== legacySessions[i]) {
+          mismatch = true
+          break
+        }
+      }
     }
 
-    scrollTimeoutRef.current = requestAnimationFrame(() => {
-      if (!messageListRef.current) return
+    if (!mismatch) {
+      for (const sessionId of stagedSessions) {
+        const stagedIds = stagedMap[sessionId] || []
+        const legacyIds = legacyMap[sessionId] || []
+        if (stagedIds.length !== legacyIds.length) {
+          mismatch = true
+          break
+        }
+        for (let i = 0; i < stagedIds.length; i += 1) {
+          if (stagedIds[i] !== legacyIds[i]) {
+            mismatch = true
+            break
+          }
+        }
+        if (mismatch) break
+      }
+    }
 
-      const { scrollTop, clientHeight, scrollHeight } = messageListRef.current
-
-      // 显示回到底部按钮：距离底部超过 300px
-      const distanceFromBottom = scrollHeight - scrollTop - clientHeight
-      setShowScrollToBottom(distanceFromBottom > 300)
-
-      // 预加载：当滚动到顶部 30% 区域时开始加载
-      if (!isLoadingMore && !isLoadingMessages && hasMoreMessages && currentSessionId) {
-        const threshold = clientHeight * 0.3
-        if (scrollTop < threshold) {
-          loadMessages(currentSessionId, currentOffset, jumpStartTime, jumpEndTime)
+    if (!mismatch) {
+      const stagedOrder = stagedResults.map((row) => `${row.sessionId}:${row.localId || 0}:${row.messageKey || ''}`)
+      const legacyOrder = legacyResults.map((row) => `${row.sessionId}:${row.localId || 0}:${row.messageKey || ''}`)
+      if (stagedOrder.length !== legacyOrder.length) {
+        mismatch = true
+      } else {
+        for (let i = 0; i < stagedOrder.length; i += 1) {
+          if (stagedOrder[i] !== legacyOrder[i]) {
+            mismatch = true
+            break
+          }
         }
       }
+    }
 
-      // 预加载更晚的消息
-      if (!isLoadingMore && !isLoadingMessages && hasMoreLater && currentSessionId) {
-        const threshold = clientHeight * 0.3
-        const distanceFromBottom = scrollHeight - scrollTop - clientHeight
-        if (distanceFromBottom < threshold) {
-          loadLaterMessages()
-        }
-      }
+    if (!mismatch) return
+    console.warn('[GlobalMsgSearch] shadow compare mismatch', {
+      keyword,
+      stagedSessionCount: stagedSessions.length,
+      legacySessionCount: legacySessions.length,
+      stagedResultCount: stagedResults.length,
+      legacyResultCount: legacyResults.length,
+      stagedMap,
+      legacyMap
     })
-  }, [isLoadingMore, isLoadingMessages, hasMoreMessages, hasMoreLater, currentSessionId, currentOffset, jumpStartTime, jumpEndTime, loadMessages, loadLaterMessages])
+  }, [])
+
+  const handleGlobalMsgSearch = useCallback(async (keyword: string) => {
+    const normalizedKeyword = keyword.trim()
+    setGlobalMsgQuery(keyword)
+    if (globalMsgSearchTimerRef.current) clearTimeout(globalMsgSearchTimerRef.current)
+    globalMsgSearchTimerRef.current = null
+    globalMsgSearchGenRef.current += 1
+    if (!normalizedKeyword) {
+      pendingGlobalMsgSearchReplayRef.current = null
+      globalMsgPrefixCacheRef.current = null
+      setGlobalMsgResults([])
+      setGlobalMsgSearchError(null)
+      setShowGlobalMsgSearch(false)
+      setGlobalMsgSearching(false)
+      setGlobalMsgSearchPhase('idle')
+      setGlobalMsgIsBackfilling(false)
+      setGlobalMsgAuthoritativeSessionCount(0)
+      return
+    }
+    setShowGlobalMsgSearch(true)
+    setGlobalMsgSearchError(null)
+    setGlobalMsgSearchPhase('seed')
+    setGlobalMsgIsBackfilling(false)
+    setGlobalMsgAuthoritativeSessionCount(0)
+
+    const sessionList = Array.isArray(sessionsRef.current) ? sessionsRef.current.filter((session) => String(session.username || '').trim()) : []
+    if (!isConnectedRef.current || sessionList.length === 0) {
+      pendingGlobalMsgSearchReplayRef.current = normalizedKeyword
+      setGlobalMsgResults([])
+      setGlobalMsgSearchError(null)
+      setGlobalMsgSearching(false)
+      setGlobalMsgSearchPhase('idle')
+      setGlobalMsgIsBackfilling(false)
+      setGlobalMsgAuthoritativeSessionCount(0)
+      return
+    }
+
+    pendingGlobalMsgSearchReplayRef.current = null
+    const gen = globalMsgSearchGenRef.current
+    globalMsgSearchTimerRef.current = setTimeout(async () => {
+      if (gen !== globalMsgSearchGenRef.current) return
+      setGlobalMsgSearching(true)
+      setGlobalMsgSearchPhase('seed')
+      setGlobalMsgIsBackfilling(false)
+      setGlobalMsgAuthoritativeSessionCount(0)
+      try {
+        ensureGlobalMsgSearchNotStale(gen)
+
+        const seedResponse = await window.electronAPI.chat.searchMessages(normalizedKeyword, undefined, GLOBAL_MSG_SEED_LIMIT, 0)
+        if (!seedResponse?.success) {
+          throw new Error(seedResponse?.error || '搜索失败')
+        }
+        ensureGlobalMsgSearchNotStale(gen)
+
+        const seedRows = normalizeGlobalMsgSearchMessages(seedResponse?.messages || [])
+        const seedMap = buildGlobalMsgSearchSessionMap(seedRows)
+        const authoritativeMap = new Map<string, GlobalMsgSearchResult[]>()
+        setGlobalMsgResults(composeGlobalMsgSearchResults(seedMap, authoritativeMap))
+        setGlobalMsgSearchError(null)
+        setGlobalMsgSearchPhase('backfill')
+        setGlobalMsgIsBackfilling(true)
+
+        const previousPrefixCache = globalMsgPrefixCacheRef.current
+        const previousKeyword = String(previousPrefixCache?.keyword || '').trim()
+        const canUsePrefixCache = Boolean(
+          previousPrefixCache &&
+          previousPrefixCache.completed &&
+          previousKeyword &&
+          normalizedKeyword.startsWith(previousKeyword)
+        )
+        let targetSessionList = canUsePrefixCache
+          ? sessionList.filter((session) => previousPrefixCache?.matchedSessionIds.has(session.username))
+          : sessionList
+        if (canUsePrefixCache && previousPrefixCache) {
+          let foundOutsidePrefix = false
+          for (const sessionId of seedMap.keys()) {
+            if (!previousPrefixCache.matchedSessionIds.has(sessionId)) {
+              foundOutsidePrefix = true
+              break
+            }
+          }
+          if (foundOutsidePrefix) {
+            targetSessionList = sessionList
+          }
+        }
+
+        for (let index = 0; index < targetSessionList.length; index += GLOBAL_MSG_BACKFILL_CONCURRENCY) {
+          ensureGlobalMsgSearchNotStale(gen)
+          const chunk = targetSessionList.slice(index, index + GLOBAL_MSG_BACKFILL_CONCURRENCY)
+          const chunkResults = await Promise.allSettled(
+            chunk.map(async (session) => {
+              const res = await window.electronAPI.chat.searchMessages(normalizedKeyword, session.username, GLOBAL_MSG_PER_SESSION_LIMIT, 0)
+              if (!res?.success) {
+                throw new Error(res?.error || `搜索失败: ${session.username}`)
+              }
+              return {
+                sessionId: session.username,
+                messages: normalizeGlobalMsgSearchMessages(res?.messages || [], session.username)
+              }
+            })
+          )
+          ensureGlobalMsgSearchNotStale(gen)
+
+          for (const item of chunkResults) {
+            if (item.status === 'rejected') {
+              throw item.reason instanceof Error ? item.reason : new Error(String(item.reason))
+            }
+            authoritativeMap.set(item.value.sessionId, item.value.messages)
+          }
+          setGlobalMsgAuthoritativeSessionCount(authoritativeMap.size)
+          setGlobalMsgResults(composeGlobalMsgSearchResults(seedMap, authoritativeMap))
+        }
+
+        ensureGlobalMsgSearchNotStale(gen)
+        const finalResults = composeGlobalMsgSearchResults(seedMap, authoritativeMap)
+        setGlobalMsgResults(finalResults)
+        setGlobalMsgSearchError(null)
+        setGlobalMsgSearchPhase('done')
+        setGlobalMsgIsBackfilling(false)
+
+        const matchedSessionIds = new Set<string>()
+        for (const row of finalResults) {
+          matchedSessionIds.add(row.sessionId)
+        }
+        globalMsgPrefixCacheRef.current = {
+          keyword: normalizedKeyword,
+          matchedSessionIds,
+          completed: true
+        }
+
+        if (shouldRunGlobalMsgShadowCompareSample()) {
+          void (async () => {
+            try {
+              const legacyResults = await runLegacyGlobalMsgSearch(normalizedKeyword, sessionList, gen)
+              if (gen !== globalMsgSearchGenRef.current) return
+              compareGlobalMsgSearchShadow(normalizedKeyword, finalResults, legacyResults)
+            } catch (error) {
+              if (isGlobalMsgSearchCanceled(error)) return
+              console.warn('[GlobalMsgSearch] shadow compare failed:', error)
+            }
+          })()
+        }
+      } catch (error) {
+        if (isGlobalMsgSearchCanceled(error)) return
+        if (gen !== globalMsgSearchGenRef.current) return
+        setGlobalMsgResults([])
+        setGlobalMsgSearchError(error instanceof Error ? error.message : String(error))
+        setGlobalMsgSearchPhase('done')
+        setGlobalMsgIsBackfilling(false)
+        setGlobalMsgAuthoritativeSessionCount(0)
+        globalMsgPrefixCacheRef.current = null
+      } finally {
+        if (gen === globalMsgSearchGenRef.current) setGlobalMsgSearching(false)
+      }
+    }, 500)
+  }, [compareGlobalMsgSearchShadow, ensureGlobalMsgSearchNotStale, runLegacyGlobalMsgSearch])
+
+  const handleCloseGlobalMsgSearch = useCallback(() => {
+    globalMsgSearchGenRef.current += 1
+    if (globalMsgSearchTimerRef.current) clearTimeout(globalMsgSearchTimerRef.current)
+    globalMsgSearchTimerRef.current = null
+    pendingGlobalMsgSearchReplayRef.current = null
+    globalMsgPrefixCacheRef.current = null
+    setShowGlobalMsgSearch(false)
+    setGlobalMsgQuery('')
+    setGlobalMsgResults([])
+    setGlobalMsgSearchError(null)
+    setGlobalMsgSearching(false)
+    setGlobalMsgSearchPhase('idle')
+    setGlobalMsgIsBackfilling(false)
+    setGlobalMsgAuthoritativeSessionCount(0)
+  }, [])
+
+  const handleMessageRangeChanged = useCallback((range: { startIndex: number; endIndex: number }) => {
+    visibleMessageRangeRef.current = range
+    const total = messages.length
+    const shouldWarmupVisibleGroupSenders = Boolean(
+      currentSessionId && (
+        isGroupChatSession(currentSessionId) ||
+        (
+          standaloneSessionWindow &&
+          normalizedInitialSessionId &&
+          currentSessionId === normalizedInitialSessionId &&
+          normalizedStandaloneInitialContactType === 'group'
+        )
+      )
+    )
+    if (total <= 0) {
+      isMessageListAtBottomRef.current = true
+      setShowScrollToBottom(prev => (prev ? false : prev))
+      return
+    }
+
+    if (shouldWarmupVisibleGroupSenders) {
+      const now = Date.now()
+      if (now - lastVisibleSenderWarmupAtRef.current >= 180) {
+        lastVisibleSenderWarmupAtRef.current = now
+        const latestMessages = useChatStore.getState().messages || []
+        const visibleStart = Math.max(range.startIndex - 12, 0)
+        const visibleEnd = Math.min(range.endIndex + 20, total - 1)
+        const pendingUsernames = new Set<string>()
+        for (let index = visibleStart; index <= visibleEnd; index += 1) {
+          const msg = latestMessages[index]
+          if (!msg || msg.isSend === 1) continue
+          const sender = String(msg.senderUsername || '').trim()
+          if (!sender) continue
+          if (senderAvatarCache.has(sender) || senderAvatarLoading.has(sender)) continue
+          pendingUsernames.add(sender)
+          if (pendingUsernames.size >= 24) break
+        }
+        if (pendingUsernames.size > 0) {
+          scheduleGroupSenderWarmup([...pendingUsernames], false)
+        }
+      }
+    }
+  }, [
+    messages.length,
+    currentSessionId,
+    isGroupChatSession,
+    standaloneSessionWindow,
+    normalizedInitialSessionId,
+    normalizedStandaloneInitialContactType,
+    scheduleGroupSenderWarmup
+  ])
+
+  const handleMessageAtBottomStateChange = useCallback((atBottom: boolean) => {
+    if (messages.length <= 0) {
+      isMessageListAtBottomRef.current = true
+      setShowScrollToBottom(prev => (prev ? false : prev))
+      return
+    }
+
+    const listEl = messageListRef.current
+    const distanceFromBottom = listEl
+      ? (listEl.scrollHeight - (listEl.scrollTop + listEl.clientHeight))
+      : Number.POSITIVE_INFINITY
+    const nearBottomByDistance = distanceFromBottom <= 140
+    const effectiveAtBottom = atBottom || nearBottomByDistance
+    isMessageListAtBottomRef.current = effectiveAtBottom
+
+    if (!effectiveAtBottom) {
+      bottomRangeLoadLockRef.current = false
+      // 用户主动离开底部后，解除“搜索跳转后的自动向后加载抑制”
+      suppressAutoLoadLaterRef.current = false
+    }
+
+    if (
+      isLoadingMessages ||
+      isSessionSwitching ||
+      isLoadingMore ||
+      suppressScrollToBottomButtonRef.current
+    ) {
+      setShowScrollToBottom(prev => (prev ? false : prev))
+      return
+    }
+
+    if (effectiveAtBottom) {
+      setShowScrollToBottom(prev => (prev ? false : prev))
+      return
+    }
+    const shouldShow = distanceFromBottom > 180
+    setShowScrollToBottom(prev => (prev === shouldShow ? prev : shouldShow))
+  }, [messages.length, isLoadingMessages, isLoadingMore, isSessionSwitching])
+
+  const handleMessageListWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+    markMessageListScrolling()
+    if (!currentSessionId || isLoadingMore || isLoadingMessages) return
+    const listEl = messageListRef.current
+    if (!listEl) return
+    const distanceFromTop = listEl.scrollTop
+    const distanceFromBottom = listEl.scrollHeight - (listEl.scrollTop + listEl.clientHeight)
+
+    if (event.deltaY <= -18) {
+      if (!hasMoreMessages) return
+      if (distanceFromTop > MESSAGE_EDGE_TRIGGER_DISTANCE_PX) return
+      if (topRangeLoadLockRef.current) return
+      const now = Date.now()
+      if (now - topRangeLoadLastTriggerAtRef.current < MESSAGE_TOP_WHEEL_LOAD_COOLDOWN_MS) return
+      topRangeLoadLastTriggerAtRef.current = now
+      topRangeLoadLockRef.current = true
+      isMessageListAtBottomRef.current = false
+      void loadMessages(currentSessionId, currentOffset, jumpStartTime, jumpEndTime)
+      return
+    }
+
+    if (event.deltaY <= 18) return
+    if (!hasMoreLater) return
+    if (distanceFromBottom > MESSAGE_EDGE_TRIGGER_DISTANCE_PX) return
+    if (bottomRangeLoadLockRef.current) return
+
+    // 用户明确向下滚动时允许加载后续消息
+    suppressAutoLoadLaterRef.current = false
+    bottomRangeLoadLockRef.current = true
+    void loadLaterMessages()
+  }, [
+    currentSessionId,
+    hasMoreLater,
+    hasMoreMessages,
+    isLoadingMessages,
+    isLoadingMore,
+    currentOffset,
+    jumpStartTime,
+    jumpEndTime,
+    markMessageListScrolling,
+    loadMessages,
+    loadLaterMessages
+  ])
+
+  const handleMessageAtTopStateChange = useCallback((atTop: boolean) => {
+    if (!atTop) {
+      topRangeLoadLockRef.current = false
+    }
+  }, [])
 
 
   const isSameSession = useCallback((prev: ChatSession, next: ChatSession): boolean => {
@@ -2529,7 +4635,8 @@ function ChatPage(props: ChatPageProps) {
       prev.lastTimestamp === next.lastTimestamp &&
       prev.lastMsgType === next.lastMsgType &&
       prev.displayName === next.displayName &&
-      prev.avatarUrl === next.avatarUrl
+      prev.avatarUrl === next.avatarUrl &&
+      prev.alias === next.alias
     )
   }, [])
 
@@ -2540,15 +4647,16 @@ function ChatPage(props: ChatPageProps) {
       return Array.isArray(sessionsRef.current) ? sessionsRef.current : []
     }
     if (!Array.isArray(sessionsRef.current) || sessionsRef.current.length === 0) {
-      return nextSessions
+      return nextSessions.map((next) => mergeSessionContactPresentation(next))
     }
     const prevMap = new Map(sessionsRef.current.map((s) => [s.username, s]))
     return nextSessions.map((next) => {
       const prev = prevMap.get(next.username)
-      if (!prev) return next
-      return isSameSession(prev, next) ? prev : next
+      const merged = mergeSessionContactPresentation(next, prev)
+      if (!prev) return merged
+      return isSameSession(prev, merged) ? prev : merged
     })
-  }, [isSameSession])
+  }, [isSameSession, mergeSessionContactPresentation])
 
   const flashNewMessages = useCallback((keys: string[]) => {
     if (keys.length === 0) return
@@ -2558,15 +4666,59 @@ function ChatPage(props: ChatPageProps) {
     }, 2500)
   }, [])
 
+  const handleInSessionResultJump = useCallback((msg: Message) => {
+    const targetTime = Number(msg.createTime || 0)
+    const targetSessionId = String(currentSessionRef.current || currentSessionId || '').trim()
+    if (!targetTime || !targetSessionId) return
+
+    if (inSessionResultJumpTimerRef.current) {
+      window.clearTimeout(inSessionResultJumpTimerRef.current)
+      inSessionResultJumpTimerRef.current = null
+    }
+
+    const requestSeq = inSessionResultJumpRequestSeqRef.current + 1
+    inSessionResultJumpRequestSeqRef.current = requestSeq
+    const anchorEndTime = targetTime + 1
+    const targetMessageKey = getMessageKey(msg)
+
+    inSessionResultJumpTimerRef.current = window.setTimeout(() => {
+      inSessionResultJumpTimerRef.current = null
+      if (requestSeq !== inSessionResultJumpRequestSeqRef.current) return
+      if (currentSessionRef.current !== targetSessionId) return
+
+      setCurrentOffset(0)
+      setJumpStartTime(0)
+      setJumpEndTime(anchorEndTime)
+      // 搜索跳转后默认不自动回流到最新消息，仅在用户主动向下滚动时加载后续
+      suppressAutoLoadLaterRef.current = true
+      flashNewMessages([targetMessageKey])
+      void loadMessages(targetSessionId, 0, 0, anchorEndTime, false, {
+        inSessionJumpRequestSeq: requestSeq
+      })
+    }, 220)
+  }, [currentSessionId, flashNewMessages, getMessageKey, loadMessages])
+
   // 滚动到底部
   const scrollToBottom = useCallback(() => {
+    suppressScrollToBottomButton(220)
+    isMessageListAtBottomRef.current = true
+    setShowScrollToBottom(false)
+    const lastIndex = messages.length - 1
+    if (lastIndex >= 0 && messageVirtuosoRef.current) {
+      messageVirtuosoRef.current.scrollToIndex({
+        index: lastIndex,
+        align: 'end',
+        behavior: 'auto'
+      })
+      return
+    }
     if (messageListRef.current) {
       messageListRef.current.scrollTo({
         top: messageListRef.current.scrollHeight,
-        behavior: 'smooth'
+        behavior: 'auto'
       })
     }
-  }, [])
+  }, [messages.length, suppressScrollToBottomButton])
 
   // 拖动调节侧边栏宽度
   const handleResizeStart = useCallback((e: React.MouseEvent) => {
@@ -2609,13 +4761,25 @@ function ChatPage(props: ChatPageProps) {
         window.clearTimeout(sessionListPersistTimerRef.current)
         sessionListPersistTimerRef.current = null
       }
+      if (scrollBottomButtonArmTimerRef.current !== null) {
+        window.clearTimeout(scrollBottomButtonArmTimerRef.current)
+        scrollBottomButtonArmTimerRef.current = null
+      }
       if (contactUpdateTimerRef.current) {
         clearTimeout(contactUpdateTimerRef.current)
       }
       if (sessionScrollTimeoutRef.current) {
         clearTimeout(sessionScrollTimeoutRef.current)
       }
+      if (messageListScrollTimeoutRef.current !== null) {
+        window.clearTimeout(messageListScrollTimeoutRef.current)
+        messageListScrollTimeoutRef.current = null
+      }
+      isMessageListScrollingRef.current = false
       contactUpdateQueueRef.current.clear()
+      pendingSessionContactEnrichRef.current.clear()
+      sessionContactEnrichAttemptAtRef.current.clear()
+      sessionContactProfileCacheRef.current.clear()
       enrichCancelledRef.current = true
       isEnrichingRef.current = false
     }
@@ -2638,6 +4802,36 @@ function ChatPage(props: ChatPageProps) {
     const lastMsg = messages[messages.length - 1]
     lastMessageTimeRef.current = lastMsg?.createTime ?? 0
   }, [messages, getMessageKey])
+
+  useEffect(() => {
+    lastObservedMessageCountRef.current = messages.length
+    if (messages.length <= 0) {
+      isMessageListAtBottomRef.current = true
+    }
+  }, [currentSessionId])
+
+  useEffect(() => {
+    const previousCount = lastObservedMessageCountRef.current
+    const currentCount = messages.length
+    lastObservedMessageCountRef.current = currentCount
+    if (currentCount <= previousCount) return
+    if (!currentSessionId || isLoadingMessages || isSessionSwitching) return
+    if (suppressAutoScrollOnNextMessageGrowthRef.current || prependingHistoryRef.current) {
+      suppressAutoScrollOnNextMessageGrowthRef.current = false
+      return
+    }
+    if (!isMessageListAtBottomRef.current) return
+    if (suppressAutoLoadLaterRef.current) return
+    suppressScrollToBottomButton(220)
+    isMessageListAtBottomRef.current = true
+    requestAnimationFrame(() => {
+      const latestMessages = useChatStore.getState().messages || []
+      const lastIndex = latestMessages.length - 1
+      if (lastIndex >= 0 && messageVirtuosoRef.current) {
+        messageVirtuosoRef.current.scrollToIndex({ index: lastIndex, align: 'end', behavior: 'auto' })
+      }
+    })
+  }, [messages.length, currentSessionId, isLoadingMessages, isSessionSwitching, suppressScrollToBottomButton])
 
   useEffect(() => {
     currentSessionRef.current = currentSessionId
@@ -2692,13 +4886,45 @@ function ChatPage(props: ChatPageProps) {
   }, [sessions])
 
   useEffect(() => {
+    if (!Array.isArray(sessions) || sessions.length === 0) return
+    const now = Date.now()
+    const cache = sessionContactProfileCacheRef.current
+
+    for (const session of sessions) {
+      const username = String(session.username || '').trim()
+      if (!username || isFoldPlaceholderSession(username)) continue
+
+      const displayName = resolveSessionDisplayName(session.displayName, username)
+      const avatarUrl = normalizeSearchAvatarUrl(session.avatarUrl)
+      const alias = normalizeSearchIdentityText(session.alias)
+      if (!displayName && !avatarUrl && !alias) continue
+
+      const prev = cache.get(username)
+      cache.set(username, {
+        displayName: displayName || prev?.displayName,
+        avatarUrl: avatarUrl || prev?.avatarUrl,
+        alias: alias || prev?.alias,
+        updatedAt: now
+      })
+    }
+
+    for (const [username, profile] of cache.entries()) {
+      if (now - profile.updatedAt > SESSION_CONTACT_PROFILE_CACHE_TTL_MS) {
+        cache.delete(username)
+      }
+    }
+  }, [sessions])
+
+  useEffect(() => {
     sessionsRef.current = Array.isArray(sessions) ? sessions : []
   }, [sessions])
 
   useEffect(() => {
-    isLoadingMessagesRef.current = isLoadingMessages
-    isLoadingMoreRef.current = isLoadingMore
-  }, [isLoadingMessages, isLoadingMore])
+    if (!isLoadingMore) {
+      topRangeLoadLockRef.current = false
+      bottomRangeLoadLockRef.current = false
+    }
+  }, [isLoadingMore])
 
   useEffect(() => {
     if (initialRevealTimerRef.current !== null) {
@@ -2734,7 +4960,7 @@ function ChatPage(props: ChatPageProps) {
   }, [currentSessionId, messages.length, isLoadingMessages])
 
   useEffect(() => {
-    if (currentSessionId && messages.length === 0 && !isLoadingMessages && !isLoadingMore && !noMessageTable) {
+    if (currentSessionId && isConnected && messages.length === 0 && !isLoadingMessages && !isLoadingMore && !noMessageTable) {
       if (pendingSessionLoadRef.current === currentSessionId) return
       if (initialLoadRequestedSessionRef.current === currentSessionId) return
       initialLoadRequestedSessionRef.current = currentSessionId
@@ -2745,7 +4971,7 @@ function ChatPage(props: ChatPageProps) {
         forceInitialLimit: 30
       })
     }
-  }, [currentSessionId, messages.length, isLoadingMessages, isLoadingMore, noMessageTable])
+  }, [currentSessionId, isConnected, messages.length, isLoadingMessages, isLoadingMore, noMessageTable])
 
   useEffect(() => {
     return () => {
@@ -2759,6 +4985,29 @@ function ChatPage(props: ChatPageProps) {
   useEffect(() => {
     isConnectedRef.current = isConnected
   }, [isConnected])
+
+  useEffect(() => {
+    const replayKeyword = pendingGlobalMsgSearchReplayRef.current
+    if (!replayKeyword || !isConnected || sessions.length === 0) return
+    pendingGlobalMsgSearchReplayRef.current = null
+    void handleGlobalMsgSearch(replayKeyword)
+  }, [isConnected, sessions.length, handleGlobalMsgSearch])
+
+  useEffect(() => {
+    return () => {
+      inSessionSearchGenRef.current += 1
+      if (inSessionSearchTimerRef.current) {
+        clearTimeout(inSessionSearchTimerRef.current)
+        inSessionSearchTimerRef.current = null
+      }
+      globalMsgSearchGenRef.current += 1
+      if (globalMsgSearchTimerRef.current) {
+        clearTimeout(globalMsgSearchTimerRef.current)
+        globalMsgSearchTimerRef.current = null
+      }
+      globalMsgPrefixCacheRef.current = null
+    }
+  }, [])
 
   useEffect(() => {
     searchKeywordRef.current = searchKeyword
@@ -2827,6 +5076,15 @@ function ChatPage(props: ChatPageProps) {
   ])
 
   useEffect(() => {
+    return () => {
+      inSessionResultJumpRequestSeqRef.current += 1
+      if (inSessionResultJumpTimerRef.current) {
+        window.clearTimeout(inSessionResultJumpTimerRef.current)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
     if (!Array.isArray(sessions) || sessions.length === 0) return
     if (sessionListPersistTimerRef.current !== null) {
       window.clearTimeout(sessionListPersistTimerRef.current)
@@ -2838,26 +5096,113 @@ function ChatPage(props: ChatPageProps) {
   }, [sessions, persistSessionListCache])
 
   // 普通视图：隐藏 isFolded 的群，保留 placeholder_foldgroup 入口
-  useEffect(() => {
+  const filteredSessions = useMemo(() => {
     if (!Array.isArray(sessions)) {
-      setFilteredSessions([])
-      return
+      return []
     }
-    const visible = sessions.filter(s => {
+
+    const officialSessions = sessions.filter(s => s.username.startsWith('gh_'))
+
+    // 检查是否有折叠的群聊
+    const foldedGroups = sessions.filter(s => s.isFolded && !s.username.toLowerCase().includes('placeholder_foldgroup'))
+    const hasFoldedGroups = foldedGroups.length > 0
+
+    let visible = sessions.filter(s => {
       if (s.isFolded && !s.username.toLowerCase().includes('placeholder_foldgroup')) return false
+      if (s.username.startsWith('gh_')) return false
       return true
     })
+
+    const latestOfficial = officialSessions.reduce<ChatSession | null>((latest, current) => {
+      if (!latest) return current
+      const latestTime = latest.sortTimestamp || latest.lastTimestamp
+      const currentTime = current.sortTimestamp || current.lastTimestamp
+      return currentTime > latestTime ? current : latest
+    }, null)
+    const officialUnreadCount = officialSessions.reduce((sum, s) => sum + (s.unreadCount || 0), 0)
+
+    const bizEntry: ChatSession = {
+      username: OFFICIAL_ACCOUNTS_VIRTUAL_ID,
+      displayName: '公众号',
+      summary: latestOfficial
+        ? `${latestOfficial.displayName || latestOfficial.username}: ${latestOfficial.summary || '查看公众号历史消息'}`
+        : '查看公众号历史消息',
+      type: 0,
+      sortTimestamp: 9999999999,  // 放到最前面？  目前还没有严格的对时间进行排序，  后面可以改一下
+      lastTimestamp: latestOfficial?.lastTimestamp || latestOfficial?.sortTimestamp || 0,
+      lastMsgType: latestOfficial?.lastMsgType || 0,
+      unreadCount: officialUnreadCount,
+      isMuted: false,
+      isFolded: false
+    }
+
+    if (!visible.some(s => s.username === OFFICIAL_ACCOUNTS_VIRTUAL_ID)) {
+      visible.unshift(bizEntry)
+    }
+
+    if (hasFoldedGroups && !visible.some(s => s.username.toLowerCase().includes('placeholder_foldgroup'))) {
+
+      const latestFolded = foldedGroups.reduce((latest, current) => {
+        const latestTime = latest.sortTimestamp || latest.lastTimestamp
+        const currentTime = current.sortTimestamp || current.lastTimestamp
+        return currentTime > latestTime ? current : latest
+      })
+
+      const foldEntry: ChatSession = {
+        username: 'placeholder_foldgroup',
+        displayName: '折叠的聊天',
+        summary: `${latestFolded.displayName || latestFolded.username}: ${latestFolded.summary}`,
+        type: 0,
+        sortTimestamp: latestFolded.sortTimestamp || latestFolded.lastTimestamp,
+        lastTimestamp: latestFolded.lastTimestamp || latestFolded.sortTimestamp,
+        lastMsgType: 0,
+        unreadCount: foldedGroups.reduce((sum, s) => sum + (s.unreadCount || 0), 0),
+        isMuted: false,
+        isFolded: false
+      }
+
+      // 按时间戳插入到正确位置
+      const foldTime = foldEntry.sortTimestamp || foldEntry.lastTimestamp
+      const insertIndex = visible.findIndex(s => {
+        const sTime = s.sortTimestamp || s.lastTimestamp
+        return sTime < foldTime
+      })
+      if (insertIndex === -1) {
+        visible.push(foldEntry)
+      } else {
+        visible.splice(insertIndex, 0, foldEntry)
+      }
+    }
+
     if (!searchKeyword.trim()) {
-      setFilteredSessions(visible)
-      return
+      return visible
     }
     const lower = searchKeyword.toLowerCase()
-    setFilteredSessions(visible.filter(s =>
-      s.displayName?.toLowerCase().includes(lower) ||
-      s.username.toLowerCase().includes(lower) ||
-      s.summary.toLowerCase().includes(lower)
-    ))
-  }, [sessions, searchKeyword, setFilteredSessions])
+    return visible
+      .filter(s => {
+        const matchedByName = s.displayName?.toLowerCase().includes(lower)
+        const matchedByUsername = s.username.toLowerCase().includes(lower)
+        const matchedByAlias = s.alias?.toLowerCase().includes(lower)
+        return matchedByName || matchedByUsername || matchedByAlias
+      })
+      .map(s => {
+        const matchedByName = s.displayName?.toLowerCase().includes(lower)
+        const matchedByUsername = s.username.toLowerCase().includes(lower)
+        const matchedByAlias = s.alias?.toLowerCase().includes(lower)
+
+        let matchedField: 'wxid' | 'alias' | 'name' | undefined = undefined
+
+        if (matchedByUsername && !matchedByName && !matchedByAlias) {
+          matchedField = 'wxid'
+        } else if (matchedByAlias && !matchedByName && !matchedByUsername) {
+          matchedField = 'alias'
+        } else if (matchedByName && !matchedByUsername && !matchedByAlias) {
+          matchedField = 'name'
+        }
+
+        return { ...s, matchedField }
+      })
+  }, [sessions, searchKeyword])
 
   // 折叠群列表（独立计算，供折叠 panel 使用）
   const foldedSessions = useMemo(() => {
@@ -2865,12 +5210,54 @@ function ChatPage(props: ChatPageProps) {
     const folded = sessions.filter(s => s.isFolded)
     if (!searchKeyword.trim() || !foldedView) return folded
     const lower = searchKeyword.toLowerCase()
-    return folded.filter(s =>
-      s.displayName?.toLowerCase().includes(lower) ||
-      s.username.toLowerCase().includes(lower) ||
-      s.summary.toLowerCase().includes(lower)
-    )
+    return folded
+        // 1. 先过滤
+        .filter(s => {
+          const matchedByName = s.displayName?.toLowerCase().includes(lower)
+          const matchedByUsername = s.username.toLowerCase().includes(lower)
+          const matchedByAlias = s.alias?.toLowerCase().includes(lower)
+          const matchedBySummary = s.summary?.toLowerCase().includes(lower) // 注意：这里有个 summary
+
+          return matchedByName || matchedByUsername || matchedByAlias || matchedBySummary
+        })
+        // 2. 后映射
+        .map(s => {
+          const matchedByName = s.displayName?.toLowerCase().includes(lower)
+          const matchedByUsername = s.username.toLowerCase().includes(lower)
+          const matchedByAlias = s.alias?.toLowerCase().includes(lower)
+          const matchedBySummary = s.summary?.toLowerCase().includes(lower)
+
+          let matchedField: 'wxid' | 'alias' | 'name' | undefined = undefined
+
+          if (matchedByUsername && !matchedByName && !matchedBySummary && !matchedByAlias) {
+            matchedField = 'wxid'
+          } else if (matchedByAlias && !matchedByName && !matchedBySummary && !matchedByUsername) {
+            matchedField = 'alias'
+          }
+
+          // ✅ 同样返回新对象
+          return { ...s, matchedField }
+        })
   }, [sessions, searchKeyword, foldedView])
+
+  const sessionLookupMap = useMemo(() => {
+    const map = new Map<string, ChatSession>()
+    for (const session of sessions) {
+      const username = String(session.username || '').trim()
+      if (!username) continue
+      map.set(username, session)
+    }
+    return map
+  }, [sessions])
+  const groupedGlobalMsgResults = useMemo(() => {
+    const grouped = globalMsgResults.reduce((acc, msg) => {
+      const sessionId = (msg as any).sessionId || '未知'
+      if (!acc[sessionId]) acc[sessionId] = []
+      acc[sessionId].push(msg)
+      return acc
+    }, {} as Record<string, Message[]>)
+    return Object.entries(grouped)
+  }, [globalMsgResults])
 
   const hasSessionRecords = Array.isArray(sessions) && sessions.length > 0
   const shouldShowSessionsSkeleton = isLoadingSessions && !hasSessionRecords
@@ -2906,7 +5293,21 @@ function ChatPage(props: ChatPageProps) {
   // 获取当前会话信息（从通讯录跳转时可能不在 sessions 列表中，构造 fallback）
   const currentSession = (() => {
     const found = Array.isArray(sessions) ? sessions.find(s => s.username === currentSessionId) : undefined
-    if (found || !currentSessionId) return found
+    if (found) {
+      if (
+        standaloneSessionWindow &&
+        normalizedInitialSessionId &&
+        found.username === normalizedInitialSessionId
+      ) {
+        return {
+          ...found,
+          displayName: found.displayName || fallbackDisplayName || found.username,
+          avatarUrl: found.avatarUrl || fallbackAvatarUrl || undefined
+        }
+      }
+      return found
+    }
+    if (!currentSessionId) return found
     return {
       username: currentSessionId,
       type: 0,
@@ -2916,6 +5317,7 @@ function ChatPage(props: ChatPageProps) {
       lastTimestamp: 0,
       lastMsgType: 0,
       displayName: fallbackDisplayName || currentSessionId,
+      avatarUrl: fallbackAvatarUrl || undefined,
     } as ChatSession
   })()
   const filteredGroupPanelMembers = useMemo(() => {
@@ -2935,20 +5337,204 @@ function ChatPage(props: ChatPageProps) {
   }, [groupMemberSearchKeyword, groupPanelMembers])
   const isCurrentSessionExporting = Boolean(currentSessionId && inProgressExportSessionIds.has(currentSessionId))
   const isExportActionBusy = isCurrentSessionExporting || isPreparingExportDialog
+  const isCurrentSessionGroup = Boolean(
+    currentSession && (
+      isGroupChatSession(currentSession.username) ||
+      (
+        standaloneSessionWindow &&
+        currentSession.username === normalizedInitialSessionId &&
+        normalizedStandaloneInitialContactType === 'group'
+      )
+    )
+  )
+  const isCurrentSessionPrivateSnsSupported = Boolean(
+    currentSession &&
+    isSingleContactSession(currentSession.username) &&
+    !isCurrentSessionGroup
+  )
+
+  const openCurrentSessionSnsTimeline = useCallback(() => {
+    if (!currentSession || !isCurrentSessionPrivateSnsSupported) return
+    setChatSnsTimelineTarget({
+      username: currentSession.username,
+      displayName: currentSession.displayName || currentSession.username,
+      avatarUrl: currentSession.avatarUrl
+    })
+  }, [currentSession, isCurrentSessionPrivateSnsSupported])
+
+  useEffect(() => {
+    if (!standaloneSessionWindow) return
+    setStandaloneInitialLoadRequested(false)
+    setStandaloneLoadStage(normalizedInitialSessionId ? 'connecting' : 'idle')
+    setFallbackDisplayName(normalizedStandaloneInitialDisplayName || null)
+    setFallbackAvatarUrl(normalizedStandaloneInitialAvatarUrl || null)
+  }, [
+    standaloneSessionWindow,
+    normalizedInitialSessionId,
+    normalizedStandaloneInitialDisplayName,
+    normalizedStandaloneInitialAvatarUrl
+  ])
+
+  useEffect(() => {
+    if (!standaloneSessionWindow) return
+    if (!normalizedInitialSessionId) return
+
+    if (normalizedStandaloneInitialDisplayName) {
+      setFallbackDisplayName(normalizedStandaloneInitialDisplayName)
+    }
+    if (normalizedStandaloneInitialAvatarUrl) {
+      setFallbackAvatarUrl(normalizedStandaloneInitialAvatarUrl)
+    }
+
+    if (!currentSessionId) {
+      setCurrentSession(normalizedInitialSessionId, { preserveMessages: false })
+    }
+    if (!isConnected || isConnecting) {
+      setStandaloneLoadStage('connecting')
+    }
+  }, [
+    standaloneSessionWindow,
+    normalizedInitialSessionId,
+    normalizedStandaloneInitialDisplayName,
+    normalizedStandaloneInitialAvatarUrl,
+    currentSessionId,
+    isConnected,
+    isConnecting,
+    setCurrentSession
+  ])
 
   useEffect(() => {
     if (!standaloneSessionWindow) return
     if (!normalizedInitialSessionId) return
     if (!isConnected || isConnecting) return
-    if (currentSessionId === normalizedInitialSessionId) return
-    selectSessionById(normalizedInitialSessionId)
+    if (currentSessionId === normalizedInitialSessionId && standaloneInitialLoadRequested) return
+    setStandaloneInitialLoadRequested(true)
+    setStandaloneLoadStage('loading')
+    selectSessionById(normalizedInitialSessionId, {
+      force: currentSessionId === normalizedInitialSessionId
+    })
   }, [
     standaloneSessionWindow,
     normalizedInitialSessionId,
     isConnected,
     isConnecting,
     currentSessionId,
+    standaloneInitialLoadRequested,
     selectSessionById
+  ])
+
+  // 监听 URL 参数中的会话/锚点（通知跳转 + 足迹锚点定位）
+  useEffect(() => {
+    if (standaloneSessionWindow) return // standalone模式由上面的useEffect处理
+    const params = new URLSearchParams(location.search)
+    const urlSessionId = String(params.get('sessionId') || '').trim()
+    if (!urlSessionId) return
+    if (!isConnected || isConnecting) return
+    const jumpSource = String(params.get('jumpSource') || '').trim()
+    const jumpLocalId = Number.parseInt(String(params.get('jumpLocalId') || ''), 10)
+    const jumpCreateTime = Number.parseInt(String(params.get('jumpCreateTime') || ''), 10)
+    const hasFootprintAnchor = jumpSource === 'footprint'
+      && Number.isFinite(jumpLocalId)
+      && jumpLocalId > 0
+      && Number.isFinite(jumpCreateTime)
+      && jumpCreateTime > 0
+
+    if (hasFootprintAnchor) {
+      pendingFootprintJumpRef.current = {
+        sessionId: urlSessionId,
+        localId: jumpLocalId,
+        createTime: jumpCreateTime
+      }
+      if (currentSessionId !== urlSessionId) {
+        selectSessionById(urlSessionId)
+        return
+      }
+      const messageStub: Message = {
+        messageKey: `footprint:${urlSessionId}:${jumpCreateTime}:${jumpLocalId}`,
+        localId: jumpLocalId,
+        serverId: 0,
+        localType: 0,
+        createTime: jumpCreateTime,
+        sortSeq: jumpCreateTime,
+        isSend: null,
+        senderUsername: null,
+        parsedContent: '',
+        rawContent: ''
+      }
+      handleInSessionResultJump(messageStub)
+      pendingFootprintJumpRef.current = null
+      navigate('/chat', { replace: true })
+      return
+    }
+
+    pendingFootprintJumpRef.current = null
+    if (currentSessionId !== urlSessionId) {
+      selectSessionById(urlSessionId)
+    }
+    // 选中后清除URL参数，避免影响后续用户手动切换会话
+    navigate('/chat', { replace: true })
+  }, [
+    standaloneSessionWindow,
+    location.search,
+    isConnected,
+    isConnecting,
+    currentSessionId,
+    selectSessionById,
+    handleInSessionResultJump,
+    navigate
+  ])
+
+  useEffect(() => {
+    const pending = pendingFootprintJumpRef.current
+    if (!pending) return
+    if (!isConnected || isConnecting) return
+    if (currentSessionId !== pending.sessionId) return
+
+    const messageStub: Message = {
+      messageKey: `footprint:${pending.sessionId}:${pending.createTime}:${pending.localId}`,
+      localId: pending.localId,
+      serverId: 0,
+      localType: 0,
+      createTime: pending.createTime,
+      sortSeq: pending.createTime,
+      isSend: null,
+      senderUsername: null,
+      parsedContent: '',
+      rawContent: ''
+    }
+    handleInSessionResultJump(messageStub)
+    pendingFootprintJumpRef.current = null
+    navigate('/chat', { replace: true })
+  }, [isConnected, isConnecting, currentSessionId, handleInSessionResultJump, navigate])
+
+  useEffect(() => {
+    if (!standaloneSessionWindow || !normalizedInitialSessionId) return
+    if (!isConnected || isConnecting) {
+      setStandaloneLoadStage('connecting')
+      return
+    }
+    if (!standaloneInitialLoadRequested) {
+      setStandaloneLoadStage('loading')
+      return
+    }
+    if (currentSessionId !== normalizedInitialSessionId) {
+      setStandaloneLoadStage('loading')
+      return
+    }
+    if (isLoadingMessages || isSessionSwitching) {
+      setStandaloneLoadStage('loading')
+      return
+    }
+    setStandaloneLoadStage('ready')
+  }, [
+    standaloneSessionWindow,
+    normalizedInitialSessionId,
+    isConnected,
+    isConnecting,
+    standaloneInitialLoadRequested,
+    currentSessionId,
+    isLoadingMessages,
+    isSessionSwitching
   ])
 
   // 从通讯录跳转时，会话不在列表中，主动加载联系人显示名称
@@ -2956,12 +5542,14 @@ function ChatPage(props: ChatPageProps) {
     if (!currentSessionId) return
     const found = Array.isArray(sessions) ? sessions.find(s => s.username === currentSessionId) : undefined
     if (found) {
-      setFallbackDisplayName(null)
+      if (found.displayName) setFallbackDisplayName(found.displayName)
+      if (found.avatarUrl) setFallbackAvatarUrl(found.avatarUrl)
       return
     }
     loadContactInfoBatch([currentSessionId]).then(() => {
       const cached = senderAvatarCache.get(currentSessionId)
       if (cached?.displayName) setFallbackDisplayName(cached.displayName)
+      if (cached?.avatarUrl) setFallbackAvatarUrl(cached.avatarUrl)
     })
   }, [currentSessionId, sessions])
 
@@ -3027,6 +5615,7 @@ function ChatPage(props: ChatPageProps) {
     setBatchVoiceCount(voiceMessages.length)
     setBatchVoiceDates(sortedDates)
     setBatchSelectedDates(new Set(sortedDates))
+    setBatchVoiceTaskType('transcribe')
     setShowBatchConfirm(true)
   }, [sessions, currentSessionId, isBatchTranscribing])
 
@@ -3083,14 +5672,14 @@ function ChatPage(props: ChatPageProps) {
 
   const handleGroupAnalytics = useCallback(() => {
     if (!currentSessionId || !isGroupChatSession(currentSessionId)) return
-    navigate('/group-analytics', {
+    navigate('/analytics/group', {
       state: {
         preselectGroupIds: [currentSessionId]
       }
     })
   }, [currentSessionId, navigate, isGroupChatSession])
 
-  // 确认批量转写
+  // 确认批量语音任务（解密/转写）
   const confirmBatchTranscribe = useCallback(async () => {
     if (!currentSessionId) return
 
@@ -3122,23 +5711,35 @@ function ChatPage(props: ChatPageProps) {
     const session = sessions.find(s => s.username === currentSessionId)
     if (!session) return
 
-    startTranscribe(voiceMessages.length, session.displayName || session.username)
+    const taskType = batchVoiceTaskType
+    startTranscribe(voiceMessages.length, session.displayName || session.username, taskType)
 
-    // 检查模型状态
-    const modelStatus = await window.electronAPI.whisper.getModelStatus()
-    if (!modelStatus?.exists) {
-      alert('SenseVoice 模型未下载，请先在设置中下载模型')
-      finishTranscribe(0, 0)
-      return
+    if (taskType === 'transcribe') {
+      // 检查模型状态
+      const modelStatus = await window.electronAPI.whisper.getModelStatus()
+      if (!modelStatus?.exists) {
+        alert('SenseVoice 模型未下载，请先在设置中下载模型')
+        finishTranscribe(0, 0)
+        return
+      }
     }
 
     let successCount = 0
     let failCount = 0
     let completedCount = 0
-    const concurrency = 10
+    const concurrency = taskType === 'decrypt' ? 12 : 10
 
-    const transcribeOne = async (msg: Message) => {
+    const runOne = async (msg: Message) => {
       try {
+        if (taskType === 'decrypt') {
+          const result = await window.electronAPI.chat.getVoiceData(
+            session.username,
+            String(msg.localId),
+            msg.createTime,
+            msg.serverIdRaw || msg.serverId
+          )
+          return { success: Boolean(result.success && result.data) }
+        }
         const result = await window.electronAPI.chat.getVoiceTranscript(
           session.username,
           String(msg.localId),
@@ -3152,7 +5753,7 @@ function ChatPage(props: ChatPageProps) {
 
     for (let i = 0; i < voiceMessages.length; i += concurrency) {
       const batch = voiceMessages.slice(i, i + concurrency)
-      const results = await Promise.all(batch.map(msg => transcribeOne(msg)))
+      const results = await Promise.all(batch.map(msg => runOne(msg)))
 
       results.forEach(result => {
         if (result.success) successCount++
@@ -3163,7 +5764,7 @@ function ChatPage(props: ChatPageProps) {
     }
 
     finishTranscribe(successCount, failCount)
-  }, [sessions, currentSessionId, batchSelectedDates, batchVoiceMessages, startTranscribe, updateProgress, finishTranscribe])
+  }, [sessions, currentSessionId, batchSelectedDates, batchVoiceMessages, batchVoiceTaskType, startTranscribe, updateProgress, finishTranscribe])
 
   // 批量转写：按日期的消息数量
   const batchCountByDate = useMemo(() => {
@@ -3183,6 +5784,12 @@ function ChatPage(props: ChatPageProps) {
       batchSelectedDates.has(new Date(m.createTime * 1000).toISOString().slice(0, 10))
     ).length
   }, [batchVoiceMessages, batchSelectedDates])
+
+  const batchVoiceTaskTitle = batchVoiceTaskType === 'decrypt' ? '批量解密语音' : '批量语音转文字'
+  const batchVoiceTaskVerb = batchVoiceTaskType === 'decrypt' ? '解密' : '转写'
+  const batchVoiceTaskMinutes = Math.ceil(
+    batchSelectedMessageCount * (batchVoiceTaskType === 'decrypt' ? 0.6 : 2) / 60
+  )
 
   const toggleBatchDate = useCallback((date: string) => {
     setBatchSelectedDates(prev => {
@@ -3245,20 +5852,17 @@ function ChatPage(props: ChatPageProps) {
     }
 
     // 并发池：同时跑 concurrency 个任务
-    const pool: Promise<void>[] = []
+    const pool = new Set<Promise<void>>()
     for (const img of images) {
-      const p = decryptOne(img)
-      pool.push(p)
-      if (pool.length >= concurrency) {
+      const p = decryptOne(img).then(() => { pool.delete(p) })
+      pool.add(p)
+      if (pool.size >= concurrency) {
         await Promise.race(pool)
-        // 移除已完成的
-        for (let j = pool.length - 1; j >= 0; j--) {
-          const settled = await Promise.race([pool[j].then(() => true), Promise.resolve(false)])
-          if (settled) pool.splice(j, 1)
-        }
       }
     }
-    await Promise.all(pool)
+    if (pool.size > 0) {
+      await Promise.all(pool)
+    }
 
     finishDecrypt(successCount, failCount)
   }, [batchImageMessages, batchImageSelectedDates, batchDecryptConcurrency, currentSessionId, finishDecrypt, sessions, startDecrypt, updateDecryptProgress])
@@ -3292,53 +5896,66 @@ function ChatPage(props: ChatPageProps) {
   const selectAllBatchImageDates = useCallback(() => setBatchImageSelectedDates(new Set(batchImageDates)), [batchImageDates])
   const clearAllBatchImageDates = useCallback(() => setBatchImageSelectedDates(new Set()), [])
 
-  const lastSelectedIdRef = useRef<number | null>(null)
+  const lastSelectedKeyRef = useRef<string | null>(null)
 
-  const handleToggleSelection = useCallback((localId: number, isShiftKey: boolean = false) => {
+  const handleToggleSelection = useCallback((messageKey: string, isShiftKey: boolean = false) => {
     setSelectedMessages(prev => {
       const next = new Set(prev)
 
       // Range selection with Shift key
-      if (isShiftKey && lastSelectedIdRef.current !== null && lastSelectedIdRef.current !== localId) {
+      if (isShiftKey && lastSelectedKeyRef.current !== null && lastSelectedKeyRef.current !== messageKey) {
         const currentMsgs = useChatStore.getState().messages || []
-        const idx1 = currentMsgs.findIndex(m => m.localId === lastSelectedIdRef.current)
-        const idx2 = currentMsgs.findIndex(m => m.localId === localId)
+        const idx1 = currentMsgs.findIndex(m => getMessageKey(m) === lastSelectedKeyRef.current)
+        const idx2 = currentMsgs.findIndex(m => getMessageKey(m) === messageKey)
 
         if (idx1 !== -1 && idx2 !== -1) {
           const start = Math.min(idx1, idx2)
           const end = Math.max(idx1, idx2)
           for (let i = start; i <= end; i++) {
-            next.add(currentMsgs[i].localId)
+            next.add(getMessageKey(currentMsgs[i]))
           }
         }
       } else {
         // Normal toggle
-        if (next.has(localId)) {
-          next.delete(localId)
-          lastSelectedIdRef.current = null // Reset last selection on uncheck? Or keep? Usually keep last interaction.
+        if (next.has(messageKey)) {
+          next.delete(messageKey)
+          lastSelectedKeyRef.current = null
         } else {
-          next.add(localId)
-          lastSelectedIdRef.current = localId
+          next.add(messageKey)
+          lastSelectedKeyRef.current = messageKey
         }
       }
       return next
     })
-  }, [])
+  }, [getMessageKey])
 
   const formatBatchDateLabel = useCallback((dateStr: string) => {
     const [y, m, d] = dateStr.split('-').map(Number)
     return `${y}年${m}月${d}日`
   }, [])
 
+  const clampContextMenuPosition = useCallback((x: number, y: number) => {
+    const viewportPadding = 12
+    const estimatedMenuWidth = 180
+    const estimatedMenuHeight = 188
+    const maxLeft = Math.max(viewportPadding, window.innerWidth - estimatedMenuWidth - viewportPadding)
+    const maxTop = Math.max(viewportPadding, window.innerHeight - estimatedMenuHeight - viewportPadding)
+    return {
+      x: Math.min(Math.max(x, viewportPadding), maxLeft),
+      y: Math.min(Math.max(y, viewportPadding), maxTop)
+    }
+  }, [])
+
   // 消息右键菜单处理
   const handleContextMenu = useCallback((e: React.MouseEvent, message: Message) => {
     e.preventDefault()
+    const nextPos = clampContextMenuPosition(e.clientX, e.clientY)
     setContextMenu({
-      x: e.clientX,
-      y: e.clientY,
+      x: nextPos.x,
+      y: nextPos.y,
       message
     })
-  }, [])
+  }, [clampContextMenuPosition])
 
   // 关闭右键菜单
   useEffect(() => {
@@ -3367,11 +5984,12 @@ function ChatPage(props: ChatPageProps) {
   // 执行单条删除动作
   const performSingleDelete = async (msg: Message) => {
     try {
-      const dbPathHint = (msg as any)._db_path
+      const targetMessageKey = getMessageKey(msg)
+      const dbPathHint = msg._db_path
       const result = await (window as any).electronAPI.chat.deleteMessage(currentSessionId, msg.localId, msg.createTime, dbPathHint)
       if (result.success) {
         const currentMessages = useChatStore.getState().messages || []
-        const newMessages = currentMessages.filter(m => m.localId !== msg.localId)
+        const newMessages = currentMessages.filter(m => getMessageKey(m) !== targetMessageKey)
         useChatStore.getState().setMessages(newMessages)
       } else {
         alert('删除失败: ' + (result.error || '原因未知'))
@@ -3433,7 +6051,7 @@ function ChatPage(props: ChatPageProps) {
         if (result.success) {
           const currentMessages = useChatStore.getState().messages || []
           const newMessages = currentMessages.map(m => {
-            if (m.localId === editingMessage.message.localId) {
+            if (getMessageKey(m) === getMessageKey(editingMessage.message)) {
               return { ...m, parsedContent: finalContent, content: finalContent, rawContent: finalContent }
             }
             return m
@@ -3474,37 +6092,44 @@ function ChatPage(props: ChatPageProps) {
 
     try {
       const currentMessages = useChatStore.getState().messages || []
-      const selectedIds = Array.from(selectedMessages)
-      const deletedIds = new Set<number>()
+      const selectedKeys = Array.from(selectedMessages)
+      const deletedKeys = new Set<string>()
 
-      for (let i = 0; i < selectedIds.length; i++) {
+      for (let i = 0; i < selectedKeys.length; i++) {
         if (cancelDeleteRef.current) break
 
-        const id = selectedIds[i]
-        const msgObj = currentMessages.find(m => m.localId === id)
-        const dbPathHint = (msgObj as any)?._db_path
+        const key = selectedKeys[i]
+        const msgObj = currentMessages.find(m => getMessageKey(m) === key)
+        const dbPathHint = msgObj?._db_path
         const createTime = msgObj?.createTime || 0
+        const localId = msgObj?.localId || 0
 
-        try {
-          const result = await (window as any).electronAPI.chat.deleteMessage(currentSessionId, id, createTime, dbPathHint)
-          if (result.success) {
-            deletedIds.add(id)
-          }
-        } catch (err) {
-          console.error(`删除消息 ${id} 失败:`, err)
+        if (!msgObj) {
+          setDeleteProgress({ current: i + 1, total: selectedKeys.length })
+          continue
         }
 
-        setDeleteProgress({ current: i + 1, total: selectedIds.length })
+        try {
+          const result = await (window as any).electronAPI.chat.deleteMessage(currentSessionId, localId, createTime, dbPathHint)
+          if (result.success) {
+            deletedKeys.add(key)
+          }
+        } catch (err) {
+          console.error(`删除消息 ${localId} 失败:`, err)
+        }
+
+        setDeleteProgress({ current: i + 1, total: selectedKeys.length })
       }
 
-      const finalMessages = (useChatStore.getState().messages || []).filter(m => !deletedIds.has(m.localId))
+      const finalMessages = (useChatStore.getState().messages || []).filter(m => !deletedKeys.has(getMessageKey(m)))
       useChatStore.getState().setMessages(finalMessages)
 
       setIsSelectionMode(false)
-      setSelectedMessages(new Set())
+      setSelectedMessages(new Set<string>())
+      lastSelectedKeyRef.current = null
 
       if (cancelDeleteRef.current) {
-        alert(`操作已中止。已删除 ${deletedIds.size} 条，剩余记录保留。`)
+        alert(`操作已中止。已删除 ${deletedKeys.size} 条，剩余记录保留。`)
       }
     } catch (e) {
       alert('批量删除出现错误: ' + String(e))
@@ -3515,6 +6140,89 @@ function ChatPage(props: ChatPageProps) {
       cancelDeleteRef.current = false
     }
   }
+
+  const messageVirtuosoComponents = useMemo(() => ({
+    Header: () => (
+      hasMoreMessages ? (
+        <div className={`load-more-trigger ${isLoadingMore ? 'loading' : ''}`}>
+          {isLoadingMore ? (
+            <>
+              <Loader2 size={14} />
+              <span>加载更多...</span>
+            </>
+          ) : (
+            <span>向上滚动加载更多</span>
+          )}
+        </div>
+      ) : null
+    ),
+    Footer: () => (
+      hasMoreLater ? (
+        <div className={`load-more-trigger later ${isLoadingMore ? 'loading' : ''}`}>
+          {isLoadingMore ? (
+            <>
+              <Loader2 size={14} />
+              <span>正在加载后续消息...</span>
+            </>
+          ) : (
+            <span>向下滚动查看更新消息</span>
+          )}
+        </div>
+      ) : null
+    )
+  }), [hasMoreMessages, hasMoreLater, isLoadingMore])
+
+  const renderMessageListItem = useCallback((index: number, msg: Message) => {
+    if (!currentSession) return null
+
+    const prevMsg = index > 0 ? messages[index - 1] : undefined
+    const showDateDivider = shouldShowDateDivider(msg, prevMsg)
+    const showTime = !prevMsg || (msg.createTime - prevMsg.createTime > 300)
+    const isSent = msg.isSend === 1
+    const isSystem = isSystemMessage(msg.localType)
+    const wrapperClass = isSystem ? 'system' : (isSent ? 'sent' : 'received')
+    const messageKey = getMessageKey(msg)
+
+    return (
+      <div className={`message-wrapper ${wrapperClass} ${highlightedMessageSet.has(messageKey) ? 'new-message' : ''}`}>
+        {showDateDivider && (
+          <div className="date-divider">
+            <span>{formatDateDivider(msg.createTime)}</span>
+          </div>
+        )}
+        <MemoMessageBubble
+          message={msg}
+          session={currentSession!}
+          showTime={!showDateDivider && showTime}
+          myAvatarUrl={myAvatarUrl}
+          myWxid={myWxid}
+          isGroupChat={isCurrentSessionGroup}
+          autoTranscribeVoiceEnabled={autoTranscribeVoiceEnabled}
+          onRequireModelDownload={handleRequireModelDownload}
+          onContextMenu={handleContextMenu}
+          isSelectionMode={isSelectionMode}
+          messageKey={messageKey}
+          isSelected={selectedMessages.has(messageKey)}
+          onToggleSelection={handleToggleSelection}
+        />
+      </div>
+    )
+  }, [
+    messages,
+    highlightedMessageSet,
+    getMessageKey,
+    formatDateDivider,
+    currentSession,
+    myAvatarUrl,
+    myWxid,
+    isCurrentSessionGroup,
+    autoTranscribeVoiceEnabled,
+    handleRequireModelDownload,
+    handleContextMenu,
+    isSelectionMode,
+    selectedMessages,
+    handleToggleSelection
+  ])
 
   return (
     <div className={`chat-page ${isResizing ? 'resizing' : ''} ${standaloneSessionWindow ? 'standalone session-only' : ''}`}>
@@ -3595,7 +6303,7 @@ function ChatPage(props: ChatPageProps) {
         ref={sidebarRef}
         style={{ width: sidebarWidth, minWidth: sidebarWidth, maxWidth: sidebarWidth }}
       >
-        <div className={`session-header session-header-viewport ${foldedView ? 'folded' : ''}`}>
+        <div className={`session-header session-header-viewport ${foldedView || bizView ? 'folded' : ''}`}>
           {/* 普通 header */}
           <div className="session-header-panel main-header">
             <div className="search-row">
@@ -3606,10 +6314,13 @@ function ChatPage(props: ChatPageProps) {
                   type="text"
                   placeholder="搜索"
                   value={searchKeyword}
-                  onChange={(e) => handleSearch(e.target.value)}
+                  onChange={(e) => {
+                    handleSearch(e.target.value)
+                    handleGlobalMsgSearch(e.target.value)
+                  }}
                 />
                 {searchKeyword && (
-                  <button className="close-search" onClick={handleCloseSearch}>
+                  <button className="close-search" onClick={() => { handleCloseSearch(); handleCloseGlobalMsgSearch() }}>
                     <X size={12} />
                   </button>
                 )}
@@ -3617,23 +6328,23 @@ function ChatPage(props: ChatPageProps) {
               <button className="icon-btn refresh-btn" onClick={handleRefresh} disabled={isLoadingSessions || isRefreshingSessions}>
                 <RefreshCw size={16} className={(isLoadingSessions || isRefreshingSessions) ? 'spin' : ''} />
               </button>
-              {isSessionListSyncing && (
-                <div className="session-sync-indicator">
-                  <Loader2 size={12} className="spin" />
-                  <span>同步中</span>
-                </div>
-              )}
             </div>
           </div>
           {/* 折叠群 header */}
           <div className="session-header-panel folded-header">
             <div className="folded-view-header">
-              <button className="icon-btn back-btn" onClick={() => setFoldedView(false)}>
+              <button className="icon-btn back-btn" onClick={() => {
+                setFoldedView(false)
+                setBizView(false)
+              }}>
                 <ChevronLeft size={18} />
               </button>
               <span className="folded-view-title">
-                <Users size={14} />
-                折叠的群聊
+                {foldedView ? (
+                    <><Users size={14} /> 折叠的群聊</>
+                ) : bizView ? (
+                    <><Newspaper size={14} /> 订阅号/服务号</>
+                ) : null}
               </span>
             </div>
           </div>
@@ -3644,6 +6355,85 @@ function ChatPage(props: ChatPageProps) {
             <AlertCircle size={16} />
             <span>{connectionError}</span>
             <button onClick={connect}>重试</button>
+          </div>
+        )}
+
+        {/* 全局消息搜索结果 */}
+        {globalMsgQuery && (
+          <div className="global-msg-search-results">
+            {globalMsgSearchError ? (
+              <div className="no-results">
+                <AlertCircle size={32} />
+                <p>{globalMsgSearchError}</p>
+              </div>
+            ) : globalMsgResults.length > 0 ? (
+              <>
+                <div className="search-section-header">
+                  聊天记录：
+                  {globalMsgSearching && (
+                    <span className="search-phase-hint">
+                      {globalMsgIsBackfilling
+                        ? `补全中 ${globalMsgAuthoritativeSessionCount > 0 ? `(${globalMsgAuthoritativeSessionCount})` : ''}...`
+                        : '搜索中...'}
+                    </span>
+                  )}
+                  {!globalMsgSearching && globalMsgSearchPhase === 'done' && (
+                    <span className="search-phase-hint done">已完成</span>
+                  )}
+                </div>
+                <div className="search-results-list">
+                  {groupedGlobalMsgResults.map(([sessionId, messages]) => {
+                    const session = sessionLookupMap.get(sessionId)
+                    const firstMsg = messages[0]
+                    const count = messages.length
+                    return (
+                      <div
+                        key={sessionId}
+                        className="session-item"
+                        onClick={() => {
+                          if (session) {
+                            pendingInSessionSearchRef.current = {
+                              sessionId,
+                              keyword: globalMsgQuery,
+                              firstMsgTime: firstMsg.createTime || 0,
+                              results: messages
+                            }
+                            handleSelectSession(session)
+                          }
+                        }}
+                      >
+                        <Avatar
+                          src={session?.avatarUrl}
+                          name={session?.displayName || sessionId}
+                          size={48}
+                        />
+                        <div className="session-content">
+                          <div className="session-top">
+                            <span className="session-name">{session?.displayName || sessionId}</span>
+                          </div>
+                          <div className="session-preview">
+                            <HighlightTextNoTruncate text={firstMsg.parsedContent || firstMsg.content || ''} keyword={globalMsgQuery} />
+                          </div>
+                          {count > 1 && (
+                            <div className="search-count">共 {count} 条相关聊天记录</div>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </>
+            ) : globalMsgSearching ? (
+              <div className="search-loading">
+                <Loader2 className="spin" size={20} />
+                <span>{globalMsgSearchPhase === 'seed' ? '搜索中...' : '补全中...'}</span>
+              </div>
+            ) : (
+              <div className="no-results">
+                <MessageSquare size={32} />
+                <p>未找到相关消息</p>
+              </div>
+            )}
           </div>
         )}
 
@@ -3661,34 +6451,40 @@ function ChatPage(props: ChatPageProps) {
             ))}
           </div>
         ) : (
-          <div className={`session-list-viewport ${foldedView ? 'folded' : ''}`}>
+          <div className={`session-list-viewport ${foldedView || bizView ? 'folded' : ''}`}>
             {/* 普通会话列表 */}
             <div className="session-list-panel main-panel">
               {Array.isArray(filteredSessions) && filteredSessions.length > 0 ? (
-                <div
-                  className="session-list"
-                  ref={sessionListRef}
-                  onScroll={() => {
-                    isScrollingRef.current = true
-                    if (sessionScrollTimeoutRef.current) {
-                      clearTimeout(sessionScrollTimeoutRef.current)
-                    }
-                    sessionScrollTimeoutRef.current = window.setTimeout(() => {
-                      isScrollingRef.current = false
-                      sessionScrollTimeoutRef.current = null
-                    }, 200)
-                  }}
-                >
-                  {filteredSessions.map(session => (
+                <>
+                  {searchKeyword && (
+                    <div className="search-section-header">联系人：</div>
+                  )}
+                  <div
+                    className="session-list"
+                    ref={sessionListRef}
+                    onScroll={() => {
+                      isScrollingRef.current = true
+                      if (sessionScrollTimeoutRef.current) {
+                        clearTimeout(sessionScrollTimeoutRef.current)
+                      }
+                      sessionScrollTimeoutRef.current = window.setTimeout(() => {
+                        isScrollingRef.current = false
+                        sessionScrollTimeoutRef.current = null
+                      }, 200)
+                    }}
+                  >
+                    {filteredSessions.map(session => (
                     <SessionItem
                       key={session.username}
                       session={session}
-                      isActive={currentSessionId === session.username}
+                      isActive={currentSessionId === session.username || (bizView && session.username === OFFICIAL_ACCOUNTS_VIRTUAL_ID)}
                       onSelect={handleSelectSession}
                       formatTime={formatSessionTime}
+                      searchKeyword={searchKeyword}
                     />
                   ))}
                 </div>
+                </>
               ) : (
                 <div className="empty-sessions">
                   <MessageSquare />
@@ -3700,54 +6496,66 @@ function ChatPage(props: ChatPageProps) {
 
             {/* 折叠群列表 */}
             <div className="session-list-panel folded-panel">
-              {foldedSessions.length > 0 ? (
-                <div className="session-list">
-                  {foldedSessions.map(session => (
-                    <SessionItem
-                      key={session.username}
-                      session={session}
-                      isActive={currentSessionId === session.username}
-                      onSelect={handleSelectSession}
-                      formatTime={formatSessionTime}
+              {foldedView && (
+                  foldedSessions.length > 0 ? (
+                      <div className="session-list">
+                        {foldedSessions.map(session => (
+                            <SessionItem
+                                key={session.username}
+                                session={session}
+                                isActive={currentSessionId === session.username || (bizView && session.username === OFFICIAL_ACCOUNTS_VIRTUAL_ID)}
+                                onSelect={handleSelectSession}
+                                formatTime={formatSessionTime}
+                                searchKeyword={searchKeyword}
+                            />
+                        ))}
+                      </div>
+                  ) : (
+                      <div className="empty-sessions">
+                        <Users size={32} />
+                        <p>没有折叠的群聊</p>
+                      </div>
+                  )
+              )}
+
+              {bizView && (
+                  <div style={{ height: '100%', overflowY: 'auto' }}>
+                    <BizAccountList
+                        onSelect={setSelectedBizAccount}
+                        selectedUsername={selectedBizAccount?.username}
+                        searchKeyword={searchKeyword}
                     />
-                  ))}
-                </div>
-              ) : (
-                <div className="empty-sessions">
-                  <Users size={32} />
-                  <p>没有折叠的群聊</p>
-                </div>
+                  </div>
               )}
             </div>
           </div>
         )}
-
-
       </div>
       )}
 
-      {/* 拖动调节条 */}
       {!standaloneSessionWindow && <div className="resize-handle" onMouseDown={handleResizeStart} />}
 
       {/* 右侧消息区域 */}
       <div className="message-area">
-        {currentSession ? (
-          <>
-            <div className="message-header">
+        {bizView ? (
+            <BizMessageArea account={selectedBizAccount} />
+        ) : currentSession ? (
+            <>
+              <div className="message-header">
               <Avatar
                 src={currentSession.avatarUrl}
                 name={currentSession.displayName || currentSession.username}
                 size={40}
-                className={isGroupChatSession(currentSession.username) ? 'group session-avatar' : 'session-avatar'}
+                className={isCurrentSessionGroup ? 'group session-avatar' : 'session-avatar'}
               />
               <div className="header-info">
                 <h3>{currentSession.displayName || currentSession.username}</h3>
-                {isGroupChatSession(currentSession.username) && (
+                {isCurrentSessionGroup && (
                   <div className="header-subtitle">群聊</div>
                 )}
               </div>
               <div className="header-actions">
-                {!standaloneSessionWindow && isGroupChatSession(currentSession.username) && (
+                {!standaloneSessionWindow && isCurrentSessionGroup && (
                   <button
                     className="icon-btn group-analytics-btn"
                     onClick={handleGroupAnalytics}
@@ -3756,7 +6564,7 @@ function ChatPage(props: ChatPageProps) {
                     <BarChart3 size={18} />
                   </button>
                 )}
-                {isGroupChatSession(currentSession.username) && (
+                {isCurrentSessionGroup && (
                   <button
                     className={`icon-btn group-members-btn ${showGroupMembersPanel ? 'active' : ''}`}
                     onClick={toggleGroupMembersPanel}
@@ -3779,6 +6587,16 @@ function ChatPage(props: ChatPageProps) {
                     )}
                   </button>
                 )}
+                {!standaloneSessionWindow && isCurrentSessionPrivateSnsSupported && (
+                  <button
+                    className="icon-btn chat-sns-timeline-btn"
+                    onClick={openCurrentSessionSnsTimeline}
+                    disabled={!currentSessionId}
+                    title="查看对方朋友圈"
+                  >
+                    <Aperture size={18} />
+                  </button>
+                )}
                 {!standaloneSessionWindow && (
                   <button
                     className={`icon-btn batch-transcribe-btn${isBatchTranscribing ? ' transcribing' : ''}`}
@@ -3790,7 +6608,9 @@ function ChatPage(props: ChatPageProps) {
                       }
                     }}
                     disabled={!currentSessionId}
-                    title={isBatchTranscribing ? `批量转写中 (${batchTranscribeProgress.current}/${batchTranscribeProgress.total})，点击查看进度` : '批量语音转文字'}
+                    title={isBatchTranscribing
+                      ? `${runningBatchVoiceTaskType === 'decrypt' ? '批量语音解密' : '批量转写'}中 (${batchTranscribeProgress.current}/${batchTranscribeProgress.total})，点击查看进度`
+                      : '批量语音处理（解密/转文字）'}
                   >
                     {isBatchTranscribing ? (
                       <Loader2 size={18} className="spin" />
@@ -3856,6 +6676,14 @@ function ChatPage(props: ChatPageProps) {
                   document.body
                 )}
                 <button
+                  className={`icon-btn in-session-search-btn ${showInSessionSearch ? 'active' : ''}`}
+                  onClick={handleToggleInSessionSearch}
+                  disabled={!currentSessionId}
+                  title="搜索会话消息"
+                >
+                  <Search size={18} />
+                </button>
+                <button
                   className="icon-btn refresh-messages-btn"
                   onClick={handleRefreshMessages}
                   disabled={isRefreshingMessages || isLoadingMessages}
@@ -3863,13 +6691,15 @@ function ChatPage(props: ChatPageProps) {
                 >
                   <RefreshCw size={18} className={isRefreshingMessages ? 'spin' : ''} />
                 </button>
-                <button
-                  className={`icon-btn detail-btn ${showDetailPanel ? 'active' : ''}`}
-                  onClick={toggleDetailPanel}
-                  title="会话详情"
-                >
-                  <Info size={18} />
-                </button>
+                {!shouldHideStandaloneDetailButton && (
+                  <button
+                    className={`icon-btn detail-btn ${showDetailPanel ? 'active' : ''}`}
+                    onClick={toggleDetailPanel}
+                    title="会话详情"
+                  >
+                    <Info size={18} />
+                  </button>
+                )}
               </div>
             </div>
 
@@ -3880,7 +6710,108 @@ function ChatPage(props: ChatPageProps) {
               </div>
             )}
 
+            <ContactSnsTimelineDialog
+              target={chatSnsTimelineTarget}
+              onClose={() => setChatSnsTimelineTarget(null)}
+            />
+
+            {/* 会话内搜索浮窗 */}
+            {showInSessionSearch && (
+              <div className="in-session-search-popup">
+                <div className="in-session-search-header">
+                  <Search size={16} className="search-icon" />
+                  <input
+                    ref={inSessionSearchRef}
+                    type="text"
+                    placeholder="搜索消息..."
+                    value={inSessionQuery}
+                    onChange={e => handleInSessionSearch(e.target.value)}
+                    className="search-input"
+                  />
+                  {inSessionSearching && <Loader2 size={16} className="spin" />}
+                  <button className="close-btn" onClick={handleToggleInSessionSearch}>
+                    <X size={16} />
+                  </button>
+                </div>
+                {inSessionQuery && (
+                  <div className="search-result-header">
+                    {inSessionSearching
+                      ? '搜索中...'
+                      : inSessionSearchError
+                        ? '搜索失败'
+                        : `找到 ${inSessionResults.length} 条结果`}
+                  </div>
+                )}
+                {inSessionQuery && !inSessionSearching && inSessionSearchError && (
+                  <div className="no-results">
+                    <AlertCircle size={32} />
+                    <p>{inSessionSearchError}</p>
+                  </div>
+                )}
+                {inSessionResults.length > 0 && (
+                  <div className="in-session-results">
+                    {inSessionResults.map((msg, i) => {
+                      const resolvedSenderDisplayName = resolveSearchSenderDisplayName(
+                        msg.senderDisplayName,
+                        msg.senderUsername,
+                        currentSessionId
+                      )
+                      const resolvedSenderUsername = resolveSearchSenderUsernameFallback(msg.senderUsername)
+                      const resolvedSenderAvatarUrl = normalizeSearchAvatarUrl(msg.senderAvatarUrl)
+                      const resolvedCurrentSessionName = normalizeSearchIdentityText(currentSession?.displayName) ||
+                        resolveSearchSenderUsernameFallback(currentSession?.username) ||
+                        resolveSearchSenderUsernameFallback(currentSessionId)
+                      const senderName = resolvedSenderDisplayName || (
+                        msg.isSend === 1
+                          ? '我'
+                          : (isCurrentSessionPrivateSnsSupported
+                              ? resolvedCurrentSessionName || (inSessionEnriching ? '加载中...' : '未知')
+                              : resolvedSenderUsername || (inSessionEnriching ? '加载中...' : '未知成员'))
+                      )
+                      const senderAvatar = resolvedSenderAvatarUrl || (
+                        msg.isSend === 1
+                          ? myAvatarUrl
+                          : (isCurrentSessionPrivateSnsSupported ? normalizeSearchAvatarUrl(currentSession?.avatarUrl) : undefined)
+                      )
+                      const senderAvatarLoading = inSessionEnriching && !senderAvatar
+                      const previewText = (msg.parsedContent || msg.content || '').slice(0, 80)
+                      const displayTime = msg.createTime
+                        ? new Date(msg.createTime * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+                        : ''
+                      const resultKey = getMessageKey(msg)
+
+                      return (
+                        <div key={resultKey} className="result-item" onClick={() => handleInSessionResultJump(msg)}>
+                          <div className="result-header">
+                            <Avatar src={senderAvatar} name={senderName} size={32} loading={senderAvatarLoading} />
+                          </div>
+                          <div className="result-content">
+                            <span className="result-sender">{senderName}</span>
+                            <span className="result-text">{previewText}</span>
+                          </div>
+                          <span className="result-time">{displayTime}</span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+                {inSessionQuery && !inSessionSearching && !inSessionSearchError && inSessionResults.length === 0 && (
+                  <div className="no-results">
+                    <MessageSquare size={32} />
+                    <p>未找到相关消息</p>
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className={`message-content-wrapper ${hasInitialMessages ? 'loaded' : 'loading'} ${isSessionSwitching ? 'switching' : ''}`}>
+              {standaloneSessionWindow && standaloneLoadStage !== 'ready' && (
+                <div className="standalone-phase-overlay" role="status" aria-live="polite">
+                  <Loader2 size={22} className="spin" />
+                  <span>{standaloneLoadStage === 'connecting' ? '正在建立连接...' : '正在加载最近消息...'}</span>
+                  {connectionError && <small>{connectionError}</small>}
+                </div>
+              )}
               {isLoadingMessages && (!hasInitialMessages || isSessionSwitching) && (
                 <div className="loading-messages loading-overlay">
                   <Loader2 size={24} />
@@ -3889,76 +6820,35 @@ function ChatPage(props: ChatPageProps) {
               )}
               <div
                 className={`message-list ${hasInitialMessages ? 'loaded' : 'loading'}`}
-                ref={messageListRef}
-                onScroll={handleScroll}
+                ref={handleMessageListScrollParentRef}
+                onScroll={markMessageListScrolling}
+                onWheel={handleMessageListWheel}
               >
-                {hasMoreMessages && (
-                  <div className={`load-more-trigger ${isLoadingMore ? 'loading' : ''}`}>
-                    {isLoadingMore ? (
-                      <>
-                        <Loader2 size={14} />
-                        <span>加载更多...</span>
-                      </>
-                    ) : (
-                      <span>向上滚动加载更多</span>
-                    )}
-                  </div>
-                )}
-
-                {!isLoadingMessages && messages.length === 0 && !hasMoreMessages && (
+                {!isLoadingMessages && messages.length === 0 && !hasMoreMessages ? (
                   <div className="empty-chat-inline">
                     <MessageSquare size={32} />
                     <span>该联系人没有聊天记录</span>
                   </div>
-                )}
-
-                {(messages || []).map((msg, index) => {
-                  const prevMsg = index > 0 ? messages[index - 1] : undefined
-                  const showDateDivider = shouldShowDateDivider(msg, prevMsg)
-
-                  // 显示时间:第一条消息,或者与上一条消息间隔超过5分钟
-                  const showTime = !prevMsg || (msg.createTime - prevMsg.createTime > 300)
-                  const isSent = msg.isSend === 1
-                  const isSystem = isSystemMessage(msg.localType)
-
-                  // 系统消息居中显示
-                  const wrapperClass = isSystem ? 'system' : (isSent ? 'sent' : 'received')
-
-                  const messageKey = getMessageKey(msg)
-                  return (
-                    <div key={messageKey} className={`message-wrapper ${wrapperClass} ${highlightedMessageSet.has(messageKey) ? 'new-message' : ''}`}>
-                      {showDateDivider && (
-                        <div className="date-divider">
-                          <span>{formatDateDivider(msg.createTime)}</span>
-                        </div>
-                      )}
-                      <MessageBubble
-                        message={msg}
-                        session={currentSession}
-                        showTime={!showDateDivider && showTime}
-                        myAvatarUrl={myAvatarUrl}
-                        isGroupChat={isGroupChatSession(currentSession.username)}
-                        onRequireModelDownload={handleRequireModelDownload}
-                        onContextMenu={handleContextMenu}
-                        isSelectionMode={isSelectionMode}
-                        isSelected={selectedMessages.has(msg.localId)}
-                        onToggleSelection={handleToggleSelection}
-                      />
-                    </div>
-                  )
-                })}
-
-                {hasMoreLater && (
-                  <div className={`load-more-trigger later ${isLoadingMore ? 'loading' : ''}`}>
-                    {isLoadingMore ? (
-                      <>
-                        <Loader2 size={14} />
-                        <span>正在加载后续消息...</span>
-                      </>
-                    ) : (
-                      <span>向下滚动查看更新消息</span>
+                ) : (
+                  <Virtuoso
+                    ref={messageVirtuosoRef}
+                    className="message-virtuoso"
+                    customScrollParent={messageListScrollParent ?? undefined}
+                    data={messages}
+                    overscan={220}
+                    followOutput={(atBottom) => (
+                      prependingHistoryRef.current
+                        ? false
+                        : (atBottom && isMessageListAtBottomRef.current ? 'auto' : false)
                     )}
-                  </div>
+                    atBottomThreshold={80}
+                    atBottomStateChange={handleMessageAtBottomStateChange}
+                    atTopStateChange={handleMessageAtTopStateChange}
+                    rangeChanged={handleMessageRangeChanged}
+                    computeItemKey={(_, msg) => getMessageKey(msg)}
+                    components={messageVirtuosoComponents}
+                    itemContent={renderMessageListItem}
+                  />
                 )}
 
                 {/* 回到底部按钮 */}
@@ -3969,7 +6859,7 @@ function ChatPage(props: ChatPageProps) {
               </div>
 
               {/* 群成员面板 */}
-              {showGroupMembersPanel && isGroupChatSession(currentSession.username) && (
+              {showGroupMembersPanel && isCurrentSessionGroup && (
                 <div className="detail-panel group-members-panel">
                   <div className="detail-header">
                     <h4>群成员</h4>
@@ -4031,12 +6921,12 @@ function ChatPage(props: ChatPageProps) {
                                 <div className="group-member-badges">
                                   {member.isOwner && (
                                     <span className="member-flag owner" title="群主">
-                                      <Crown size={12} />
+                                      群主
                                     </span>
                                   )}
                                   {member.isFriend && (
                                     <span className="member-flag friend" title="好友">
-                                      <UserCheck size={12} />
+                                      好友
                                     </span>
                                   )}
                                 </div>
@@ -4062,13 +6952,7 @@ function ChatPage(props: ChatPageProps) {
 
               {/* 会话详情面板 */}
               {showDetailPanel && (
-                <div className="detail-panel">
-                  <div className="detail-header">
-                    <h4>会话详情</h4>
-                    <button className="close-btn" onClick={() => setShowDetailPanel(false)}>
-                      <X size={16} />
-                    </button>
-                  </div>
+                <div className="detail-panel session-detail-panel">
                   {isLoadingDetail && !sessionDetail ? (
                     <div className="detail-loading">
                       <Loader2 size={20} className="spin" />
@@ -4076,7 +6960,27 @@ function ChatPage(props: ChatPageProps) {
                     </div>
                   ) : sessionDetail ? (
                     <div className="detail-content">
-                      <div className="detail-section">
+                      <div className="detail-overview-card">
+                        <Avatar
+                          src={currentSession?.avatarUrl}
+                          name={sessionDetail.remark || sessionDetail.nickName || currentSession?.displayName || sessionDetail.wxid}
+                          size={42}
+                          className="detail-overview-avatar"
+                        />
+                        <div className="detail-overview-meta">
+                          <span className="detail-overview-name">
+                            {sessionDetail.remark || sessionDetail.nickName || currentSession?.displayName || sessionDetail.alias || sessionDetail.wxid}
+                          </span>
+                          <span className="detail-overview-sub">
+                            {sessionDetail.alias || sessionDetail.wxid}
+                          </span>
+                        </div>
+                        <button className="detail-overview-close-btn" onClick={() => setShowDetailPanel(false)} title="关闭详情">
+                          <X size={16} />
+                        </button>
+                      </div>
+
+                      <div className="detail-section detail-basic-section">
                         <div className="detail-item">
                           <Hash size={14} />
                           <span className="label">微信ID</span>
@@ -4114,10 +7018,10 @@ function ChatPage(props: ChatPageProps) {
                         )}
                       </div>
 
-                      <div className="detail-section">
+                      <div className="detail-section detail-stats-section">
                         <div className="section-title">
                           <MessageSquare size={14} />
-                          <span>消息统计（导出口径）</span>
+                          <span>消息统计</span>
                         </div>
                         <div className="detail-stats-meta">
                           {isRefreshingDetailStats
@@ -4275,7 +7179,7 @@ function ChatPage(props: ChatPageProps) {
                         </div>
                       </div>
 
-                      <div className="detail-section">
+                      <div className="detail-section detail-db-section">
                         <div className="section-title">
                           <Database size={14} />
                           <span>数据库分布</span>
@@ -4324,12 +7228,13 @@ function ChatPage(props: ChatPageProps) {
             // 下载完成后，触发页面刷新让组件重新尝试转写
             // 通过更新缓存触发组件重新检查
             if (pendingVoiceTranscriptRequest) {
-              // 清除缓存中的请求标记，让组件可以重新尝试
-              const cacheKey = `voice-transcript:${pendingVoiceTranscriptRequest.messageId}`
               // 不直接调用转写，而是让组件自己重试
               // 通过触发一个自定义事件来通知所有 MessageBubble 组件
               window.dispatchEvent(new CustomEvent('model-downloaded', {
-                detail: { messageId: pendingVoiceTranscriptRequest.messageId }
+                detail: {
+                  sessionId: pendingVoiceTranscriptRequest.sessionId,
+                  messageId: pendingVoiceTranscriptRequest.messageId
+                }
               }))
             }
             setPendingVoiceTranscriptRequest(null)
@@ -4343,10 +7248,26 @@ function ChatPage(props: ChatPageProps) {
           <div className="batch-modal-content batch-confirm-modal" onClick={(e) => e.stopPropagation()}>
             <div className="batch-modal-header">
               <Mic size={20} />
-              <h3>批量语音转文字</h3>
+              <h3>{batchVoiceTaskTitle}</h3>
             </div>
             <div className="batch-modal-body">
-              <p>选择要转写的日期（仅显示有语音的日期），然后开始转写。</p>
+              <p>先选择任务类型，再选择日期（仅显示有语音的日期），然后开始处理。</p>
+              <div className="batch-task-switch" role="tablist" aria-label="语音批量任务类型">
+                <button
+                  type="button"
+                  className={`batch-task-btn${batchVoiceTaskType === 'decrypt' ? ' active' : ''}`}
+                  onClick={() => setBatchVoiceTaskType('decrypt')}
+                >
+                  批量解密语音
+                </button>
+                <button
+                  type="button"
+                  className={`batch-task-btn${batchVoiceTaskType === 'transcribe' ? ' active' : ''}`}
+                  onClick={() => setBatchVoiceTaskType('transcribe')}
+                >
+                  批量转文字
+                </button>
+              </div>
               {batchVoiceDates.length > 0 && (
                 <div className="batch-dates-list-wrap">
                   <div className="batch-dates-actions">
@@ -4381,12 +7302,16 @@ function ChatPage(props: ChatPageProps) {
                 </div>
                 <div className="info-item">
                   <span className="label">预计耗时:</span>
-                  <span className="value">约 {Math.ceil(batchSelectedMessageCount * 2 / 60)} 分钟</span>
+                  <span className="value">约 {batchVoiceTaskMinutes} 分钟</span>
                 </div>
               </div>
               <div className="batch-warning">
                 <AlertCircle size={16} />
-                <span>批量转写可能需要较长时间，转写过程中可以继续使用其他功能。已转写过的语音会自动跳过。</span>
+                <span>
+                  {batchVoiceTaskType === 'decrypt'
+                    ? '批量解密会预先缓存语音数据，之后播放和转写会更快。解密过程中可以继续使用其他功能。'
+                    : '批量转写可能需要较长时间，转写过程中可以继续使用其他功能。已转写过的语音会自动跳过。'}
+                </span>
               </div>
             </div>
             <div className="batch-modal-footer">
@@ -4395,7 +7320,7 @@ function ChatPage(props: ChatPageProps) {
               </button>
               <button className="btn-primary batch-transcribe-start-btn" onClick={confirmBatchTranscribe}>
                 <Mic size={16} />
-                开始转写
+                开始{batchVoiceTaskVerb}
               </button>
             </div>
           </div>
@@ -4499,14 +7424,16 @@ function ChatPage(props: ChatPageProps) {
       {contextMenu && createPortal(
         <>
           <div className="context-menu-overlay" onClick={() => setContextMenu(null)}
-            style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 9998 }} />
+            style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 12040 }} />
           <div
             className="context-menu"
             style={{
               position: 'fixed',
               top: contextMenu.y,
               left: contextMenu.x,
-              zIndex: 9999
+              zIndex: 12050,
+              maxHeight: 'min(280px, calc(100vh - 24px))',
+              overflowY: 'auto'
             }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -4516,7 +7443,8 @@ function ChatPage(props: ChatPageProps) {
             </div>
             <div className="menu-item" onClick={() => {
               setIsSelectionMode(true)
-              setSelectedMessages(new Set([contextMenu.message.localId]))
+              setSelectedMessages(new Set<string>([getMessageKey(contextMenu.message)]))
+              lastSelectedKeyRef.current = getMessageKey(contextMenu.message)
               setContextMenu(null)
             }}>
               <CheckSquare size={16} />
@@ -4792,7 +7720,8 @@ function ChatPage(props: ChatPageProps) {
             className="btn-secondary"
             onClick={() => {
               setIsSelectionMode(false)
-              setSelectedMessages(new Set())
+              setSelectedMessages(new Set<string>())
+              lastSelectedKeyRef.current = null
             }}
             style={{
               padding: '6px 16px',
@@ -4839,8 +7768,39 @@ const emojiDataUrlCache = new Map<string, string>()
 const imageDataUrlCache = new Map<string, string>()
 const voiceDataUrlCache = new Map<string, string>()
 const voiceTranscriptCache = new Map<string, string>()
+type SharedImageDecryptResult = { success: boolean; localPath?: string; liveVideoPath?: string; error?: string }
+const imageDecryptInFlight = new Map<string, Promise<SharedImageDecryptResult>>()
 const senderAvatarCache = new Map<string, { avatarUrl?: string; displayName?: string }>()
 const senderAvatarLoading = new Map<string, Promise<{ avatarUrl?: string; displayName?: string } | null>>()
+
+function getSharedImageDecryptTask(
+  key: string,
+  createTask: () => Promise<SharedImageDecryptResult>
+): Promise<SharedImageDecryptResult> {
+  const existing = imageDecryptInFlight.get(key)
+  if (existing) return existing
+  const task = createTask().finally(() => {
+    if (imageDecryptInFlight.get(key) === task) {
+      imageDecryptInFlight.delete(key)
+    }
+  })
+  imageDecryptInFlight.set(key, task)
+  return task
+}
+
+const buildVoiceCacheIdentity = (
+  sessionId: string,
+  message: Pick<Message, 'localId' | 'createTime' | 'serverId' | 'serverIdRaw'>
+): string => {
+  const normalizedSessionId = String(sessionId || '').trim()
+  const localId = Math.max(0, Math.floor(Number(message?.localId || 0)))
+  const createTime = Math.max(0, Math.floor(Number(message?.createTime || 0)))
+  const serverIdRaw = String(message?.serverIdRaw ?? message?.serverId ?? '').trim()
+  const serverId = /^\d+$/.test(serverIdRaw)
+    ? serverIdRaw.replace(/^0+(?=\d)/, '')
+    : String(Math.max(0, Math.floor(Number(serverIdRaw || 0))))
+  return `${normalizedSessionId}:${localId}:${createTime}:${serverId || '0'}`
+}
 
 // 引用消息中的动画表情组件
 function QuotedEmoji({ cdnUrl, md5 }: { cdnUrl: string; md5?: string }) {
@@ -4870,10 +7830,13 @@ function QuotedEmoji({ cdnUrl, md5 }: { cdnUrl: string; md5?: string }) {
 // 消息气泡组件
 function MessageBubble({
   message,
+  messageKey,
   session,
   showTime,
   myAvatarUrl,
+  myWxid,
   isGroupChat,
+  autoTranscribeVoiceEnabled,
   onRequireModelDownload,
   onContextMenu,
   isSelectionMode,
@@ -4881,15 +7844,18 @@ function MessageBubble({
   onToggleSelection
 }: {
   message: Message;
+  messageKey: string;
   session: ChatSession;
   showTime?: boolean;
   myAvatarUrl?: string;
+  myWxid?: string;
   isGroupChat?: boolean;
+  autoTranscribeVoiceEnabled?: boolean;
   onRequireModelDownload?: (sessionId: string, messageId: string) => void;
   onContextMenu?: (e: React.MouseEvent, message: Message) => void;
   isSelectionMode?: boolean;
   isSelected?: boolean;
-  onToggleSelection?: (localId: number, isShiftKey?: boolean) => void;
+  onToggleSelection?: (messageKey: string, isShiftKey?: boolean) => void;
 }) {
   const isSystem = isSystemMessage(message.localType)
   const isEmoji = message.localType === 47
@@ -4902,22 +7868,53 @@ function MessageBubble({
   const isSent = message.isSend === 1
   const [senderAvatarUrl, setSenderAvatarUrl] = useState<string | undefined>(undefined)
   const [senderName, setSenderName] = useState<string | undefined>(undefined)
+  const [quotedSenderName, setQuotedSenderName] = useState<string | undefined>(undefined)
+  const [quoteLayout, setQuoteLayout] = useState<QuoteLayout>('quote-top')
+  const [solitaireExpanded, setSolitaireExpanded] = useState(false)
+  const senderProfileRequestSeqRef = useRef(0)
   const [emojiError, setEmojiError] = useState(false)
   const [emojiLoading, setEmojiLoading] = useState(false)
+
+  // 缓存相关的 state 必须在所有 Hooks 之前声明
+  const cacheKey = message.emojiMd5 || message.emojiCdnUrl || ''
+  const [emojiLocalPath, setEmojiLocalPath] = useState<string | undefined>(
+    () => emojiDataUrlCache.get(cacheKey) || message.emojiLocalPath
+  )
+  const imageCacheKey = message.imageMd5 || message.imageDatName || `local:${message.localId}`
+  const [imageLocalPath, setImageLocalPath] = useState<string | undefined>(
+    () => imageDataUrlCache.get(imageCacheKey)
+  )
+  const voiceIdentityKey = buildVoiceCacheIdentity(session.username, message)
+  const voiceCacheKey = `voice:${voiceIdentityKey}`
+  const [voiceDataUrl, setVoiceDataUrl] = useState<string | undefined>(
+    () => voiceDataUrlCache.get(voiceCacheKey)
+  )
+  const voiceTranscriptCacheKey = `voice-transcript:${voiceIdentityKey}`
+  const [voiceTranscript, setVoiceTranscript] = useState<string | undefined>(
+    () => voiceTranscriptCache.get(voiceTranscriptCacheKey)
+  )
 
   // State variables...
   const [imageError, setImageError] = useState(false)
   const [imageLoading, setImageLoading] = useState(false)
+  const [imageLoaded, setImageLoaded] = useState(false)
+  const [imageStageLockHeight, setImageStageLockHeight] = useState<number | null>(null)
   const [imageHasUpdate, setImageHasUpdate] = useState(false)
   const [imageClicked, setImageClicked] = useState(false)
   const imageUpdateCheckedRef = useRef<string | null>(null)
   const imageClickTimerRef = useRef<number | null>(null)
   const imageContainerRef = useRef<HTMLDivElement>(null)
+  const emojiContainerRef = useRef<HTMLDivElement>(null)
+  const imageResizeBaselineRef = useRef<number | null>(null)
+  const emojiResizeBaselineRef = useRef<number | null>(null)
+  const imageObservedHeightRef = useRef<number | null>(null)
+  const emojiObservedHeightRef = useRef<number | null>(null)
   const imageAutoDecryptTriggered = useRef(false)
   const imageAutoHdTriggered = useRef<string | null>(null)
   const [imageInView, setImageInView] = useState(false)
   const imageForceHdAttempted = useRef<string | null>(null)
   const imageForceHdPending = useRef(false)
+  const imageDecryptPendingRef = useRef(false)
   const [imageLiveVideoPath, setImageLiveVideoPath] = useState<string | undefined>(undefined)
   const [voiceError, setVoiceError] = useState(false)
   const [voiceLoading, setVoiceLoading] = useState(false)
@@ -4926,11 +7923,16 @@ function MessageBubble({
   const [voiceTranscriptLoading, setVoiceTranscriptLoading] = useState(false)
   const [voiceTranscriptError, setVoiceTranscriptError] = useState(false)
   const voiceTranscriptRequestedRef = useRef(false)
-  const [autoTranscribeVoice, setAutoTranscribeVoice] = useState(true)
   const [voiceCurrentTime, setVoiceCurrentTime] = useState(0)
   const [voiceDuration, setVoiceDuration] = useState(0)
   const [voiceWaveform, setVoiceWaveform] = useState<number[]>([])
   const voiceAutoDecryptTriggered = useRef(false)
+
+
+  const [systemAlert, setSystemAlert] = useState<{
+    title: string;
+    message: React.ReactNode;
+  } | null>(null)
 
   // 转账消息双方名称
   const [transferPayerName, setTransferPayerName] = useState<string | undefined>(undefined)
@@ -4942,6 +7944,11 @@ function MessageBubble({
   const videoContainerRef = useRef<HTMLElement>(null)
   const [isVideoVisible, setIsVideoVisible] = useState(false)
   const [videoMd5, setVideoMd5] = useState<string | null>(null)
+  const imageStageLockStyle = useMemo<React.CSSProperties | undefined>(() => (
+    imageStageLockHeight && imageStageLockHeight > 0
+      ? { height: `${Math.round(imageStageLockHeight)}px` }
+      : undefined
+  ), [imageStageLockHeight])
 
   // 解析视频 MD5
   useEffect(() => {
@@ -4976,33 +7983,6 @@ function MessageBubble({
     }
   }, [isVideo, message.videoMd5, message.content, message.parsedContent])
 
-  // 加载自动转文字配置
-  useEffect(() => {
-    const loadConfig = async () => {
-      const enabled = await configService.getAutoTranscribeVoice()
-      setAutoTranscribeVoice(enabled)
-    }
-    loadConfig()
-  }, [])
-
-  // 从缓存获取表情包 data URL
-  const cacheKey = message.emojiMd5 || message.emojiCdnUrl || ''
-  const [emojiLocalPath, setEmojiLocalPath] = useState<string | undefined>(
-    () => emojiDataUrlCache.get(cacheKey) || message.emojiLocalPath
-  )
-  const imageCacheKey = message.imageMd5 || message.imageDatName || `local:${message.localId}`
-  const [imageLocalPath, setImageLocalPath] = useState<string | undefined>(
-    () => imageDataUrlCache.get(imageCacheKey)
-  )
-  const voiceCacheKey = `voice:${message.localId}`
-  const [voiceDataUrl, setVoiceDataUrl] = useState<string | undefined>(
-    () => voiceDataUrlCache.get(voiceCacheKey)
-  )
-  const voiceTranscriptCacheKey = `voice-transcript:${message.localId}`
-  const [voiceTranscript, setVoiceTranscript] = useState<string | undefined>(
-    () => voiceTranscriptCache.get(voiceTranscriptCacheKey)
-  )
-
   const formatTime = (timestamp: number): string => {
     if (!Number.isFinite(timestamp) || timestamp <= 0) return '未知时间'
     const date = new Date(timestamp * 1000)
@@ -5031,12 +8011,122 @@ function MessageBubble({
     return 'image/jpeg'
   }, [])
 
-  // 获取头像首字母
-  const getAvatarLetter = (name: string): string => {
-    if (!name) return '?'
-    const chars = [...name]
-    return chars[0] || '?'
-  }
+  const getImageObserverRoot = useCallback((): Element | null => {
+    return imageContainerRef.current?.closest('.message-list') ?? null
+  }, [])
+
+  const stabilizeScrollerByDelta = useCallback((host: HTMLElement | null, delta: number) => {
+    if (!host) return
+    if (!Number.isFinite(delta) || Math.abs(delta) < 1) return
+    const scroller = host.closest('.message-list') as HTMLDivElement | null
+    if (!scroller) return
+
+    const distanceFromBottom = scroller.scrollHeight - (scroller.scrollTop + scroller.clientHeight)
+    if (distanceFromBottom <= 96) return
+
+    const scrollerRect = scroller.getBoundingClientRect()
+    const hostRect = host.getBoundingClientRect()
+    const hostTopInScroller = hostRect.top - scrollerRect.top + scroller.scrollTop
+    const viewportBottom = scroller.scrollTop + scroller.clientHeight
+    if (hostTopInScroller > viewportBottom + 24) return
+
+    scroller.scrollTop += delta
+  }, [])
+
+  const bindResizeObserverForHost = useCallback((
+    host: HTMLElement | null,
+    observedHeightRef: React.MutableRefObject<number | null>,
+    pendingBaselineRef: React.MutableRefObject<number | null>
+  ) => {
+    if (!host) return
+
+    const initialHeight = host.getBoundingClientRect().height
+    observedHeightRef.current = Number.isFinite(initialHeight) && initialHeight > 0 ? initialHeight : null
+    if (typeof ResizeObserver === 'undefined') return
+
+    const observer = new ResizeObserver(() => {
+      const nextHeight = host.getBoundingClientRect().height
+      if (!Number.isFinite(nextHeight) || nextHeight <= 0) {
+        observedHeightRef.current = null
+        return
+      }
+      const previousHeight = observedHeightRef.current
+      observedHeightRef.current = nextHeight
+      if (!Number.isFinite(previousHeight) || (previousHeight as number) <= 0) return
+      if (pendingBaselineRef.current !== null) return
+      stabilizeScrollerByDelta(host, nextHeight - (previousHeight as number))
+    })
+
+    observer.observe(host)
+    return () => {
+      observer.disconnect()
+    }
+  }, [stabilizeScrollerByDelta])
+
+  const captureResizeBaseline = useCallback(
+    (host: HTMLElement | null, baselineRef: React.MutableRefObject<number | null>) => {
+      if (!host) return
+      const height = host.getBoundingClientRect().height
+      if (!Number.isFinite(height) || height <= 0) return
+      baselineRef.current = height
+    },
+    []
+  )
+
+  const stabilizeScrollAfterResize = useCallback(
+    (host: HTMLElement | null, baselineRef: React.MutableRefObject<number | null>) => {
+      if (!host) return
+      const baseline = baselineRef.current
+      baselineRef.current = null
+      if (!Number.isFinite(baseline) || (baseline as number) <= 0) return
+
+      requestAnimationFrame(() => {
+        const nextHeight = host.getBoundingClientRect().height
+        stabilizeScrollerByDelta(host, nextHeight - (baseline as number))
+      })
+    },
+    [stabilizeScrollerByDelta]
+  )
+
+  const captureImageResizeBaseline = useCallback(() => {
+    captureResizeBaseline(imageContainerRef.current, imageResizeBaselineRef)
+  }, [captureResizeBaseline])
+
+  const lockImageStageHeight = useCallback(() => {
+    const host = imageContainerRef.current
+    if (!host) return
+    const height = host.getBoundingClientRect().height
+    if (!Number.isFinite(height) || height <= 0) return
+    setImageStageLockHeight(Math.round(height))
+  }, [])
+
+  const captureEmojiResizeBaseline = useCallback(() => {
+    captureResizeBaseline(emojiContainerRef.current, emojiResizeBaselineRef)
+  }, [captureResizeBaseline])
+
+  const stabilizeImageScrollAfterResize = useCallback(() => {
+    stabilizeScrollAfterResize(imageContainerRef.current, imageResizeBaselineRef)
+  }, [stabilizeScrollAfterResize])
+
+  const releaseImageStageLock = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      setImageStageLockHeight(null)
+    })
+  }, [])
+
+  const stabilizeEmojiScrollAfterResize = useCallback(() => {
+    stabilizeScrollAfterResize(emojiContainerRef.current, emojiResizeBaselineRef)
+  }, [stabilizeScrollAfterResize])
+
+  useEffect(() => {
+    if (!isImage) return
+    return bindResizeObserverForHost(imageContainerRef.current, imageObservedHeightRef, imageResizeBaselineRef)
+  }, [isImage, imageLocalPath, imageLoading, imageError, bindResizeObserverForHost])
+
+  useEffect(() => {
+    if (!isEmoji) return
+    return bindResizeObserverForHost(emojiContainerRef.current, emojiObservedHeightRef, emojiResizeBaselineRef)
+  }, [isEmoji, emojiLocalPath, emojiLoading, emojiError, bindResizeObserverForHost])
 
   // 下载表情包
   const downloadEmoji = () => {
@@ -5045,6 +8135,7 @@ function MessageBubble({
     // 先检查缓存
     const cached = emojiDataUrlCache.get(cacheKey)
     if (cached) {
+      captureEmojiResizeBaseline()
       setEmojiLocalPath(cached)
       setEmojiError(false)
       return
@@ -5055,6 +8146,7 @@ function MessageBubble({
     window.electronAPI.chat.downloadEmoji(message.emojiCdnUrl, message.emojiMd5).then((result: { success: boolean; localPath?: string; error?: string }) => {
       if (result.success && result.localPath) {
         emojiDataUrlCache.set(cacheKey, result.localPath)
+        captureEmojiResizeBaseline()
         setEmojiLocalPath(result.localPath)
       } else {
         setEmojiError(true)
@@ -5068,37 +8160,55 @@ function MessageBubble({
 
   // 群聊中获取发送者信息 (如果自己发的没头像，也尝试拉取)
   useEffect(() => {
-    if (message.senderUsername && (isGroupChat || (isSent && !myAvatarUrl))) {
-      const sender = message.senderUsername
-      const cached = senderAvatarCache.get(sender)
-      if (cached) {
-        setSenderAvatarUrl(cached.avatarUrl)
-        setSenderName(cached.displayName)
-        return
-      }
-      const pending = senderAvatarLoading.get(sender)
-      if (pending) {
-        pending.then((result: { avatarUrl?: string; displayName?: string } | null) => {
-          if (result) {
-            setSenderAvatarUrl(result.avatarUrl)
-            setSenderName(result.displayName)
-          }
-        })
-        return
-      }
-      const request = window.electronAPI.chat.getContactAvatar(sender)
-      senderAvatarLoading.set(sender, request)
-      request.then((result: { avatarUrl?: string; displayName?: string } | null) => {
-        if (result) {
-          senderAvatarCache.set(sender, result)
-          setSenderAvatarUrl(result.avatarUrl)
-          setSenderName(result.displayName)
-        }
-      }).catch(() => { }).finally(() => {
-        senderAvatarLoading.delete(sender)
-      })
+    const sender = String(message.senderUsername || '').trim()
+    const cached = sender ? senderAvatarCache.get(sender) : undefined
+    setSenderAvatarUrl(cached?.avatarUrl || message.senderAvatarUrl || undefined)
+    setSenderName(cached?.displayName || message.senderDisplayName || undefined)
+
+    if (!sender || !(isGroupChat || (isSent && !myAvatarUrl))) return
+
+    const requestSeq = senderProfileRequestSeqRef.current + 1
+    senderProfileRequestSeqRef.current = requestSeq
+    let cancelled = false
+    const applyProfile = (result: { avatarUrl?: string; displayName?: string } | null) => {
+      if (!result || cancelled) return
+      if (requestSeq !== senderProfileRequestSeqRef.current) return
+      if (result.avatarUrl) setSenderAvatarUrl(result.avatarUrl)
+      if (result.displayName) setSenderName(result.displayName)
     }
-  }, [isGroupChat, isSent, message.senderUsername, myAvatarUrl])
+
+    if (cached) {
+      applyProfile(cached)
+      return () => {
+        cancelled = true
+      }
+    }
+
+    const pending = senderAvatarLoading.get(sender)
+    if (pending) {
+      pending.then(applyProfile).catch(() => { })
+      return () => {
+        cancelled = true
+      }
+    }
+
+    const request = window.electronAPI.chat.getContactAvatar(sender)
+    senderAvatarLoading.set(sender, request)
+    request.then((result: { avatarUrl?: string; displayName?: string } | null) => {
+      if (result) {
+        senderAvatarCache.set(sender, result)
+      }
+      applyProfile(result)
+    }).catch(() => { }).finally(() => {
+      if (senderAvatarLoading.get(sender) === request) {
+        senderAvatarLoading.delete(sender)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [isGroupChat, isSent, message.senderAvatarUrl, message.senderDisplayName, message.senderUsername, myAvatarUrl])
 
   // 解析转账消息的付款方和收款方显示名称
   useEffect(() => {
@@ -5124,32 +8234,41 @@ function MessageBubble({
   useEffect(() => {
     if (emojiLocalPath) return
     // 后端已从本地缓存找到文件（转发表情包无 CDN URL 的情况）
-    if (isEmoji && message.emojiLocalPath && !emojiLocalPath) {
+    if (isEmoji && message.emojiLocalPath) {
+      captureEmojiResizeBaseline()
       setEmojiLocalPath(message.emojiLocalPath)
       return
     }
     if (isEmoji && message.emojiCdnUrl && !emojiLoading && !emojiError) {
       downloadEmoji()
     }
-  }, [isEmoji, message.emojiCdnUrl, message.emojiLocalPath, emojiLocalPath, emojiLoading, emojiError])
+  }, [isEmoji, message.emojiCdnUrl, message.emojiLocalPath, emojiLocalPath, emojiLoading, emojiError, captureEmojiResizeBaseline])
 
-  const requestImageDecrypt = useCallback(async (forceUpdate = false, silent = false) => {
-    if (!isImage) return
-    if (imageLoading) return
+  const requestImageDecrypt = useCallback(async (forceUpdate = false, silent = false): Promise<SharedImageDecryptResult> => {
+    if (!isImage) return { success: false }
+    if (imageDecryptPendingRef.current) return { success: false }
+    imageDecryptPendingRef.current = true
     if (!silent) {
       setImageLoading(true)
       setImageError(false)
     }
     try {
       if (message.imageMd5 || message.imageDatName) {
-        const result = await window.electronAPI.image.decrypt({
-          sessionId: session.username,
-          imageMd5: message.imageMd5 || undefined,
-          imageDatName: message.imageDatName,
-          force: forceUpdate
+        const sharedDecryptKey = `${session.username}:${imageCacheKey}:${forceUpdate ? 'force' : 'normal'}`
+        const result = await getSharedImageDecryptTask(sharedDecryptKey, async () => {
+          return await window.electronAPI.image.decrypt({
+            sessionId: session.username,
+            imageMd5: message.imageMd5 || undefined,
+            imageDatName: message.imageDatName,
+            force: forceUpdate
+          }) as SharedImageDecryptResult
         })
         if (result.success && result.localPath) {
           imageDataUrlCache.set(imageCacheKey, result.localPath)
+          if (imageLocalPath !== result.localPath) {
+            captureImageResizeBaseline()
+            lockImageStageHeight()
+          }
           setImageLocalPath(result.localPath)
           setImageHasUpdate(false)
           if (result.liveVideoPath) setImageLiveVideoPath(result.liveVideoPath)
@@ -5162,18 +8281,23 @@ function MessageBubble({
         const mime = detectImageMimeFromBase64(fallback.data)
         const dataUrl = `data:${mime};base64,${fallback.data}`
         imageDataUrlCache.set(imageCacheKey, dataUrl)
+        if (imageLocalPath !== dataUrl) {
+          captureImageResizeBaseline()
+          lockImageStageHeight()
+        }
         setImageLocalPath(dataUrl)
         setImageHasUpdate(false)
-        return { success: true, localPath: dataUrl } as any
+        return { success: true, localPath: dataUrl }
       }
       if (!silent) setImageError(true)
     } catch {
       if (!silent) setImageError(true)
     } finally {
       if (!silent) setImageLoading(false)
+      imageDecryptPendingRef.current = false
     }
-    return { success: false } as any
-  }, [isImage, imageLoading, message.imageMd5, message.imageDatName, message.localId, session.username, imageCacheKey, detectImageMimeFromBase64])
+    return { success: false }
+  }, [isImage, message.imageMd5, message.imageDatName, message.localId, session.username, imageCacheKey, detectImageMimeFromBase64, imageLocalPath, captureImageResizeBaseline, lockImageStageHeight])
 
   const triggerForceHd = useCallback(() => {
     if (!message.imageMd5 && !message.imageDatName) return
@@ -5209,8 +8333,9 @@ function MessageBubble({
     let finalImagePath = imageLocalPath
     let finalLiveVideoPath = imageLiveVideoPath || undefined
 
-    // If current cache is a thumbnail, wait for a silent force-HD decrypt before opening viewer.
-    if (imageHasUpdate) {
+    // Every explicit preview click re-runs the forced HD search/decrypt path so
+    // users don't need to re-enter the session after WeChat materializes a new original image.
+    if (message.imageMd5 || message.imageDatName) {
       try {
         const upgraded = await requestImageDecrypt(true, true)
         if (upgraded?.success && upgraded.localPath) {
@@ -5233,6 +8358,10 @@ function MessageBubble({
           finalImagePath = resolved.localPath
           finalLiveVideoPath = resolved.liveVideoPath || finalLiveVideoPath
           imageDataUrlCache.set(imageCacheKey, resolved.localPath)
+          if (imageLocalPath !== resolved.localPath) {
+            captureImageResizeBaseline()
+            lockImageStageHeight()
+          }
           setImageLocalPath(resolved.localPath)
           if (resolved.liveVideoPath) setImageLiveVideoPath(resolved.liveVideoPath)
           setImageHasUpdate(Boolean(resolved.hasUpdate))
@@ -5242,10 +8371,11 @@ function MessageBubble({
 
     void window.electronAPI.window.openImageViewerWindow(finalImagePath, finalLiveVideoPath)
   }, [
-    imageHasUpdate,
     imageLiveVideoPath,
     imageLocalPath,
     imageCacheKey,
+    captureImageResizeBaseline,
+    lockImageStageHeight,
     message.imageDatName,
     message.imageMd5,
     requestImageDecrypt,
@@ -5259,6 +8389,16 @@ function MessageBubble({
       }
     }
   }, [])
+
+  useEffect(() => {
+    setImageLoaded(false)
+  }, [imageLocalPath])
+
+  useEffect(() => {
+    if (imageLoading) return
+    if (!imageError && imageLocalPath) return
+    setImageStageLockHeight(null)
+  }, [imageError, imageLoading, imageLocalPath])
 
   useEffect(() => {
     if (!isImage || imageLoading) return
@@ -5275,6 +8415,8 @@ function MessageBubble({
       if (result.success && result.localPath) {
         imageDataUrlCache.set(imageCacheKey, result.localPath)
         if (!imageLocalPath || imageLocalPath !== result.localPath) {
+          captureImageResizeBaseline()
+          lockImageStageHeight()
           setImageLocalPath(result.localPath)
           setImageError(false)
         }
@@ -5285,7 +8427,7 @@ function MessageBubble({
     return () => {
       cancelled = true
     }
-  }, [isImage, imageLocalPath, imageLoading, message.imageMd5, message.imageDatName, imageCacheKey, session.username])
+  }, [isImage, imageLocalPath, imageLoading, message.imageMd5, message.imageDatName, imageCacheKey, session.username, captureImageResizeBaseline, lockImageStageHeight])
 
   useEffect(() => {
     if (!isImage) return
@@ -5313,15 +8455,22 @@ function MessageBubble({
         (payload.imageMd5 && payload.imageMd5 === message.imageMd5) ||
         (payload.imageDatName && payload.imageDatName === message.imageDatName)
       if (matchesCacheKey) {
-        imageDataUrlCache.set(imageCacheKey, payload.localPath)
-        setImageLocalPath(payload.localPath)
+        const cachedPath = imageDataUrlCache.get(imageCacheKey)
+        if (cachedPath !== payload.localPath) {
+          imageDataUrlCache.set(imageCacheKey, payload.localPath)
+        }
+        if (imageLocalPath !== payload.localPath) {
+          captureImageResizeBaseline()
+          lockImageStageHeight()
+        }
+        setImageLocalPath((prev) => (prev === payload.localPath ? prev : payload.localPath))
         setImageError(false)
       }
     })
     return () => {
       unsubscribe?.()
     }
-  }, [isImage, imageCacheKey, message.imageDatName, message.imageMd5])
+  }, [isImage, imageCacheKey, imageLocalPath, message.imageDatName, message.imageMd5, captureImageResizeBaseline, lockImageStageHeight])
 
   // 图片进入视野前自动解密（懒加载）
   useEffect(() => {
@@ -5335,34 +8484,25 @@ function MessageBubble({
     const observer = new IntersectionObserver(
       (entries) => {
         const entry = entries[0]
-        // rootMargin 设置为 200px，提前触发解密
-        if (entry.isIntersecting && !imageAutoDecryptTriggered.current) {
-          imageAutoDecryptTriggered.current = true
-          void requestImageDecrypt()
-        }
-      },
-      { rootMargin: '200px', threshold: 0 }
-    )
-
-    observer.observe(container)
-    return () => observer.disconnect()
-  }, [isImage, imageLocalPath, message.imageMd5, message.imageDatName, requestImageDecrypt])
-
-  // 进入视野时自动尝试切换高清图
-  useEffect(() => {
-    if (!isImage) return
-    const container = imageContainerRef.current
-    if (!container) return
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const entry = entries[0]
+        // rootMargin 设置为 200px，提前感知即将进入视野的图片
         setImageInView(entry.isIntersecting)
       },
-      { rootMargin: '120px', threshold: 0 }
+      { root: getImageObserverRoot(), rootMargin: '200px', threshold: 0 }
     )
+
     observer.observe(container)
     return () => observer.disconnect()
-  }, [isImage])
+  }, [getImageObserverRoot, isImage])
+
+  // 进入视野后自动触发一次普通解密
+  useEffect(() => {
+    if (!isImage || !imageInView) return
+    if (imageLocalPath || imageLoading) return
+    if (!message.imageMd5 && !message.imageDatName) return
+    if (imageAutoDecryptTriggered.current) return
+    imageAutoDecryptTriggered.current = true
+    void requestImageDecrypt()
+  }, [isImage, imageInView, imageLocalPath, imageLoading, message.imageMd5, message.imageDatName, requestImageDecrypt])
 
   useEffect(() => {
     if (!isImage || !imageHasUpdate || !imageInView) return
@@ -5370,19 +8510,6 @@ function MessageBubble({
     imageAutoHdTriggered.current = imageCacheKey
     triggerForceHd()
   }, [isImage, imageHasUpdate, imageInView, imageCacheKey, triggerForceHd])
-
-  useEffect(() => {
-    if (!isImage || !imageHasUpdate) return
-    if (imageAutoHdTriggered.current === imageCacheKey) return
-    imageAutoHdTriggered.current = imageCacheKey
-    triggerForceHd()
-  }, [isImage, imageHasUpdate, imageCacheKey, triggerForceHd])
-
-  // 更激进：进入视野/打开预览时，无论 hasUpdate 与否都尝试强制高清
-  useEffect(() => {
-    if (!isImage || !imageInView) return
-    triggerForceHd()
-  }, [isImage, imageInView, triggerForceHd])
 
 
   useEffect(() => {
@@ -5485,14 +8612,16 @@ function MessageBubble({
   // 监听流式转写结果
   useEffect(() => {
     if (!isVoice) return
-    const removeListener = window.electronAPI.chat.onVoiceTranscriptPartial?.((payload: { msgId: string; text: string }) => {
-      if (payload.msgId === String(message.localId)) {
-        setVoiceTranscript(payload.text)
-        voiceTranscriptCache.set(voiceTranscriptCacheKey, payload.text)
-      }
+    const removeListener = window.electronAPI.chat.onVoiceTranscriptPartial?.((payload: { sessionId?: string; msgId: string; createTime?: number; text: string }) => {
+      const sameSession = !payload.sessionId || payload.sessionId === session.username
+      const sameMsgId = payload.msgId === String(message.localId)
+      const sameCreateTime = payload.createTime == null || Number(payload.createTime) === Number(message.createTime || 0)
+      if (!sameSession || !sameMsgId || !sameCreateTime) return
+      setVoiceTranscript(payload.text)
+      voiceTranscriptCache.set(voiceTranscriptCacheKey, payload.text)
     })
     return () => removeListener?.()
-  }, [isVoice, message.localId, voiceTranscriptCacheKey])
+  }, [isVoice, message.createTime, message.localId, session.username, voiceTranscriptCacheKey])
 
   const requestVoiceTranscript = useCallback(async () => {
     if (voiceTranscriptLoading || voiceTranscriptRequestedRef.current) return
@@ -5519,9 +8648,9 @@ function MessageBubble({
       }
 
       const result = await window.electronAPI.chat.getVoiceTranscript(
-        session.username,
-        String(message.localId),
-        message.createTime
+          session.username,
+          String(message.localId),
+          message.createTime
       )
 
       if (result.success) {
@@ -5529,6 +8658,21 @@ function MessageBubble({
         voiceTranscriptCache.set(voiceTranscriptCacheKey, transcriptText)
         setVoiceTranscript(transcriptText)
       } else {
+        if (result.error === 'SEGFAULT_ERROR') {
+          console.warn('[ChatPage] 捕获到语音引擎底层段错误');
+
+          setSystemAlert({
+            title: '引擎崩溃提示',
+            message: (
+                <>
+                  语音识别引擎发生底层崩溃 (Segmentation Fault)。<br /><br />
+                  如果您使用的是 Linux 等自定义程度较高的系统，请检查 <code>sherpa-onnx</code> 的相关系统动态链接库 (如 glibc 等) 是否兼容。
+                </>
+            )
+          });
+
+        }
+
         setVoiceTranscriptError(true)
         voiceTranscriptRequestedRef.current = false
       }
@@ -5546,14 +8690,17 @@ function MessageBubble({
     } finally {
       setVoiceTranscriptLoading(false)
     }
-  }, [message.localId, session.username, voiceTranscriptCacheKey, voiceTranscriptLoading, onRequireModelDownload])
+  }, [message.createTime, message.localId, session.username, voiceTranscriptCacheKey, voiceTranscriptLoading, onRequireModelDownload])
 
   // 监听模型下载完成事件
   useEffect(() => {
     if (!isVoice) return
 
     const handleModelDownloaded = (event: CustomEvent) => {
-      if (event.detail?.messageId === String(message.localId)) {
+      if (
+        event.detail?.messageId === String(message.localId) &&
+        (!event.detail?.sessionId || event.detail?.sessionId === session.username)
+      ) {
         // 重置状态，允许重新尝试转写
         voiceTranscriptRequestedRef.current = false
         setVoiceTranscriptError(false)
@@ -5566,7 +8713,7 @@ function MessageBubble({
     return () => {
       window.removeEventListener('model-downloaded', handleModelDownloaded as EventListener)
     }
-  }, [isVoice, message.localId, requestVoiceTranscript])
+  }, [isVoice, message.localId, requestVoiceTranscript, session.username])
 
   // 视频懒加载
   const videoAutoLoadTriggered = useRef(false)
@@ -5634,93 +8781,23 @@ function MessageBubble({
     void requestVideoInfo()
   }, [isVideo, isVideoVisible, videoInfo, requestVideoInfo])
 
-
-  // 根据设置决定是否自动转写
-  const [autoTranscribeEnabled, setAutoTranscribeEnabled] = useState(false)
-
   useEffect(() => {
-    window.electronAPI.config.get('autoTranscribeVoice').then((value: unknown) => {
-      setAutoTranscribeEnabled(value === true)
-    })
-  }, [])
-
-  useEffect(() => {
-    if (!autoTranscribeEnabled) return
+    if (!autoTranscribeVoiceEnabled) return
     if (!isVoice) return
     if (!voiceDataUrl) return
-    if (!autoTranscribeVoice) return // 如果自动转文字已关闭，不自动转文字
     if (voiceTranscriptError) return
     if (voiceTranscriptLoading || voiceTranscript !== undefined || voiceTranscriptRequestedRef.current) return
     void requestVoiceTranscript()
-  }, [autoTranscribeEnabled, isVoice, voiceDataUrl, voiceTranscript, voiceTranscriptError, voiceTranscriptLoading, requestVoiceTranscript])
-
-  // Selection mode handling removed from here to allow normal rendering
-  // We will wrap the output instead
-
-  // Regular rendering logic...
-  if (isSystem) {
-    return (
-      <div
-        className={`message-bubble system ${isSelectionMode ? 'selectable' : ''}`}
-        onContextMenu={(e) => onContextMenu?.(e, message)}
-        style={{ cursor: isSelectionMode ? 'pointer' : 'default', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
-        onClick={(e) => {
-          if (isSelectionMode) {
-            e.stopPropagation()
-            onToggleSelection?.(message.localId, e.shiftKey)
-          }
-        }}
-      >
-        {isSelectionMode && (
-          <div className={`checkbox ${isSelected ? 'checked' : ''}`} style={{
-            width: '20px',
-            height: '20px',
-            borderRadius: '4px',
-            border: isSelected ? 'none' : '2px solid rgba(128,128,128,0.5)',
-            backgroundColor: isSelected ? 'var(--primary)' : 'transparent',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: 'white',
-            flexShrink: 0
-          }}>
-            {isSelected && <Check size={14} strokeWidth={3} />}
-          </div>
-        )}
-        <div className="bubble-content">{message.parsedContent}</div>
-      </div>
-    )
-  }
-
-  // 检测是否为链接卡片消息
-  const isLinkMessage = String(message.localType) === '21474836529' ||
-    (message.rawContent && (message.rawContent.includes('<appmsg') || message.rawContent.includes('&lt;appmsg'))) ||
-    (message.parsedContent && (message.parsedContent.includes('<appmsg') || message.parsedContent.includes('&lt;appmsg')))
-  const bubbleClass = isSent ? 'sent' : 'received'
-
-  // 头像逻辑：
-  // - 自己发的：优先使用 myAvatarUrl，缺失则用 senderAvatarUrl (补救)
-  // - 群聊中对方发的：使用发送者头像
-  // - 私聊中对方发的：使用会话头像
-  const avatarUrl = isSent
-    ? (myAvatarUrl || senderAvatarUrl)
-    : (isGroupChat ? senderAvatarUrl : session.avatarUrl)
-  const avatarLetter = isSent
-    ? '我'
-    : getAvatarLetter(isGroupChat ? (senderName || message.senderUsername || '?') : (session.displayName || session.username))
-
-
-  // 是否有引用消息
-  const hasQuote = message.quotedContent && message.quotedContent.length > 0
+  }, [autoTranscribeVoiceEnabled, isVoice, voiceDataUrl, voiceTranscript, voiceTranscriptError, voiceTranscriptLoading, requestVoiceTranscript])
 
   // 去除企业微信 ID 前缀
-  const cleanMessageContent = (content: string) => {
+  const cleanMessageContent = useCallback((content: string) => {
     if (!content) return ''
     return content.replace(/^[a-zA-Z0-9]+@openim:\n?/, '')
-  }
+  }, [])
 
   // 解析混合文本和表情
-  const renderTextWithEmoji = (text: string) => {
+  const renderTextWithEmoji = useCallback((text: string) => {
     if (!text) return text
     const parts = text.split(/\[(.*?)\]/g)
     return parts.map((part, index) => {
@@ -5744,13 +8821,259 @@ function MessageBubble({
       }
       return part
     })
+  }, [])
+
+  const cleanedParsedContent = useMemo(
+    () => cleanMessageContent(message.parsedContent || ''),
+    [cleanMessageContent, message.parsedContent]
+  )
+
+  const appMsgRawXml = message.rawContent || message.parsedContent || ''
+  const appMsgContainsTag = useMemo(
+    () => appMsgRawXml.includes('<appmsg') || appMsgRawXml.includes('&lt;appmsg'),
+    [appMsgRawXml]
+  )
+  const appMsgDoc = useMemo(() => {
+    if (!appMsgContainsTag) return null
+    try {
+      const start = appMsgRawXml.indexOf('<msg>')
+      const xml = start >= 0 ? appMsgRawXml.slice(start) : appMsgRawXml
+      const doc = new DOMParser().parseFromString(xml, 'text/xml')
+      if (doc.querySelector('parsererror')) return null
+      return doc
+    } catch {
+      return null
+    }
+  }, [appMsgContainsTag, appMsgRawXml])
+  const appMsgTextCache = useMemo(() => new Map<string, string>(), [appMsgDoc])
+  const queryAppMsgText = useCallback((selector: string): string => {
+    const cached = appMsgTextCache.get(selector)
+    if (cached !== undefined) return cached
+    const value = appMsgDoc?.querySelector(selector)?.textContent?.trim() || ''
+    appMsgTextCache.set(selector, value)
+    return value
+  }, [appMsgDoc, appMsgTextCache])
+  const queryPreferredQuotedContent = useCallback((): string => {
+    if (message.quotedContent) return message.quotedContent
+    const candidates = [
+      'refermsg > selectedcontent',
+      'refermsg > selectedtext',
+      'refermsg > selectcontent',
+      'refermsg > selecttext',
+      'refermsg > quotecontent',
+      'refermsg > quotetext',
+      'refermsg > partcontent',
+      'refermsg > parttext',
+      'refermsg > excerpt',
+      'refermsg > summary',
+      'refermsg > preview',
+      'refermsg > content'
+    ]
+    for (const selector of candidates) {
+      const value = queryAppMsgText(selector)
+      if (value) return value
+    }
+    return ''
+  }, [message.quotedContent, queryAppMsgText])
+  const appMsgThumbRawCandidate = useMemo(() => (
+    message.linkThumb ||
+    message.appMsgThumbUrl ||
+    queryAppMsgText('appmsg > thumburl') ||
+    queryAppMsgText('appmsg > cdnthumburl') ||
+    queryAppMsgText('appmsg > cover') ||
+    queryAppMsgText('appmsg > coverurl') ||
+    queryAppMsgText('thumburl') ||
+    queryAppMsgText('cdnthumburl') ||
+    queryAppMsgText('cover') ||
+    queryAppMsgText('coverurl') ||
+    ''
+  ).trim(), [message.linkThumb, message.appMsgThumbUrl, queryAppMsgText])
+  const quotedSenderUsername = resolveQuotedSenderUsername(
+    queryAppMsgText('refermsg > fromusr'),
+    queryAppMsgText('refermsg > chatusr')
+  )
+  const quotedContent = queryPreferredQuotedContent()
+  const quotedSenderFallbackName = useMemo(
+    () => resolveQuotedSenderFallbackDisplayName(
+      session.username,
+      quotedSenderUsername,
+      message.quotedSender || queryAppMsgText('refermsg > displayname') || ''
+    ),
+    [message.quotedSender, queryAppMsgText, quotedSenderUsername, session.username]
+  )
+
+  useEffect(() => {
+    let cancelled = false
+    const nextFallbackName = quotedSenderFallbackName || undefined
+    setQuotedSenderName(nextFallbackName)
+
+    if (!quotedContent || !quotedSenderUsername) {
+      return () => {
+        cancelled = true
+      }
+    }
+
+    void resolveQuotedSenderDisplayName({
+      sessionId: session.username,
+      senderUsername: quotedSenderUsername,
+      fallbackDisplayName: nextFallbackName,
+      isGroupChat,
+      myWxid
+    }).then((resolvedName) => {
+      if (cancelled) return
+      setQuotedSenderName(resolvedName || nextFallbackName)
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    quotedContent,
+    quotedSenderFallbackName,
+    quotedSenderUsername,
+    session.username,
+    isGroupChat,
+    myWxid
+  ])
+
+  useEffect(() => {
+    let cancelled = false
+    void configService.getQuoteLayout().then((layout) => {
+      if (!cancelled) setQuoteLayout(layout)
+    }).catch(() => {
+      if (!cancelled) setQuoteLayout('quote-top')
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const locationMessageMeta = useMemo(() => {
+    if (message.localType !== 48) return null
+    const raw = message.rawContent || ''
+    const poiname = raw.match(/poiname="([^"]*)"/)?.[1] || message.locationPoiname || '位置'
+    const label = raw.match(/label="([^"]*)"/)?.[1] || message.locationLabel || ''
+    const lat = parseFloat(raw.match(/x="([^"]*)"/)?.[1] || String(message.locationLat || 0))
+    const lng = parseFloat(raw.match(/y="([^"]*)"/)?.[1] || String(message.locationLng || 0))
+    const zoom = 15
+    const tileX = Math.floor((lng + 180) / 360 * Math.pow(2, zoom))
+    const latRad = lat * Math.PI / 180
+    const tileY = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * Math.pow(2, zoom))
+    const mapTileUrl = (lat && lng)
+      ? `https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x=${tileX}&y=${tileY}&z=${zoom}`
+      : ''
+    return { poiname, label, lat, lng, mapTileUrl }
+  }, [message.localType, message.rawContent, message.locationPoiname, message.locationLabel, message.locationLat, message.locationLng])
+
+  // 检测是否为链接卡片消息
+  const isLinkMessage = String(message.localType) === '21474836529' || appMsgContainsTag
+  const bubbleClass = isSent ? 'sent' : 'received'
+
+  // 头像逻辑：
+  // - 自己发的：优先使用 myAvatarUrl，缺失则用 senderAvatarUrl (补救)
+  // - 群聊中对方发的：使用发送者头像
+  // - 私聊中对方发的：使用会话头像
+  const fallbackSenderName = String(message.senderDisplayName || message.senderUsername || '').trim() || undefined
+  const resolvedSenderName = senderName || fallbackSenderName
+  const resolvedSenderAvatarUrl = senderAvatarUrl || message.senderAvatarUrl
+  const avatarUrl = isSent
+    ? (myAvatarUrl || resolvedSenderAvatarUrl)
+    : (isGroupChat ? resolvedSenderAvatarUrl : session.avatarUrl)
+
+  // 是否有引用消息
+  const hasQuote = quotedContent.length > 0
+  const displayQuotedSenderName = quotedSenderName || quotedSenderFallbackName
+  const renderBubbleWithQuote = useCallback((quotedNode: React.ReactNode, messageNode: React.ReactNode) => {
+    const quoteFirst = quoteLayout !== 'quote-bottom'
+    return (
+      <div className={`bubble-content ${quoteFirst ? 'quote-layout-top' : 'quote-layout-bottom'}`}>
+        {quoteFirst ? (
+          <>
+            {quotedNode}
+            {messageNode}
+          </>
+        ) : (
+          <>
+            {messageNode}
+            {quotedNode}
+          </>
+        )}
+      </div>
+    )
+  }, [quoteLayout])
+
+  const renderQuotedMessageBlock = useCallback((contentNode: React.ReactNode) => (
+    <div className="quoted-message">
+      {displayQuotedSenderName && <span className="quoted-sender">{displayQuotedSenderName}</span>}
+      <span className="quoted-text">{contentNode}</span>
+    </div>
+  ), [displayQuotedSenderName])
+
+  const handlePlayVideo = useCallback(async () => {
+    if (!videoInfo?.videoUrl) return
+    try {
+      await window.electronAPI.window.openVideoPlayerWindow(videoInfo.videoUrl)
+    } catch (e) {
+      console.error('打开视频播放窗口失败:', e)
+    }
+  }, [videoInfo?.videoUrl])
+
+  // Selection mode handling removed from here to allow normal rendering
+  // We will wrap the output instead
+  if (isSystem) {
+    const isPatSystemMessage = message.localType === 266287972401
+    const patTitleRaw = isPatSystemMessage
+      ? (queryAppMsgText('appmsg > title') || queryAppMsgText('title') || message.parsedContent || '')
+      : ''
+    const patDisplayText = isPatSystemMessage
+      ? cleanMessageContent(String(patTitleRaw).replace(/^\s*\[拍一拍\]\s*/i, ''))
+      : ''
+    const systemContentNode = isPatSystemMessage
+      ? renderTextWithEmoji(patDisplayText || '拍一拍')
+      : message.parsedContent
+
+    return (
+      <div
+        className={`message-bubble system ${isSelectionMode ? 'selectable' : ''}`}
+        onContextMenu={(e) => onContextMenu?.(e, message)}
+        style={{ cursor: isSelectionMode ? 'pointer' : 'default', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
+        onClick={(e) => {
+          if (isSelectionMode) {
+            e.stopPropagation()
+            onToggleSelection?.(messageKey, e.shiftKey)
+          }
+        }}
+      >
+        {isSelectionMode && (
+          <div className={`checkbox ${isSelected ? 'checked' : ''}`} style={{
+            width: '20px',
+            height: '20px',
+            borderRadius: '4px',
+            border: isSelected ? 'none' : '2px solid rgba(128,128,128,0.5)',
+            backgroundColor: isSelected ? 'var(--primary)' : 'transparent',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: 'white',
+            flexShrink: 0
+          }}>
+            {isSelected && <Check size={14} strokeWidth={3} />}
+          </div>
+        )}
+        <div className="bubble-content">{systemContentNode}</div>
+      </div>
+    )
   }
 
   // 渲染消息内容
   const renderContent = () => {
     if (isImage) {
       return (
-        <div ref={imageContainerRef}>
+        <div
+          ref={imageContainerRef}
+          className={`image-stage ${imageStageLockHeight ? 'locked' : ''}`}
+          style={imageStageLockStyle}
+        >
           {imageLoading ? (
             <div className="image-loading">
               <Loader2 size={20} className="spin" />
@@ -5772,10 +9095,20 @@ function MessageBubble({
                 <img
                   src={imageLocalPath}
                   alt="图片"
-                  className="image-message"
+                  className={`image-message ${imageLoaded ? 'ready' : 'pending'}`}
                   onClick={() => { void handleOpenImageViewer() }}
-                  onLoad={() => setImageError(false)}
-                  onError={() => setImageError(true)}
+                  onLoad={() => {
+                    setImageLoaded(true)
+                    setImageError(false)
+                    stabilizeImageScrollAfterResize()
+                    releaseImageStageLock()
+                  }}
+                  onError={() => {
+                    imageResizeBaselineRef.current = null
+                    setImageLoaded(false)
+                    setImageError(true)
+                    releaseImageStageLock()
+                  }}
                 />
                 {imageLiveVideoPath && (
                   <div className="media-badge live">
@@ -5791,15 +9124,6 @@ function MessageBubble({
 
     // 视频消息
     if (isVideo) {
-      const handlePlayVideo = useCallback(async () => {
-        if (!videoInfo?.videoUrl) return
-        try {
-          await window.electronAPI.window.openVideoPlayerWindow(videoInfo.videoUrl)
-        } catch (e) {
-          console.error('打开视频播放窗口失败:', e)
-        }
-      }, [videoInfo?.videoUrl])
-
       // 未进入可视区域时显示占位符
       if (!isVideoVisible) {
         return (
@@ -5888,7 +9212,7 @@ function MessageBubble({
               session.username,
               String(message.localId),
               message.createTime,
-              message.serverId
+              message.serverIdRaw || message.serverId
             )
             if (result.success && result.data) {
               const url = `data:audio/wav;base64,${result.data}`
@@ -6076,18 +9400,8 @@ function MessageBubble({
 
     // 位置消息
     if (message.localType === 48) {
-      const raw = message.rawContent || ''
-      const poiname = raw.match(/poiname="([^"]*)"/)?.[1] || message.locationPoiname || '位置'
-      const label = raw.match(/label="([^"]*)"/)?.[1] || message.locationLabel || ''
-      const lat = parseFloat(raw.match(/x="([^"]*)"/)?.[1] || String(message.locationLat || 0))
-      const lng = parseFloat(raw.match(/y="([^"]*)"/)?.[1] || String(message.locationLng || 0))
-      const zoom = 15
-      const tileX = Math.floor((lng + 180) / 360 * Math.pow(2, zoom))
-      const latRad = lat * Math.PI / 180
-      const tileY = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * Math.pow(2, zoom))
-      const mapTileUrl = (lat && lng)
-        ? `https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x=${tileX}&y=${tileY}&z=${zoom}`
-        : ''
+      if (!locationMessageMeta) return null
+      const { poiname, label, lat, lng, mapTileUrl } = locationMessageMeta
       return (
         <div className="location-message" onClick={() => window.electronAPI.shell.openExternal(`https://uri.amap.com/marker?position=${lng},${lat}&name=${encodeURIComponent(poiname || label)}`)}>
           <div className="location-text">
@@ -6113,30 +9427,22 @@ function MessageBubble({
 
     // 链接消息 (AppMessage)
     const appMsgRichPreview = (() => {
-      const rawXml = message.rawContent || ''
-      if (!rawXml || (!rawXml.includes('<appmsg') && !rawXml.includes('&lt;appmsg'))) return null
-
-      let doc: Document | null = null
-      const getDoc = () => {
-        if (doc) return doc
-        try {
-          const start = rawXml.indexOf('<msg>')
-          const xml = start >= 0 ? rawXml.slice(start) : rawXml
-          doc = new DOMParser().parseFromString(xml, 'text/xml')
-        } catch {
-          doc = null
-        }
-        return doc
-      }
-      const q = (selector: string) => getDoc()?.querySelector(selector)?.textContent?.trim() || ''
+      const rawXml = appMsgRawXml
+      if (!appMsgContainsTag) return null
+      const q = queryAppMsgText
 
       const xmlType = message.xmlType || q('appmsg > type') || q('type')
 
+      // type 62: 拍一拍（按普通文本渲染，支持 [烟花] 这类 emoji 占位符）
+      if (xmlType === '62') {
+        const patText = cleanMessageContent((q('title') || cleanedParsedContent || '').replace(/^\s*\[拍一拍\]\s*/i, ''))
+        return <div className="bubble-content">{renderTextWithEmoji(patText || '拍一拍')}</div>
+      }
+
       // type 57: 引用回复消息，解析 refermsg 渲染为引用样式
       if (xmlType === '57') {
-        const replyText = q('title') || cleanMessageContent(message.parsedContent) || ''
-        const referContent = q('refermsg > content') || ''
-        const referSender = q('refermsg > displayname') || ''
+        const replyText = q('title') || cleanedParsedContent || ''
+        const referContent = queryPreferredQuotedContent()
         const referType = q('refermsg > type') || ''
 
         // 根据被引用消息类型渲染对应内容
@@ -6166,20 +9472,83 @@ function MessageBubble({
         }
 
         return (
-          <div className="bubble-content">
-            <div className="quoted-message">
-              {referSender && <span className="quoted-sender">{referSender}</span>}
-              <span className="quoted-text">{renderReferContent()}</span>
-            </div>
+          renderBubbleWithQuote(
+            renderQuotedMessageBlock(renderReferContent()),
             <div className="message-text">{renderTextWithEmoji(cleanMessageContent(replyText))}</div>
+          )
+        )
+      }
+
+      if (xmlType === '53' || message.appMsgKind === 'solitaire') {
+        const solitaireText = message.linkTitle || q('appmsg > title') || q('title') || cleanedParsedContent || '接龙'
+        const solitaire = parseSolitaireContent(solitaireText)
+        const previewEntries = solitaireExpanded ? solitaire.entries : solitaire.entries.slice(0, 3)
+        const hiddenEntryCount = Math.max(0, solitaire.entries.length - previewEntries.length)
+        const introLines = solitaireExpanded ? solitaire.introLines : solitaire.introLines.slice(0, 4)
+        const hasMoreIntro = !solitaireExpanded && solitaire.introLines.length > introLines.length
+        const countText = solitaire.entries.length > 0 ? `${solitaire.entries.length} 人参与` : '接龙消息'
+
+        return (
+          <div
+            className={`solitaire-message${solitaireExpanded ? ' expanded' : ''}`}
+            role="button"
+            tabIndex={0}
+            aria-expanded={solitaireExpanded}
+            onClick={isSelectionMode ? undefined : (e) => {
+              e.stopPropagation()
+              setSolitaireExpanded(value => !value)
+            }}
+            onKeyDown={isSelectionMode ? undefined : (e) => {
+              if (e.key !== 'Enter' && e.key !== ' ') return
+              e.preventDefault()
+              e.stopPropagation()
+              setSolitaireExpanded(value => !value)
+            }}
+            title={solitaireExpanded ? '点击收起接龙' : '点击展开接龙'}
+          >
+            <div className="solitaire-header">
+              <div className="solitaire-icon" aria-hidden="true">
+                <Hash size={18} />
+              </div>
+              <div className="solitaire-heading">
+                <div className="solitaire-title">{solitaire.title}</div>
+                <div className="solitaire-meta">{countText}</div>
+              </div>
+            </div>
+            {introLines.length > 0 && (
+              <div className="solitaire-intro">
+                {introLines.map((line, index) => (
+                  <div key={`${line}-${index}`} className="solitaire-intro-line">{line}</div>
+                ))}
+                {hasMoreIntro && <div className="solitaire-muted-line">...</div>}
+              </div>
+            )}
+            {previewEntries.length > 0 ? (
+              <div className="solitaire-entry-list">
+                {previewEntries.map(entry => (
+                  <div key={`${entry.index}-${entry.text}`} className="solitaire-entry">
+                    <span className="solitaire-entry-index">{entry.index}</span>
+                    <span className="solitaire-entry-text">{entry.text}</span>
+                  </div>
+                ))}
+                {hiddenEntryCount > 0 && (
+                  <div className="solitaire-muted-line">还有 {hiddenEntryCount} 条...</div>
+                )}
+              </div>
+            ) : null}
+            <div className="solitaire-footer">
+              <span>{solitaireExpanded ? '收起接龙' : '展开接龙'}</span>
+              <ChevronDown size={14} className="solitaire-chevron" />
+            </div>
           </div>
         )
       }
 
-      const title = message.linkTitle || q('title') || cleanMessageContent(message.parsedContent) || 'Card'
+      const title = message.linkTitle || q('title') || cleanedParsedContent || 'Card'
       const desc = message.appMsgDesc || q('des')
       const url = message.linkUrl || q('url')
-      const thumbUrl = message.linkThumb || message.appMsgThumbUrl || q('thumburl') || q('cdnthumburl') || q('cover') || q('coverurl')
+      const fallbackThumbUrl = appMsgThumbRawCandidate
+      const thumbUrl = isRenderableImageSrc(fallbackThumbUrl) ? fallbackThumbUrl : ''
       const musicUrl = message.appMsgMusicUrl || message.appMsgDataUrl || q('musicurl') || q('playurl') || q('dataurl') || q('lowurl')
       const sourceName = message.appMsgSourceName || q('sourcename')
       const sourceDisplayName = q('sourcedisplayname') || ''
@@ -6211,12 +9580,7 @@ function MessageBubble({
       // 对视频号提取真实标题，避免出现 "当前版本不支持该内容"
       let displayTitle = title
       if (kind === 'finder' && (!displayTitle || displayTitle.includes('不支持'))) {
-        try {
-          const d = new DOMParser().parseFromString(rawXml, 'text/xml')
-          displayTitle = d.querySelector('finderFeed desc')?.textContent?.trim() || desc || ''
-        } catch {
-          displayTitle = desc || ''
-        }
+        displayTitle = q('finderFeed > desc') || q('finderFeed desc') || desc || ''
       }
 
       const openExternal = (e: React.MouseEvent, nextUrl?: string) => {
@@ -6258,39 +9622,26 @@ function MessageBubble({
                 loading="lazy"
                 referrerPolicy="no-referrer"
               />
-            ) : (
-              <div className={`link-thumb-placeholder ${cardKind}`}>{cardKind.slice(0, 2).toUpperCase()}</div>
-            )}
+            ) : null}
           </div>
         </div>
       )
 
       if (kind === 'quote') {
         // 引用回复消息（appMsgKind='quote'，xmlType=57）
-        const replyText = message.linkTitle || q('title') || cleanMessageContent(message.parsedContent) || ''
-        const referContent = message.quotedContent || q('refermsg > content') || ''
-        const referSender = message.quotedSender || q('refermsg > displayname') || ''
+        const replyText = message.linkTitle || q('title') || cleanedParsedContent || ''
+        const referContent = queryPreferredQuotedContent()
         return (
-          <div className="bubble-content">
-            <div className="quoted-message">
-              {referSender && <span className="quoted-sender">{referSender}</span>}
-              <span className="quoted-text">{renderTextWithEmoji(cleanMessageContent(referContent))}</span>
-            </div>
+          renderBubbleWithQuote(
+            renderQuotedMessageBlock(renderTextWithEmoji(cleanMessageContent(referContent))),
             <div className="message-text">{renderTextWithEmoji(cleanMessageContent(replyText))}</div>
-          </div>
+          )
         )
       }
 
       if (kind === 'red-packet') {
         // 专属红包卡片
-        const greeting = (() => {
-          try {
-            const d = getDoc()
-            if (!d) return ''
-            return d.querySelector('receivertitle')?.textContent?.trim() ||
-              d.querySelector('sendertitle')?.textContent?.trim() || ''
-          } catch { return '' }
-        })()
+        const greeting = q('receivertitle') || q('sendertitle') || ''
         return (
           <div className="hongbao-message">
             <div className="hongbao-icon">
@@ -6458,38 +9809,19 @@ function MessageBubble({
       return appMsgRichPreview
     }
 
-    const isAppMsg = message.rawContent?.includes('<appmsg') || (message.parsedContent && message.parsedContent.includes('<appmsg'))
-
-    if (isAppMsg) {
-      let title = '链接'
-      let desc = ''
-      let url = ''
-      let appMsgType = ''
-      let textAnnouncement = ''
-      let parsedDoc: Document | null = null
-
-      try {
-        const content = message.rawContent || message.parsedContent || ''
-        // 简单清理 XML 前缀（如 wxid:）
-        const xmlContent = content.substring(content.indexOf('<msg>'))
-
-        const parser = new DOMParser()
-        parsedDoc = parser.parseFromString(xmlContent, 'text/xml')
-
-        title = parsedDoc.querySelector('title')?.textContent || '链接'
-        desc = parsedDoc.querySelector('des')?.textContent || ''
-        url = parsedDoc.querySelector('url')?.textContent || ''
-        appMsgType = parsedDoc.querySelector('appmsg > type')?.textContent || parsedDoc.querySelector('type')?.textContent || ''
-        textAnnouncement = parsedDoc.querySelector('textannouncement')?.textContent || ''
-      } catch (e) {
-        console.error('解析 AppMsg 失败:', e)
-      }
+    if (appMsgContainsTag) {
+      const q = queryAppMsgText
+      const title = q('title') || '链接'
+      const desc = q('des')
+      const url = q('url')
+      const appMsgType = message.xmlType || q('appmsg > type') || q('type')
+      const textAnnouncement = q('textannouncement')
+      const parsedDoc: Document | null = appMsgDoc
 
       // 引用回复消息 (type=57)，防止被误判为链接
       if (appMsgType === '57') {
-        const replyText = parsedDoc?.querySelector('title')?.textContent?.trim() || cleanMessageContent(message.parsedContent) || ''
-        const referContent = parsedDoc?.querySelector('refermsg > content')?.textContent?.trim() || ''
-        const referSender = parsedDoc?.querySelector('refermsg > displayname')?.textContent?.trim() || ''
+        const replyText = parsedDoc?.querySelector('title')?.textContent?.trim() || cleanedParsedContent || ''
+        const referContent = queryPreferredQuotedContent()
         const referType = parsedDoc?.querySelector('refermsg > type')?.textContent?.trim() || ''
 
         const renderReferContent2 = () => {
@@ -6513,13 +9845,10 @@ function MessageBubble({
         }
 
         return (
-          <div className="bubble-content">
-            <div className="quoted-message">
-              {referSender && <span className="quoted-sender">{referSender}</span>}
-              <span className="quoted-text">{renderReferContent2()}</span>
-            </div>
+          renderBubbleWithQuote(
+            renderQuotedMessageBlock(renderReferContent2()),
             <div className="message-text">{renderTextWithEmoji(cleanMessageContent(replyText))}</div>
-          </div>
+          )
         )
       }
 
@@ -6550,11 +9879,12 @@ function MessageBubble({
             ? `共 ${recordList.length} 条聊天记录`
             : desc || '聊天记录'
 
-        const previewItems = recordList.slice(0, 4)
+        const previewItems = buildChatRecordPreviewItems(recordList, 3)
+        const remainingCount = Math.max(0, recordList.length - previewItems.length)
 
         return (
           <div
-            className="link-message chat-record-message"
+            className="chat-record-message"
             onClick={(e) => {
               e.stopPropagation()
               // 打开聊天记录窗口
@@ -6562,42 +9892,32 @@ function MessageBubble({
             }}
             title="点击查看详细聊天记录"
           >
-            <div className="link-header">
-              <div className="link-title" title={displayTitle}>
-                {displayTitle}
-              </div>
+            <div className="chat-record-title" title={displayTitle}>
+              {displayTitle}
             </div>
-            <div className="link-body">
-              <div className="chat-record-preview">
-                {previewItems.length > 0 ? (
-                  <>
-                    <div className="chat-record-meta-line" title={metaText}>
-                      {metaText}
-                    </div>
-                    <div className="chat-record-list">
-                      {previewItems.map((item, i) => (
-                        <div key={i} className="chat-record-item">
-                          <span className="source-name">
-                            {item.sourcename ? `${item.sourcename}: ` : ''}
-                          </span>
-                          {item.datadesc || item.datatitle || '[媒体消息]'}
-                        </div>
-                      ))}
-                      {recordList.length > previewItems.length && (
-                        <div className="chat-record-more">还有 {recordList.length - previewItems.length} 条…</div>
-                      )}
-                    </div>
-                  </>
-                ) : (
-                  <div className="chat-record-desc">
-                    {desc || '点击打开查看完整聊天记录'}
+            <div className="chat-record-meta-line" title={metaText}>
+              {metaText}
+            </div>
+            {previewItems.length > 0 ? (
+              <div className="chat-record-list">
+                {previewItems.map((item, i) => (
+                  <div key={i} className="chat-record-item">
+                    <span className="source-name">
+                      {hasRenderableChatRecordName(item.sourcename) ? `${item.sourcename}: ` : ''}
+                    </span>
+                    {getChatRecordPreviewText(item)}
                   </div>
+                ))}
+                {remainingCount > 0 && (
+                  <div className="chat-record-more">还有 {remainingCount} 条…</div>
                 )}
               </div>
-              <div className="chat-record-icon">
-                <MessageSquare size={18} />
+            ) : (
+              <div className="chat-record-desc">
+                {desc || '点击打开查看完整聊天记录'}
               </div>
-            </div>
+            )}
+            <div className="chat-record-footer">聊天记录</div>
           </div>
         )
       }
@@ -6742,9 +10062,6 @@ function MessageBubble({
             </div>
             <div className="link-body">
               <div className="link-desc" title={desc}>{desc}</div>
-              <div className="link-thumb-placeholder">
-                <Link size={24} />
-              </div>
             </div>
           </div>
         )
@@ -6757,14 +10074,16 @@ function MessageBubble({
       // 没有 cdnUrl 或加载失败，显示占位符
       if ((!message.emojiCdnUrl && !message.emojiLocalPath) || emojiError) {
         return (
-          <div className="emoji-unavailable">
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-              <circle cx="12" cy="12" r="10" />
-              <path d="M8 15s1.5 2 4 2 4-2 4-2" />
-              <line x1="9" y1="9" x2="9.01" y2="9" />
-              <line x1="15" y1="9" x2="15.01" y2="9" />
-            </svg>
-            <span>表情包未缓存</span>
+          <div className="emoji-message-wrapper" ref={emojiContainerRef}>
+            <div className="emoji-unavailable">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <circle cx="12" cy="12" r="10" />
+                <path d="M8 15s1.5 2 4 2 4-2 4-2" />
+                <line x1="9" y1="9" x2="9.01" y2="9" />
+                <line x1="15" y1="9" x2="15.01" y2="9" />
+              </svg>
+              <span>表情包未缓存</span>
+            </div>
           </div>
         )
       }
@@ -6772,20 +10091,31 @@ function MessageBubble({
       // 显示加载中
       if (emojiLoading || !emojiLocalPath) {
         return (
-          <div className="emoji-loading">
-            <Loader2 size={20} className="spin" />
+          <div className="emoji-message-wrapper" ref={emojiContainerRef}>
+            <div className="emoji-loading">
+              <Loader2 size={20} className="spin" />
+            </div>
           </div>
         )
       }
 
       // 显示表情图片
       return (
-        <img
-          src={emojiLocalPath}
-          alt="表情"
-          className="emoji-image"
-          onError={() => setEmojiError(true)}
-        />
+        <div className="emoji-message-wrapper" ref={emojiContainerRef}>
+          <img
+            src={emojiLocalPath}
+            alt="表情"
+            className="emoji-image"
+            onLoad={() => {
+              setEmojiError(false)
+              stabilizeEmojiScrollAfterResize()
+            }}
+            onError={() => {
+              emojiResizeBaselineRef.current = null
+              setEmojiError(true)
+            }}
+          />
+        </div>
       )
     }
 
@@ -6794,19 +10124,14 @@ function MessageBubble({
 
     // 带引用的消息
     if (hasQuote) {
-      return (
-        <div className="bubble-content">
-          <div className="quoted-message">
-            {message.quotedSender && <span className="quoted-sender">{message.quotedSender}</span>}
-            <span className="quoted-text">{renderTextWithEmoji(cleanMessageContent(message.quotedContent || ''))}</span>
-          </div>
-          <div className="message-text">{renderTextWithEmoji(cleanMessageContent(message.parsedContent))}</div>
-        </div>
+      return renderBubbleWithQuote(
+        renderQuotedMessageBlock(renderTextWithEmoji(cleanMessageContent(quotedContent))),
+        <div className="message-text">{renderTextWithEmoji(cleanedParsedContent)}</div>
       )
     }
 
     // 普通消息
-    return <div className="bubble-content">{renderTextWithEmoji(cleanMessageContent(message.parsedContent))}</div>
+    return <div className="bubble-content">{renderTextWithEmoji(cleanedParsedContent)}</div>
   }
 
   return (
@@ -6828,7 +10153,7 @@ function MessageBubble({
         onClick={(e) => {
           if (isSelectionMode) {
             e.stopPropagation()
-            onToggleSelection?.(message.localId, e.shiftKey)
+            onToggleSelection?.(messageKey, e.shiftKey)
           }
         }}
       >
@@ -6857,7 +10182,7 @@ function MessageBubble({
           <div className="bubble-avatar">
             <Avatar
               src={avatarUrl}
-              name={!isSent ? (isGroupChat ? (senderName || message.senderUsername || '?') : (session.displayName || session.username)) : '我'}
+              name={!isSent ? (isGroupChat ? (resolvedSenderName || '?') : (session.displayName || session.username)) : '我'}
               size={36}
               className="bubble-avatar"
             />
@@ -6866,7 +10191,7 @@ function MessageBubble({
             {/* 群聊中显示发送者名称 */}
             {isGroupChat && !isSent && (
               <div className="sender-name">
-                {senderName || message.senderUsername || '群成员'}
+                {resolvedSenderName || '群成员'}
               </div>
             )}
             {renderContent()}
@@ -6891,9 +10216,55 @@ function MessageBubble({
             {isSelected && <Check size={14} strokeWidth={3} />}
           </div>
         )}
+        {systemAlert && createPortal(
+            <div className="modal-overlay" onClick={() => setSystemAlert(null)} style={{ zIndex: 99999 }}>
+              <div className="delete-confirm-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '400px' }}>
+                <div className="confirm-icon">
+                  <AlertCircle size={32} color="var(--danger)" />
+                </div>
+                <div className="confirm-content">
+                  <h3>{systemAlert.title}</h3>
+                  <p style={{ marginTop: '12px', lineHeight: '1.6', fontSize: '14px', color: 'var(--text-secondary)' }}>
+                    {systemAlert.message}
+                  </p>
+                </div>
+                <div className="confirm-actions" style={{ justifyContent: 'center', marginTop: '24px' }}>
+                  <button
+                      className="btn-primary"
+                      onClick={() => setSystemAlert(null)}
+                      style={{ padding: '8px 32px' }}
+                  >
+                    确认
+                  </button>
+                </div>
+              </div>
+            </div>,
+            document.body
+        )}
       </div>
     </>
   )
 }
+
+const MemoMessageBubble = React.memo(MessageBubble, (prevProps, nextProps) => {
+  if (prevProps.message !== nextProps.message) return false
+  if (prevProps.messageKey !== nextProps.messageKey) return false
+  if (prevProps.showTime !== nextProps.showTime) return false
+  if (prevProps.myAvatarUrl !== nextProps.myAvatarUrl) return false
+  if (prevProps.myWxid !== nextProps.myWxid) return false
+  if (prevProps.isGroupChat !== nextProps.isGroupChat) return false
+  if (prevProps.autoTranscribeVoiceEnabled !== nextProps.autoTranscribeVoiceEnabled) return false
+  if (prevProps.isSelectionMode !== nextProps.isSelectionMode) return false
+  if (prevProps.isSelected !== nextProps.isSelected) return false
+  if (prevProps.onRequireModelDownload !== nextProps.onRequireModelDownload) return false
+  if (prevProps.onContextMenu !== nextProps.onContextMenu) return false
+  if (prevProps.onToggleSelection !== nextProps.onToggleSelection) return false
+
+  return (
+    prevProps.session.username === nextProps.session.username &&
+    prevProps.session.displayName === nextProps.session.displayName &&
+    prevProps.session.avatarUrl === nextProps.session.avatarUrl
+  )
+})
 
 export default ChatPage

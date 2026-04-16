@@ -1,6 +1,7 @@
 import { wcdbService } from './wcdbService'
 import { ConfigService } from './config'
 import { ContactCacheService } from './contactCacheService'
+import { app } from 'electron'
 import { existsSync, mkdirSync } from 'fs'
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { basename, join } from 'path'
@@ -27,6 +28,17 @@ export interface SnsMedia {
     livePhoto?: SnsLivePhoto
 }
 
+export interface SnsLocation {
+    latitude?: number
+    longitude?: number
+    city?: string
+    country?: string
+    poiName?: string
+    poiAddress?: string
+    poiAddressName?: string
+    label?: string
+}
+
 export interface SnsPost {
     id: string
     tid?: string       // 数据库主键（雪花 ID），用于精确删除
@@ -39,6 +51,7 @@ export interface SnsPost {
     media: SnsMedia[]
     likes: string[]
     comments: { id: string; nickname: string; content: string; refCommentId: string; refNickname?: string; emojis?: { url: string; md5: string; width: number; height: number; encryptUrl?: string; aesKey?: string }[] }[]
+    location?: SnsLocation
     rawXml?: string
     linkTitle?: string
     linkUrl?: string
@@ -287,12 +300,25 @@ function parseCommentsFromXml(xml: string): ParsedCommentItem[] {
     return comments
 }
 
+const decodeXmlText = (text: string): string => {
+    if (!text) return ''
+    return text
+        .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+        .replace(/&amp;/gi, '&')
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/gi, "'")
+}
+
 class SnsService {
     private configService: ConfigService
     private contactCache: ContactCacheService
     private imageCache = new Map<string, string>()
     private exportStatsCache: { totalPosts: number; totalFriends: number; myPosts: number | null; updatedAt: number } | null = null
+    private userPostCountsCache: { counts: Record<string, number>; updatedAt: number } | null = null
     private readonly exportStatsCacheTtlMs = 5 * 60 * 1000
+    private readonly userPostCountsCacheTtlMs = 5 * 60 * 1000
     private lastTimelineFallbackAt = 0
     private readonly timelineFallbackCooldownMs = 3 * 60 * 1000
 
@@ -512,6 +538,32 @@ class SnsService {
         return raw.trim()
     }
 
+    private async collectSnsUsernamesFromTimeline(maxRounds: number = 2000): Promise<string[]> {
+        const pageSize = 500
+        const uniqueUsers = new Set<string>()
+        let offset = 0
+
+        for (let round = 0; round < maxRounds; round++) {
+            const result = await wcdbService.getSnsTimeline(pageSize, offset, undefined, undefined, 0, 0)
+            if (!result.success || !Array.isArray(result.timeline)) {
+                throw new Error(result.error || '获取朋友圈发布者失败')
+            }
+
+            const rows = result.timeline
+            if (rows.length === 0) break
+
+            for (const row of rows) {
+                const username = this.pickTimelineUsername(row)
+                if (username) uniqueUsers.add(username)
+            }
+
+            if (rows.length < pageSize) break
+            offset += rows.length
+        }
+
+        return Array.from(uniqueUsers)
+    }
+
     private async getExportStatsFromTimeline(myWxid?: string): Promise<{ totalPosts: number; totalFriends: number; myPosts: number | null }> {
         const pageSize = 500
         const uniqueUsers = new Set<string>()
@@ -645,13 +697,128 @@ class SnsService {
         return { media, videoKey }
     }
 
+    private toOptionalNumber(value: unknown): number | undefined {
+        if (typeof value === 'number' && Number.isFinite(value)) return value
+        if (typeof value !== 'string') return undefined
+        const trimmed = value.trim()
+        if (!trimmed) return undefined
+        const parsed = Number.parseFloat(trimmed)
+        return Number.isFinite(parsed) ? parsed : undefined
+    }
+
+    private normalizeLocation(input: unknown): SnsLocation | undefined {
+        if (!input || typeof input !== 'object') return undefined
+
+        const row = input as Record<string, unknown>
+        const normalizeText = (value: unknown): string | undefined => {
+            if (typeof value !== 'string') return undefined
+            return this.toOptionalString(decodeXmlText(value))
+        }
+
+        const location: SnsLocation = {}
+        const latitude = this.toOptionalNumber(row.latitude ?? row.lat ?? row.x)
+        const longitude = this.toOptionalNumber(row.longitude ?? row.lng ?? row.y)
+        const city = normalizeText(row.city)
+        const country = normalizeText(row.country)
+        const poiName = normalizeText(row.poiName ?? row.poiname)
+        const poiAddress = normalizeText(row.poiAddress ?? row.poiaddress)
+        const poiAddressName = normalizeText(row.poiAddressName ?? row.poiaddressname)
+        const label = normalizeText(row.label)
+
+        if (latitude !== undefined) location.latitude = latitude
+        if (longitude !== undefined) location.longitude = longitude
+        if (city) location.city = city
+        if (country) location.country = country
+        if (poiName) location.poiName = poiName
+        if (poiAddress) location.poiAddress = poiAddress
+        if (poiAddressName) location.poiAddressName = poiAddressName
+        if (label) location.label = label
+
+        return Object.keys(location).length > 0 ? location : undefined
+    }
+
+    private parseLocationFromXml(xml: string): SnsLocation | undefined {
+        if (!xml) return undefined
+
+        try {
+            const locationTagMatch = xml.match(/<location\b([^>]*)>/i)
+            const locationAttrs = locationTagMatch?.[1] || ''
+            const readAttr = (name: string): string | undefined => {
+                if (!locationAttrs) return undefined
+                const match = locationAttrs.match(new RegExp(`${name}\\s*=\\s*["']([\\s\\S]*?)["']`, 'i'))
+                if (!match?.[1]) return undefined
+                return this.toOptionalString(decodeXmlText(match[1]))
+            }
+            const readTag = (name: string): string | undefined => {
+                const match = xml.match(new RegExp(`<${name}>([\\s\\S]*?)<\\/${name}>`, 'i'))
+                if (!match?.[1]) return undefined
+                return this.toOptionalString(decodeXmlText(match[1]))
+            }
+
+            const location: SnsLocation = {}
+            const latitude = this.toOptionalNumber(readAttr('latitude') || readAttr('x') || readTag('latitude') || readTag('x'))
+            const longitude = this.toOptionalNumber(readAttr('longitude') || readAttr('y') || readTag('longitude') || readTag('y'))
+            const city = readAttr('city') || readTag('city')
+            const country = readAttr('country') || readTag('country')
+            const poiName = readAttr('poiName') || readAttr('poiname') || readTag('poiName') || readTag('poiname')
+            const poiAddress = readAttr('poiAddress') || readAttr('poiaddress') || readTag('poiAddress') || readTag('poiaddress')
+            const poiAddressName = readAttr('poiAddressName') || readAttr('poiaddressname') || readTag('poiAddressName') || readTag('poiaddressname')
+            const label = readAttr('label') || readTag('label')
+
+            if (latitude !== undefined) location.latitude = latitude
+            if (longitude !== undefined) location.longitude = longitude
+            if (city) location.city = city
+            if (country) location.country = country
+            if (poiName) location.poiName = poiName
+            if (poiAddress) location.poiAddress = poiAddress
+            if (poiAddressName) location.poiAddressName = poiAddressName
+            if (label) location.label = label
+
+            return Object.keys(location).length > 0 ? location : undefined
+        } catch (e) {
+            console.error('[SnsService] 解析位置 XML 失败:', e)
+            return undefined
+        }
+    }
+
+    private mergeLocation(primary?: SnsLocation, fallback?: SnsLocation): SnsLocation | undefined {
+        if (!primary && !fallback) return undefined
+
+        const merged: SnsLocation = {}
+        const setValue = <K extends keyof SnsLocation>(key: K, value: SnsLocation[K] | undefined) => {
+            if (value !== undefined) merged[key] = value
+        }
+
+        setValue('latitude', primary?.latitude ?? fallback?.latitude)
+        setValue('longitude', primary?.longitude ?? fallback?.longitude)
+        setValue('city', primary?.city ?? fallback?.city)
+        setValue('country', primary?.country ?? fallback?.country)
+        setValue('poiName', primary?.poiName ?? fallback?.poiName)
+        setValue('poiAddress', primary?.poiAddress ?? fallback?.poiAddress)
+        setValue('poiAddressName', primary?.poiAddressName ?? fallback?.poiAddressName)
+        setValue('label', primary?.label ?? fallback?.label)
+
+        return Object.keys(merged).length > 0 ? merged : undefined
+    }
+
     private getSnsCacheDir(): string {
-        const cachePath = this.configService.getCacheBasePath()
-        const snsCacheDir = join(cachePath, 'sns_cache')
+        const configuredCachePath = String(this.configService.get('cachePath') || '').trim()
+        const baseDir = configuredCachePath || join(app.getPath('documents'), 'WeFlow')
+        const snsCacheDir = join(baseDir, 'sns_cache')
         if (!existsSync(snsCacheDir)) {
             mkdirSync(snsCacheDir, { recursive: true })
         }
         return snsCacheDir
+    }
+
+    private getEmojiCacheDir(): string {
+        const configuredCachePath = String(this.configService.get('cachePath') || '').trim()
+        const baseDir = configuredCachePath || join(app.getPath('documents'), 'WeFlow')
+        const emojiDir = join(baseDir, 'Emojis')
+        if (!existsSync(emojiDir)) {
+            mkdirSync(emojiDir, { recursive: true })
+        }
+        return emojiDir
     }
 
     private getCacheFilePath(url: string): string {
@@ -661,100 +828,39 @@ class SnsService {
     }
 
     async getSnsUsernames(): Promise<{ success: boolean; usernames?: string[]; error?: string }> {
-        const collect = (rows?: any[]): string[] => {
-            if (!Array.isArray(rows)) return []
-            const usernames: string[] = []
-            for (const row of rows) {
-                const raw = row?.user_name ?? row?.userName ?? row?.username ?? Object.values(row || {})[0]
-                const username = typeof raw === 'string' ? raw.trim() : String(raw || '').trim()
-                if (username) usernames.push(username)
+        const result = await wcdbService.getSnsUsernames()
+        if (!result.success) {
+            return { success: false, error: result.error || '获取朋友圈联系人失败' }
+        }
+        const directUsernames = Array.isArray(result.usernames) ? result.usernames : []
+        if (directUsernames.length > 0) {
+            return { success: true, usernames: directUsernames }
+        }
+
+        // 回退：通过 timeline 分页拉取收集用户名，兼容底层接口暂时返回空数组的场景。
+        try {
+            const timelineUsers = await this.collectSnsUsernamesFromTimeline()
+            if (timelineUsers.length > 0) {
+                return { success: true, usernames: timelineUsers }
             }
-            return usernames
+        } catch {
+            // 忽略回退错误，保持与原行为一致返回空数组
         }
 
-        const primary = await wcdbService.execQuery(
-            'sns',
-            null,
-            "SELECT DISTINCT user_name FROM SnsTimeLine WHERE user_name IS NOT NULL AND user_name <> ''"
-        )
-        const fallback = await wcdbService.execQuery(
-            'sns',
-            null,
-            "SELECT DISTINCT userName FROM SnsTimeLine WHERE userName IS NOT NULL AND userName <> ''"
-        )
-
-        const merged = Array.from(new Set([
-            ...collect(primary.rows),
-            ...collect(fallback.rows)
-        ]))
-
-        // 任一查询成功且拿到用户名即视为成功，避免因为列名差异导致误判为空。
-        if (merged.length > 0) {
-            return { success: true, usernames: merged }
-        }
-
-        // 两条查询都成功但无数据，说明确实没有朋友圈发布者。
-        if (primary.success || fallback.success) {
-            return { success: true, usernames: [] }
-        }
-
-        return { success: false, error: primary.error || fallback.error || '获取朋友圈联系人失败' }
+        return { success: true, usernames: directUsernames }
     }
 
     private async getExportStatsFromTableCount(myWxid?: string): Promise<{ totalPosts: number; totalFriends: number; myPosts: number | null }> {
-        let totalPosts = 0
-        let totalFriends = 0
-        let myPosts: number | null = null
-
-        const postCountResult = await wcdbService.execQuery('sns', null, 'SELECT COUNT(1) AS total FROM SnsTimeLine')
-        if (postCountResult.success && postCountResult.rows && postCountResult.rows.length > 0) {
-            totalPosts = this.parseCountValue(postCountResult.rows[0])
-        }
-
-        if (totalPosts > 0) {
-            const friendCountPrimary = await wcdbService.execQuery(
-                'sns',
-                null,
-                "SELECT COUNT(DISTINCT user_name) AS total FROM SnsTimeLine WHERE user_name IS NOT NULL AND user_name <> ''"
-            )
-            if (friendCountPrimary.success && friendCountPrimary.rows && friendCountPrimary.rows.length > 0) {
-                totalFriends = this.parseCountValue(friendCountPrimary.rows[0])
-            } else {
-                const friendCountFallback = await wcdbService.execQuery(
-                    'sns',
-                    null,
-                    "SELECT COUNT(DISTINCT userName) AS total FROM SnsTimeLine WHERE userName IS NOT NULL AND userName <> ''"
-                )
-                if (friendCountFallback.success && friendCountFallback.rows && friendCountFallback.rows.length > 0) {
-                    totalFriends = this.parseCountValue(friendCountFallback.rows[0])
-                }
-            }
-        }
-
         const normalizedMyWxid = this.toOptionalString(myWxid)
-        if (normalizedMyWxid) {
-            const myPostPrimary = await wcdbService.execQuery(
-                'sns',
-                null,
-                "SELECT COUNT(1) AS total FROM SnsTimeLine WHERE user_name = ?",
-                [normalizedMyWxid]
-            )
-            if (myPostPrimary.success && myPostPrimary.rows && myPostPrimary.rows.length > 0) {
-                myPosts = this.parseCountValue(myPostPrimary.rows[0])
-            } else {
-                const myPostFallback = await wcdbService.execQuery(
-                    'sns',
-                    null,
-                    "SELECT COUNT(1) AS total FROM SnsTimeLine WHERE userName = ?",
-                    [normalizedMyWxid]
-                )
-                if (myPostFallback.success && myPostFallback.rows && myPostFallback.rows.length > 0) {
-                    myPosts = this.parseCountValue(myPostFallback.rows[0])
-                }
-            }
+        const result = await wcdbService.getSnsExportStats(normalizedMyWxid || undefined)
+        if (!result.success || !result.data) {
+            return { totalPosts: 0, totalFriends: 0, myPosts: normalizedMyWxid ? 0 : null }
         }
-
-        return { totalPosts, totalFriends, myPosts }
+        return {
+            totalPosts: Number(result.data.totalPosts || 0),
+            totalFriends: Number(result.data.totalFriends || 0),
+            myPosts: result.data.myPosts === null || result.data.myPosts === undefined ? null : Number(result.data.myPosts || 0)
+        }
     }
 
     async getExportStats(options?: {
@@ -864,6 +970,84 @@ class SnsService {
         })
     }
 
+    private async getUserPostCountsFromTimeline(): Promise<Record<string, number>> {
+        const pageSize = 500
+        const counts: Record<string, number> = {}
+        let offset = 0
+
+        for (let round = 0; round < 2000; round++) {
+            const result = await wcdbService.getSnsTimeline(pageSize, offset, undefined, undefined, 0, 0)
+            if (!result.success || !Array.isArray(result.timeline)) {
+                throw new Error(result.error || '获取朋友圈用户总条数失败')
+            }
+
+            const rows = result.timeline
+            if (rows.length === 0) break
+
+            for (const row of rows) {
+                const username = this.pickTimelineUsername(row)
+                if (!username) continue
+                counts[username] = (counts[username] || 0) + 1
+            }
+
+            if (rows.length < pageSize) break
+            offset += rows.length
+        }
+
+        return counts
+    }
+
+    async getUserPostCounts(options?: {
+        preferCache?: boolean
+    }): Promise<{ success: boolean; counts?: Record<string, number>; error?: string }> {
+        const preferCache = options?.preferCache ?? true
+        const now = Date.now()
+
+        try {
+            if (
+                preferCache &&
+                this.userPostCountsCache &&
+                now - this.userPostCountsCache.updatedAt <= this.userPostCountsCacheTtlMs
+            ) {
+                return { success: true, counts: this.userPostCountsCache.counts }
+            }
+
+            const counts = await this.getUserPostCountsFromTimeline()
+            this.userPostCountsCache = {
+                counts,
+                updatedAt: Date.now()
+            }
+            return { success: true, counts }
+        } catch (error) {
+            console.error('[SnsService] getUserPostCounts failed:', error)
+            if (this.userPostCountsCache) {
+                return { success: true, counts: this.userPostCountsCache.counts }
+            }
+            return { success: false, error: String(error) }
+        }
+    }
+
+    async getUserPostStats(username: string): Promise<{ success: boolean; data?: { username: string; totalPosts: number }; error?: string }> {
+        const normalizedUsername = this.toOptionalString(username)
+        if (!normalizedUsername) {
+            return { success: false, error: '用户名不能为空' }
+        }
+
+        const countsResult = await this.getUserPostCounts({ preferCache: true })
+        if (countsResult.success) {
+            const totalPosts = countsResult.counts?.[normalizedUsername] ?? 0
+            return {
+                success: true,
+                data: {
+                    username: normalizedUsername,
+                    totalPosts: Math.max(0, Number(totalPosts || 0))
+                }
+            }
+        }
+
+        return { success: false, error: countsResult.error || '统计单个好友朋友圈失败' }
+    }
+
     // 安装朋友圈删除拦截
     async installSnsBlockDeleteTrigger(): Promise<{ success: boolean; alreadyInstalled?: boolean; error?: string }> {
         return wcdbService.installSnsBlockDeleteTrigger()
@@ -881,18 +1065,23 @@ class SnsService {
 
     // 从数据库直接删除朋友圈记录
     async deleteSnsPost(postId: string): Promise<{ success: boolean; error?: string }> {
-        return wcdbService.deleteSnsPost(postId)
+        const result = await wcdbService.deleteSnsPost(postId)
+        if (result.success) {
+            this.userPostCountsCache = null
+            this.exportStatsCache = null
+        }
+        return result
     }
 
     /**
-     * 补全 DLL 返回的评论中缺失的 refNickname
-     * DLL 返回的 refCommentId 是被回复评论的 cmtid
+     * 补全数据服务返回的评论中缺失的 refNickname
+     *数据服务返回的 refCommentId 是被回复评论的 cmtid
      * 评论按 cmtid 从小到大排列，cmtid 从 1 开始递增
      */
     private fixCommentRefs(comments: any[]): any[] {
         if (!comments || comments.length === 0) return []
 
-        // DLL 现在返回完整的评论数据（含 emojis、refNickname）
+        //数据服务现在返回完整的评论数据（含 emojis、refNickname）
         // 此处做最终的格式化和兜底补全
         const idToNickname = new Map<string, string>()
         comments.forEach((c, idx) => {
@@ -939,7 +1128,12 @@ class SnsService {
         const enrichedTimeline = result.timeline.map((post: any) => {
             const contact = this.contactCache.get(post.username)
             const isVideoPost = post.type === 15
-            const videoKey = extractVideoKey(post.rawXml || '')
+            const rawXml = post.rawXml || ''
+            const videoKey = extractVideoKey(rawXml)
+            const location = this.mergeLocation(
+                this.normalizeLocation((post as { location?: unknown }).location),
+                this.parseLocationFromXml(rawXml)
+            )
 
             const fixedMedia = (post.media || []).map((m: any) => ({
                 url: fixSnsUrl(m.url, m.token, isVideoPost),
@@ -958,15 +1152,14 @@ class SnsService {
                 } : undefined
             }))
 
-            // DLL 已返回完整评论数据（含 emojis、refNickname）
-            // 如果 DLL 评论缺少表情包信息，回退到从 rawXml 重新解析
+            //数据服务已返回完整评论数据（含 emojis、refNickname）
+            // 如果数据服务评论缺少表情包信息，回退到从 rawXml 重新解析
             const dllComments: any[] = post.comments || []
             const hasEmojisInDll = dllComments.some((c: any) => c.emojis && c.emojis.length > 0)
-            const rawXml = post.rawXml || ''
 
             let finalComments: any[]
             if (dllComments.length > 0 && (hasEmojisInDll || !rawXml)) {
-                // DLL 数据完整，直接使用
+                //数据服务数据完整，直接使用
                 finalComments = this.fixCommentRefs(dllComments)
             } else if (rawXml) {
                 // 回退：从 rawXml 重新解析（兼容旧版 DLL）
@@ -981,7 +1174,8 @@ class SnsService {
                 avatarUrl: contact?.avatarUrl,
                 nickname: post.nickname || contact?.displayName || post.username,
                 media: fixedMedia,
-                comments: finalComments
+                comments: finalComments,
+                location
             }
         })
 
@@ -1058,7 +1252,7 @@ class SnsService {
         return { success: false, error: result.error }
     }
 
-    async downloadImage(url: string, key?: string | number): Promise<{ success: boolean; data?: Buffer; contentType?: string; error?: string }> {
+    async downloadImage(url: string, key?: string | number): Promise<{ success: boolean; data?: Buffer; contentType?: string; cachePath?: string; error?: string }> {
         return this.fetchAndDecryptImage(url, key)
     }
 
@@ -1337,6 +1531,7 @@ class SnsService {
                         })),
                         likes: p.likes,
                         comments: p.comments,
+                        location: p.location,
                         linkTitle: (p as any).linkTitle,
                         linkUrl: (p as any).linkUrl
                     }))
@@ -1388,6 +1583,7 @@ class SnsService {
                         })),
                         likes: post.likes,
                         comments: post.comments,
+                        location: post.location,
                         likesDetail,
                         commentsDetail,
                         linkTitle: (post as any).linkTitle,
@@ -1470,6 +1666,27 @@ class SnsService {
             const ch = name.charAt(0)
             return escapeHtml(ch || '?')
         }
+        const normalizeLocationText = (value?: string): string => (
+            decodeXmlText(String(value || '')).replace(/\s+/g, ' ').trim()
+        )
+        const resolveLocationText = (location?: SnsLocation): string => {
+            if (!location) return ''
+            const primaryCandidates = [
+                normalizeLocationText(location.poiName),
+                normalizeLocationText(location.poiAddressName),
+                normalizeLocationText(location.label),
+                normalizeLocationText(location.poiAddress)
+            ].filter(Boolean)
+            const primary = primaryCandidates[0] || ''
+            const region = [
+                normalizeLocationText(location.country),
+                normalizeLocationText(location.city)
+            ].filter(Boolean).join(' ')
+            if (primary && region && !primary.includes(region)) {
+                return `${primary} · ${region}`
+            }
+            return primary || region
+        }
 
         let filterInfo = ''
         if (filters.keyword) filterInfo += `关键词: "${escapeHtml(filters.keyword)}" `
@@ -1493,6 +1710,10 @@ class SnsService {
             const linkHtml = post.linkTitle && post.linkUrl
                 ? `<a class="lk" href="${escapeHtml(post.linkUrl)}" target="_blank"><span class="lk-t">${escapeHtml(post.linkTitle)}</span><span class="lk-a">›</span></a>`
                 : ''
+            const locationText = resolveLocationText(post.location)
+            const locationHtml = locationText
+                ? `<div class="loc"><span class="loc-i">📍</span><span class="loc-t">${escapeHtml(locationText)}</span></div>`
+                : ''
 
             const likesHtml = post.likes.length > 0
                 ? `<div class="interactions"><div class="likes">♥ ${post.likes.map(l => `<span>${escapeHtml(l)}</span>`).join('、')}</div></div>`
@@ -1515,6 +1736,7 @@ ${avatarHtml}
 <div class="body">
 <div class="hd"><span class="nick">${escapeHtml(post.nickname)}</span><span class="tm">${formatTime(post.createTime)}</span></div>
 ${post.contentDesc ? `<div class="txt">${escapeHtml(post.contentDesc)}</div>` : ''}
+${locationHtml}
 ${mediaHtml ? `<div class="mg ${gridClass}">${mediaHtml}</div>` : ''}
 ${linkHtml}
 ${likesHtml}
@@ -1550,6 +1772,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hira
 .nick{font-size:15px;font-weight:700;color:var(--accent);margin-bottom:2px}
 .tm{font-size:12px;color:var(--t3)}
 .txt{font-size:15px;line-height:1.6;white-space:pre-wrap;word-break:break-word;margin-bottom:12px}
+.loc{display:flex;align-items:flex-start;gap:6px;font-size:13px;color:var(--t2);margin:-4px 0 12px}
+.loc-i{line-height:1.3}
+.loc-t{line-height:1.45;word-break:break-word}
 
 /* 媒体网格 */
 .mg{display:grid;gap:6px;margin-bottom:12px;max-width:320px}
@@ -1619,7 +1844,7 @@ window.addEventListener('scroll',function(){document.getElementById('btt').class
         const isVideo = isVideoUrl(url)
         const cachePath = this.getCacheFilePath(url)
 
-        // 1. 尝试从磁盘缓存读取
+        // 1. 优先尝试从当前缓存目录读取
         if (existsSync(cachePath)) {
             try {
                 // 对于视频，不读取整个文件到内存，只确认存在即可
@@ -2080,9 +2305,7 @@ window.addEventListener('scroll',function(){document.getElementById('btt').class
 
         const fs = require('fs')
         const cacheKey = crypto.createHash('md5').update(url || encryptUrl!).digest('hex')
-        const cachePath = this.configService.getCacheBasePath()
-        const emojiDir = join(cachePath, 'sns_emoji_cache')
-        if (!existsSync(emojiDir)) mkdirSync(emojiDir, { recursive: true })
+        const emojiDir = this.getEmojiCacheDir()
 
         // 检查本地缓存
         for (const ext of ['.gif', '.png', '.webp', '.jpg', '.jpeg']) {

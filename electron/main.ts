@@ -1,9 +1,10 @@
 import './preload-env'
-import { app, BrowserWindow, ipcMain, nativeTheme, session } from 'electron'
+import { app, BrowserWindow, ipcMain, nativeTheme, session, Tray, Menu, nativeImage } from 'electron'
 import { Worker } from 'worker_threads'
+import { randomUUID } from 'crypto'
 import { join, dirname } from 'path'
 import { autoUpdater } from 'electron-updater'
-import { readFile, writeFile, mkdir, rm, readdir } from 'fs/promises'
+import { readFile, writeFile, mkdir, rm, readdir, copyFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import { ConfigService } from './services/config'
 import { dbPathService } from './services/dbPathService'
@@ -16,6 +17,8 @@ import { groupAnalyticsService } from './services/groupAnalyticsService'
 import { annualReportService } from './services/annualReportService'
 import { exportService, ExportOptions, ExportProgress } from './services/exportService'
 import { KeyService } from './services/keyService'
+import { KeyServiceLinux } from './services/keyServiceLinux'
+import { KeyServiceMac } from './services/keyServiceMac'
 import { voiceTranscribeService } from './services/voiceTranscribeService'
 import { videoService } from './services/videoService'
 import { snsService, isVideoUrl } from './services/snsService'
@@ -24,18 +27,280 @@ import { windowsHelloService } from './services/windowsHelloService'
 import { exportCardDiagnosticsService } from './services/exportCardDiagnosticsService'
 import { cloudControlService } from './services/cloudControlService'
 
-import { registerNotificationHandlers, showNotification } from './windows/notificationWindow'
+import { destroyNotificationWindow, registerNotificationHandlers, showNotification, setNotificationNavigateHandler } from './windows/notificationWindow'
 import { httpService } from './services/httpService'
-
+import { messagePushService } from './services/messagePushService'
+import { insightService } from './services/insightService'
+import { bizService } from './services/bizService'
 
 // 配置自动更新
 autoUpdater.autoDownload = false
 autoUpdater.autoInstallOnAppQuit = true
 autoUpdater.disableDifferentialDownload = true  // 禁用差分更新，强制全量下载
+// 更新通道策略：
+// - 稳定版（如 4.3.0）默认走 latest
+// - 预览版（如 0.26.2）默认走 preview（0.年.当年发布序号）
+// - 开发版（如 26.4.5）默认走 dev（年.月.日）
+// - 用户可在设置页切换稳定/预览/开发，切换后即时生效
+// 同时区分 Windows x64 / arm64，避免更新清单互相覆盖。
+const appVersion = app.getVersion()
+const inferUpdateTrackFromVersion = (version: string): 'stable' | 'preview' | 'dev' => {
+  const normalized = String(version || '').trim().replace(/^v/i, '')
+  if (/^0\.\d{2}\.\d+$/i.test(normalized)) return 'preview'
+  if (/^\d{2}\.\d{1,2}\.\d{1,2}$/i.test(normalized)) return 'dev'
+  // 兼容旧版命名（如 4.3.0-preview.26.1 / 4.3.0-dev.26.3.4）
+  if (/-preview\.\d+\.\d+$/i.test(normalized)) return 'preview'
+  if (/-dev\.\d+\.\d+\.\d+$/i.test(normalized)) return 'dev'
+  // 兼容 alpha/beta/rc 预发布
+  if (/(alpha|beta|rc)/i.test(normalized)) return 'dev'
+  return 'stable'
+}
+
+const defaultUpdateTrack: 'stable' | 'preview' | 'dev' = (() => {
+  const inferred = inferUpdateTrackFromVersion(appVersion)
+  if (inferred === 'preview' || inferred === 'dev') return inferred
+  return 'stable'
+})()
+let configService: ConfigService | null = null
+
+const normalizeUpdateTrack = (raw: unknown): 'stable' | 'preview' | 'dev' | null => {
+  if (raw === 'stable' || raw === 'preview' || raw === 'dev') return raw
+  return null
+}
+
+const getEffectiveUpdateTrack = (): 'stable' | 'preview' | 'dev' => {
+  const configuredTrack = normalizeUpdateTrack(configService?.get('updateChannel'))
+  return configuredTrack || defaultUpdateTrack
+}
+
+const isRemoteVersionNewer = (latestVersion: string, currentVersion: string): boolean => {
+  const latest = String(latestVersion || '').trim()
+  const current = String(currentVersion || '').trim()
+  if (!latest || !current) return false
+
+  const parseVersion = (version: string) => {
+    const normalized = version.replace(/^v/i, '')
+    const [main, pre = ''] = normalized.split('-', 2)
+    const core = main.split('.').map((segment) => Number.parseInt(segment, 10) || 0)
+    const prerelease = pre ? pre.split('.').map((segment) => /^\d+$/.test(segment) ? Number.parseInt(segment, 10) : segment) : []
+    return { core, prerelease }
+  }
+
+  const compareParsedVersion = (a: ReturnType<typeof parseVersion>, b: ReturnType<typeof parseVersion>): number => {
+    const maxLen = Math.max(a.core.length, b.core.length)
+    for (let i = 0; i < maxLen; i += 1) {
+      const left = a.core[i] || 0
+      const right = b.core[i] || 0
+      if (left > right) return 1
+      if (left < right) return -1
+    }
+
+    const aPre = a.prerelease
+    const bPre = b.prerelease
+    if (aPre.length === 0 && bPre.length === 0) return 0
+    if (aPre.length === 0) return 1
+    if (bPre.length === 0) return -1
+
+    const preMaxLen = Math.max(aPre.length, bPre.length)
+    for (let i = 0; i < preMaxLen; i += 1) {
+      const left = aPre[i]
+      const right = bPre[i]
+      if (left === undefined) return -1
+      if (right === undefined) return 1
+      if (left === right) continue
+
+      const leftNum = typeof left === 'number'
+      const rightNum = typeof right === 'number'
+      if (leftNum && rightNum) return left > right ? 1 : -1
+      if (leftNum) return -1
+      if (rightNum) return 1
+      return String(left) > String(right) ? 1 : -1
+    }
+
+    return 0
+  }
+
+  try {
+    return autoUpdater.currentVersion.compare(latest) < 0
+  } catch {
+    return compareParsedVersion(parseVersion(latest), parseVersion(current)) > 0
+  }
+}
+
+const shouldOfferUpdateForTrack = (latestVersion: string, currentVersion: string): boolean => {
+  if (isRemoteVersionNewer(latestVersion, currentVersion)) return true
+  const effectiveTrack = getEffectiveUpdateTrack()
+  const currentTrack = inferUpdateTrackFromVersion(currentVersion)
+  // 切换通道后，目标通道最新版本与当前版本不同即提示更新（即使是降级）
+  if (effectiveTrack !== currentTrack && latestVersion !== currentVersion) return true
+  return false
+}
+
+let lastAppliedUpdaterChannel: string | null = null
+let lastAppliedUpdaterFeedUrl: string | null = null
+const resetUpdaterProviderCache = () => {
+  const updater = autoUpdater as any
+  // electron-updater 会缓存 provider；切换 channel 后需清理缓存，避免仍请求旧通道
+  for (const key of ['clientPromise', '_clientPromise', 'updateInfoAndProvider']) {
+    if (Object.prototype.hasOwnProperty.call(updater, key)) {
+      updater[key] = null
+    }
+  }
+}
+
+const getUpdaterFeedUrlByTrack = (track: 'stable' | 'preview' | 'dev'): string => {
+  const repoBase = 'https://github.com/hicccc77/WeFlow/releases'
+  if (track === 'stable') return `${repoBase}/latest/download`
+  if (track === 'preview') return `${repoBase}/download/nightly-preview`
+  return `${repoBase}/download/nightly-dev`
+}
+
+const applyAutoUpdateChannel = (reason: 'startup' | 'settings' = 'startup') => {
+  const track = getEffectiveUpdateTrack()
+  const currentTrack = inferUpdateTrackFromVersion(appVersion)
+  const baseUpdateChannel = track === 'stable' ? 'latest' : track
+  const nextFeedUrl = getUpdaterFeedUrlByTrack(track)
+  const nextUpdaterChannel =
+    process.platform === 'win32' && process.arch === 'arm64'
+      ? `${baseUpdateChannel}-arm64`
+      : baseUpdateChannel
+  if (
+    (lastAppliedUpdaterChannel && lastAppliedUpdaterChannel !== nextUpdaterChannel) ||
+    (lastAppliedUpdaterFeedUrl && lastAppliedUpdaterFeedUrl !== nextFeedUrl)
+  ) {
+    resetUpdaterProviderCache()
+  }
+  autoUpdater.allowPrerelease = track !== 'stable'
+  // 只要用户当前选择的目标通道与当前安装版本所属通道不同，就允许跨通道更新（含降级）
+  autoUpdater.allowDowngrade = track !== currentTrack
+  // 统一走 generic feed，确保 preview/dev 命中各自固定发布页，不受 GitHub provider 的 prerelease 选择影响。
+  autoUpdater.setFeedURL({
+    provider: 'generic',
+    url: nextFeedUrl,
+    channel: nextUpdaterChannel
+  })
+  autoUpdater.channel = nextUpdaterChannel
+  lastAppliedUpdaterChannel = nextUpdaterChannel
+  lastAppliedUpdaterFeedUrl = nextFeedUrl
+}
+
+applyAutoUpdateChannel('startup')
 const AUTO_UPDATE_ENABLED =
   process.env.AUTO_UPDATE_ENABLED === 'true' ||
   process.env.AUTO_UPDATE_ENABLED === '1' ||
   (process.env.AUTO_UPDATE_ENABLED == null && !process.env.VITE_DEV_SERVER_URL)
+
+const getLaunchAtStartupUnsupportedReason = (): string | null => {
+  if (process.platform !== 'win32' && process.platform !== 'darwin') {
+    return '当前平台暂不支持开机自启动'
+  }
+  if (!app.isPackaged) {
+    return '仅安装后的 Windows / macOS 版本支持开机自启动'
+  }
+  return null
+}
+
+const isLaunchAtStartupSupported = (): boolean => getLaunchAtStartupUnsupportedReason() == null
+
+const getStoredLaunchAtStartupPreference = (): boolean | undefined => {
+  const value = configService?.get('launchAtStartup')
+  return typeof value === 'boolean' ? value : undefined
+}
+
+const getSystemLaunchAtStartup = (): boolean => {
+  if (!isLaunchAtStartupSupported()) return false
+  try {
+    return app.getLoginItemSettings().openAtLogin === true
+  } catch (error) {
+    console.error('[WeFlow] 读取开机自启动状态失败:', error)
+    return false
+  }
+}
+
+const buildLaunchAtStartupSettings = (enabled: boolean): Parameters<typeof app.setLoginItemSettings>[0] =>
+  process.platform === 'win32'
+    ? { openAtLogin: enabled, path: process.execPath }
+    : { openAtLogin: enabled }
+
+const setSystemLaunchAtStartup = (enabled: boolean): { success: boolean; enabled: boolean; error?: string } => {
+  try {
+    app.setLoginItemSettings(buildLaunchAtStartupSettings(enabled))
+    const effectiveEnabled = app.getLoginItemSettings().openAtLogin === true
+    if (effectiveEnabled !== enabled) {
+      return {
+        success: false,
+        enabled: effectiveEnabled,
+        error: '系统未接受该开机自启动设置'
+      }
+    }
+    return { success: true, enabled: effectiveEnabled }
+  } catch (error) {
+    return {
+      success: false,
+      enabled: getSystemLaunchAtStartup(),
+      error: `设置开机自启动失败: ${String((error as Error)?.message || error)}`
+    }
+  }
+}
+
+const getLaunchAtStartupStatus = (): { enabled: boolean; supported: boolean; reason?: string } => {
+  const unsupportedReason = getLaunchAtStartupUnsupportedReason()
+  if (unsupportedReason) {
+    return {
+      enabled: getStoredLaunchAtStartupPreference() === true,
+      supported: false,
+      reason: unsupportedReason
+    }
+  }
+  return {
+    enabled: getSystemLaunchAtStartup(),
+    supported: true
+  }
+}
+
+const applyLaunchAtStartupPreference = (
+  enabled: boolean
+): { success: boolean; enabled: boolean; supported: boolean; reason?: string; error?: string } => {
+  const unsupportedReason = getLaunchAtStartupUnsupportedReason()
+  if (unsupportedReason) {
+    return {
+      success: false,
+      enabled: getStoredLaunchAtStartupPreference() === true,
+      supported: false,
+      reason: unsupportedReason
+    }
+  }
+
+  const result = setSystemLaunchAtStartup(enabled)
+  configService?.set('launchAtStartup', result.enabled)
+  return {
+    ...result,
+    supported: true
+  }
+}
+
+const syncLaunchAtStartupPreference = () => {
+  if (!configService) return
+
+  const unsupportedReason = getLaunchAtStartupUnsupportedReason()
+  if (unsupportedReason) return
+
+  const storedPreference = getStoredLaunchAtStartupPreference()
+  const systemEnabled = getSystemLaunchAtStartup()
+
+  if (typeof storedPreference !== 'boolean') {
+    configService.set('launchAtStartup', systemEnabled)
+    return
+  }
+
+  if (storedPreference === systemEnabled) return
+
+  const result = setSystemLaunchAtStartup(storedPreference)
+  configService.set('launchAtStartup', result.enabled)
+  if (!result.success && result.error) {
+    console.error('[WeFlow] 同步开机自启动设置失败:', result.error)
+  }
+}
 
 // 使用白名单过滤 PATH，避免被第三方目录中的旧版 VC++ 运行库劫持。
 // 仅保留系统目录（Windows/System32/SysWOW64）和应用自身目录（可执行目录、resources）。
@@ -79,7 +344,6 @@ function sanitizePathEnv() {
 sanitizePathEnv()
 
 // 单例服务
-let configService: ConfigService | null = null
 
 // 协议窗口实例
 let agreementWindow: BrowserWindow | null = null
@@ -87,15 +351,161 @@ let onboardingWindow: BrowserWindow | null = null
 // Splash 启动窗口
 let splashWindow: BrowserWindow | null = null
 const sessionChatWindows = new Map<string, BrowserWindow>()
-const keyService = new KeyService()
+const sessionChatWindowSources = new Map<string, 'chat' | 'export'>()
+
+let keyService: any
+if (process.platform === 'darwin') {
+  keyService = new KeyServiceMac()
+} else if (process.platform === 'linux') {
+  // const { KeyServiceLinux } = require('./services/keyServiceLinux')
+  // keyService = new KeyServiceLinux()
+
+  import('./services/keyServiceLinux').then(({ KeyServiceLinux }) => {
+    keyService = new KeyServiceLinux();
+  });
+
+} else {
+  keyService = new KeyService()
+}
 
 let mainWindowReady = false
 let shouldShowMain = true
+let isAppQuitting = false
+let tray: Tray | null = null
+let isClosePromptVisible = false
+const chatHistoryPayloadStore = new Map<string, { sessionId: string; title?: string; recordList: any[] }>()
+
+type WindowCloseBehavior = 'ask' | 'tray' | 'quit'
 
 // 更新下载状态管理（Issue #294 修复）
 let isDownloadInProgress = false
 let downloadProgressHandler: ((progress: any) => void) | null = null
 let downloadedHandler: (() => void) | null = null
+
+const normalizeReleaseNotes = (rawReleaseNotes: unknown): string => {
+  const merged = (() => {
+    if (typeof rawReleaseNotes === 'string') {
+      return rawReleaseNotes
+    }
+    if (Array.isArray(rawReleaseNotes)) {
+      return rawReleaseNotes
+        .map((item) => {
+          if (!item || typeof item !== 'object') return ''
+          const note = (item as { note?: unknown }).note
+          return typeof note === 'string' ? note : ''
+        })
+        .filter(Boolean)
+        .join('\n\n')
+    }
+    return ''
+  })()
+
+  if (!merged.trim()) return ''
+
+  const normalizeHeadingText = (raw: string): string => {
+    return raw
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;/gi, '\'')
+      .replace(/&#x27;/gi, '\'')
+      .toLowerCase()
+      .replace(/[：:]/g, '')
+      .replace(/\s+/g, '')
+      .trim()
+  }
+
+  const shouldStripReleaseSection = (headingRaw: string): boolean => {
+    const heading = normalizeHeadingText(headingRaw)
+    if (!heading) return false
+    if (heading.startsWith('下载') || heading.startsWith('download')) return true
+
+    if ((heading.includes('macos') || heading.startsWith('mac')) && heading.includes('安装提示')) return true
+    return false
+  }
+
+  // 兼容 electron-updater 直接返回 HTML 的场景（含 dir/anchor 等标签嵌套）
+  const removeDownloadSectionFromHtml = (input: string): string => {
+    const headingPattern = /<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi
+    const headings: Array<{ start: number; end: number; headingText: string }> = []
+    let match: RegExpExecArray | null
+
+    while ((match = headingPattern.exec(input)) !== null) {
+      const full = match[0]
+      headings.push({
+        start: match.index,
+        end: match.index + full.length,
+        headingText: match[2] || ''
+      })
+    }
+
+    if (headings.length === 0) return input
+
+    const rangesToRemove: Array<{ start: number; end: number }> = []
+    for (let i = 0; i < headings.length; i += 1) {
+      const current = headings[i]
+      if (!shouldStripReleaseSection(current.headingText)) continue
+
+      const nextStart = i + 1 < headings.length ? headings[i + 1].start : input.length
+      rangesToRemove.push({ start: current.start, end: nextStart })
+    }
+
+    if (rangesToRemove.length === 0) return input
+
+    let output = ''
+    let cursor = 0
+    for (const range of rangesToRemove) {
+      output += input.slice(cursor, range.start)
+      cursor = range.end
+    }
+    output += input.slice(cursor)
+    return output
+  }
+
+  // 兼容 Markdown 场景（Action 最终 release note 模板）
+  const removeDownloadSectionFromMarkdown = (input: string): string => {
+    const lines = input.split(/\r?\n/)
+    const output: string[] = []
+    let skipSection = false
+
+    for (const line of lines) {
+      const headingMatch = line.match(/^\s*#{1,6}\s*(.+?)\s*$/)
+      if (headingMatch) {
+        if (shouldStripReleaseSection(headingMatch[1])) {
+          skipSection = true
+          continue
+        }
+        if (skipSection) {
+          skipSection = false
+        }
+      }
+      if (!skipSection) {
+        output.push(line)
+      }
+    }
+
+    return output.join('\n')
+  }
+
+  const cleaned = removeDownloadSectionFromMarkdown(removeDownloadSectionFromHtml(merged))
+    // 兜底：即使没有匹配到标题，也不在弹窗展示 macOS 隔离标记清理命令
+    .replace(/^[ \t>*-]*`?\s*xattr\s+-[a-z]*d[a-z]*\s+com\.apple\.quarantine[^\n]*`?\s*$/gim, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+  return cleaned
+}
+
+const getDialogReleaseNotes = (rawReleaseNotes: unknown): string => {
+  const track = getEffectiveUpdateTrack()
+  if (track !== 'stable') {
+    return '修复了一些已知问题'
+  }
+  return normalizeReleaseNotes(rawReleaseNotes)
+}
 
 type AnnualReportYearsLoadStrategy = 'cache' | 'native' | 'hybrid'
 type AnnualReportYearsLoadPhase = 'cache' | 'native' | 'scan' | 'done'
@@ -121,6 +531,47 @@ interface AnnualReportYearsTaskState {
   done: boolean
   snapshot: AnnualReportYearsProgressPayload
   updatedAt: number
+}
+
+interface OpenSessionChatWindowOptions {
+  source?: 'chat' | 'export'
+  initialDisplayName?: string
+  initialAvatarUrl?: string
+  initialContactType?: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
+}
+
+const normalizeSessionChatWindowSource = (source: unknown): 'chat' | 'export' => {
+  return String(source || '').trim().toLowerCase() === 'export' ? 'export' : 'chat'
+}
+
+const normalizeSessionChatWindowOptionString = (value: unknown): string => {
+  return String(value || '').trim()
+}
+
+const loadSessionChatWindowContent = (
+  win: BrowserWindow,
+  sessionId: string,
+  source: 'chat' | 'export',
+  options?: OpenSessionChatWindowOptions
+) => {
+  const queryParams = new URLSearchParams({
+    sessionId,
+    source
+  })
+  const initialDisplayName = normalizeSessionChatWindowOptionString(options?.initialDisplayName)
+  const initialAvatarUrl = normalizeSessionChatWindowOptionString(options?.initialAvatarUrl)
+  const initialContactType = normalizeSessionChatWindowOptionString(options?.initialContactType)
+  if (initialDisplayName) queryParams.set('initialDisplayName', initialDisplayName)
+  if (initialAvatarUrl) queryParams.set('initialAvatarUrl', initialAvatarUrl)
+  if (initialContactType) queryParams.set('initialContactType', initialContactType)
+  const query = queryParams.toString()
+  if (process.env.VITE_DEV_SERVER_URL) {
+    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/chat-window?${query}`)
+    return
+  }
+  win.loadFile(join(__dirname, '../dist/index.html'), {
+    hash: `/chat-window?${query}`
+  })
 }
 
 const annualReportYearsLoadTasks = new Map<string, AnnualReportYearsTaskState>()
@@ -189,13 +640,51 @@ const isYearsLoadCanceled = (taskId: string): boolean => {
   return task?.canceled === true
 }
 
+const setupCustomTitleBarWindow = (win: BrowserWindow): void => {
+  if (process.platform === 'darwin') {
+    win.setWindowButtonVisibility(false)
+  }
+
+  const emitMaximizeState = () => {
+    if (win.isDestroyed()) return
+    win.webContents.send('window:maximizeStateChanged', win.isMaximized() || win.isFullScreen())
+  }
+
+  win.on('maximize', emitMaximizeState)
+  win.on('unmaximize', emitMaximizeState)
+  win.on('enter-full-screen', emitMaximizeState)
+  win.on('leave-full-screen', emitMaximizeState)
+  win.webContents.on('did-finish-load', emitMaximizeState)
+}
+
+const getWindowCloseBehavior = (): WindowCloseBehavior => {
+  const behavior = configService?.get('windowCloseBehavior')
+  return behavior === 'tray' || behavior === 'quit' ? behavior : 'ask'
+}
+
+const requestMainWindowCloseConfirmation = (win: BrowserWindow): void => {
+  if (isClosePromptVisible) return
+  isClosePromptVisible = true
+  win.webContents.send('window:confirmCloseRequested', {
+    canMinimizeToTray: Boolean(tray)
+  })
+}
+
 function createWindow(options: { autoShow?: boolean } = {}) {
   // 获取图标路径 - 打包后在 resources 目录
   const { autoShow = true } = options
+  let iconName = 'icon.ico';
+  if (process.platform === 'linux') {
+    iconName = 'icon.png';
+  } else if (process.platform === 'darwin') {
+    iconName = 'icon.icns';
+  }
+
   const isDev = !!process.env.VITE_DEV_SERVER_URL
+
   const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+      ? join(__dirname, `../public/${iconName}`)
+      : join(process.resourcesPath, iconName);
 
   const win = new BrowserWindow({
     width: 1400,
@@ -210,13 +699,10 @@ function createWindow(options: { autoShow?: boolean } = {}) {
       webSecurity: false // Allow loading local files (video playback)
     },
     titleBarStyle: 'hidden',
-    titleBarOverlay: {
-      color: '#00000000',
-      symbolColor: '#1a1a1a',
-      height: 40
-    },
+    titleBarOverlay: false,
     show: false
   })
+  setupCustomTitleBarWindow(win)
 
   // 窗口准备好后显示
   // Splash 模式下不在这里 show，由启动流程统一控制
@@ -248,6 +734,14 @@ function createWindow(options: { autoShow?: boolean } = {}) {
 
   // Handle notification click navigation
   ipcMain.on('notification-clicked', (_, sessionId) => {
+    if (win.isMinimized()) win.restore()
+    win.show()
+    win.focus()
+    win.webContents.send('navigate-to-session', sessionId)
+  })
+
+  // 设置用于D-Bus通知的Linux通知导航处理程序
+  setNotificationNavigateHandler((sessionId: string) => {
     if (win.isMinimized()) win.restore()
     win.show()
     win.focus()
@@ -290,6 +784,40 @@ function createWindow(options: { autoShow?: boolean } = {}) {
     callback(false)
   })
 
+  win.on('close', (e) => {
+    if (isAppQuitting || win !== mainWindow) return
+    e.preventDefault()
+    const closeBehavior = getWindowCloseBehavior()
+
+    if (closeBehavior === 'quit') {
+      isAppQuitting = true
+      app.quit()
+      return
+    }
+
+    if (closeBehavior === 'tray' && tray) {
+      win.hide()
+      return
+    }
+
+    requestMainWindowCloseConfirmation(win)
+  })
+
+  win.on('closed', () => {
+    if (mainWindow !== win) return
+
+    mainWindow = null
+    mainWindowReady = false
+    isClosePromptVisible = false
+
+    if (process.platform !== 'darwin' && !isAppQuitting) {
+      destroyNotificationWindow()
+      if (BrowserWindow.getAllWindows().length === 0) {
+        app.quit()
+      }
+    }
+  })
+
   return win
 }
 
@@ -306,7 +834,9 @@ function createAgreementWindow() {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   const isDark = nativeTheme.shouldUseDarkColors
 
@@ -356,7 +886,9 @@ function createSplashWindow(): BrowserWindow {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   splashWindow = new BrowserWindow({
     width: 760,
@@ -418,8 +950,17 @@ function closeSplash() {
 /**
  * 创建首次引导窗口
  */
-function createOnboardingWindow() {
+function createOnboardingWindow(mode: 'default' | 'add-account' = 'default') {
+  const onboardingHash = mode === 'add-account'
+    ? '/onboarding-window?mode=add-account'
+    : '/onboarding-window'
+
   if (onboardingWindow && !onboardingWindow.isDestroyed()) {
+    if (process.env.VITE_DEV_SERVER_URL) {
+      onboardingWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}#${onboardingHash}`)
+    } else {
+      onboardingWindow.loadFile(join(__dirname, '../dist/index.html'), { hash: onboardingHash })
+    }
     onboardingWindow.focus()
     return onboardingWindow
   }
@@ -427,7 +968,9 @@ function createOnboardingWindow() {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   onboardingWindow = new BrowserWindow({
     width: 960,
@@ -453,9 +996,9 @@ function createOnboardingWindow() {
   })
 
   if (process.env.VITE_DEV_SERVER_URL) {
-    onboardingWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/onboarding-window`)
+    onboardingWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}#${onboardingHash}`)
   } else {
-    onboardingWindow.loadFile(join(__dirname, '../dist/index.html'), { hash: '/onboarding-window' })
+    onboardingWindow.loadFile(join(__dirname, '../dist/index.html'), { hash: onboardingHash })
   }
 
   onboardingWindow.on('closed', () => {
@@ -473,7 +1016,9 @@ function createVideoPlayerWindow(videoPath: string, videoWidth?: number, videoHe
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   // 获取屏幕尺寸
   const { screen } = require('electron')
@@ -571,7 +1116,9 @@ function createImageViewerWindow(imagePath: string, liveVideoPath?: string) {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   const win = new BrowserWindow({
     width: 900,
@@ -585,16 +1132,13 @@ function createImageViewerWindow(imagePath: string, liveVideoPath?: string) {
       nodeIntegration: false,
       webSecurity: false // 允许加载本地文件
     },
-    titleBarStyle: 'hidden',
-    titleBarOverlay: {
-      color: '#00000000',
-      symbolColor: '#ffffff',
-      height: 40
-    },
+    frame: false,
     show: false,
     backgroundColor: '#000000',
     autoHideMenuBar: true
   })
+
+  setupCustomTitleBarWindow(win)
 
   win.once('ready-to-show', () => {
     win.show()
@@ -629,10 +1173,20 @@ function createImageViewerWindow(imagePath: string, liveVideoPath?: string) {
  * 创建独立的聊天记录窗口
  */
 function createChatHistoryWindow(sessionId: string, messageId: number) {
+  return createChatHistoryRouteWindow(`/chat-history/${sessionId}/${messageId}`)
+}
+
+function createChatHistoryPayloadWindow(payloadId: string) {
+  return createChatHistoryRouteWindow(`/chat-history-inline/${payloadId}`)
+}
+
+function createChatHistoryRouteWindow(route: string) {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   // 根据系统主题设置窗口背景色
   const isDark = nativeTheme.shouldUseDarkColors
@@ -649,22 +1203,19 @@ function createChatHistoryWindow(sessionId: string, messageId: number) {
       nodeIntegration: false
     },
     titleBarStyle: 'hidden',
-    titleBarOverlay: {
-      color: '#00000000',
-      symbolColor: isDark ? '#ffffff' : '#1a1a1a',
-      height: 32
-    },
+    titleBarOverlay: false,
     show: false,
     backgroundColor: isDark ? '#1A1A1A' : '#F0F0F0',
     autoHideMenuBar: true
   })
+  setupCustomTitleBarWindow(win)
 
   win.once('ready-to-show', () => {
     win.show()
   })
 
   if (process.env.VITE_DEV_SERVER_URL) {
-    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/chat-history/${sessionId}/${messageId}`)
+    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#${route}`)
 
     win.webContents.on('before-input-event', (event, input) => {
       if (input.key === 'F12' || (input.control && input.shift && input.key === 'I')) {
@@ -678,7 +1229,7 @@ function createChatHistoryWindow(sessionId: string, messageId: number) {
     })
   } else {
     win.loadFile(join(__dirname, '../dist/index.html'), {
-      hash: `/chat-history/${sessionId}/${messageId}`
+      hash: route
     })
   }
 
@@ -688,12 +1239,18 @@ function createChatHistoryWindow(sessionId: string, messageId: number) {
 /**
  * 创建独立的会话聊天窗口（单会话，复用聊天页右侧消息区域）
  */
-function createSessionChatWindow(sessionId: string) {
+function createSessionChatWindow(sessionId: string, options?: OpenSessionChatWindowOptions) {
   const normalizedSessionId = String(sessionId || '').trim()
   if (!normalizedSessionId) return null
+  const normalizedSource = normalizeSessionChatWindowSource(options?.source)
 
   const existing = sessionChatWindows.get(normalizedSessionId)
   if (existing && !existing.isDestroyed()) {
+    const trackedSource = sessionChatWindowSources.get(normalizedSessionId) || 'chat'
+    if (trackedSource !== normalizedSource) {
+      loadSessionChatWindowContent(existing, normalizedSessionId, normalizedSource, options)
+      sessionChatWindowSources.set(normalizedSessionId, normalizedSource)
+    }
     if (existing.isMinimized()) {
       existing.restore()
     }
@@ -704,7 +1261,9 @@ function createSessionChatWindow(sessionId: string) {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   const isDark = nativeTheme.shouldUseDarkColors
 
@@ -730,10 +1289,9 @@ function createSessionChatWindow(sessionId: string) {
     autoHideMenuBar: true
   })
 
-  const sessionParam = `sessionId=${encodeURIComponent(normalizedSessionId)}`
-  if (process.env.VITE_DEV_SERVER_URL) {
-    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/chat-window?${sessionParam}`)
+  loadSessionChatWindowContent(win, normalizedSessionId, normalizedSource, options)
 
+  if (process.env.VITE_DEV_SERVER_URL) {
     win.webContents.on('before-input-event', (event, input) => {
       if (input.key === 'F12' || (input.control && input.shift && input.key === 'I')) {
         if (win.webContents.isDevToolsOpened()) {
@@ -743,10 +1301,6 @@ function createSessionChatWindow(sessionId: string) {
         }
         event.preventDefault()
       }
-    })
-  } else {
-    win.loadFile(join(__dirname, '../dist/index.html'), {
-      hash: `/chat-window?${sessionParam}`
     })
   }
 
@@ -759,10 +1313,12 @@ function createSessionChatWindow(sessionId: string) {
     const tracked = sessionChatWindows.get(normalizedSessionId)
     if (tracked === win) {
       sessionChatWindows.delete(normalizedSessionId)
+      sessionChatWindowSources.delete(normalizedSessionId)
     }
   })
 
   sessionChatWindows.set(normalizedSessionId, win)
+  sessionChatWindowSources.set(normalizedSessionId, normalizedSource)
   return win
 }
 
@@ -832,20 +1388,288 @@ const removeMatchedEntriesInDir = async (
   }
 }
 
+const normalizeFsPathForCompare = (value: string): string => {
+  const normalized = String(value || '').replace(/\\/g, '/').replace(/\/+$/, '')
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+type SnsCacheMigrationCandidate = {
+  label: string
+  sourceDir: string
+  targetDir: string
+  fileCount: number
+}
+
+type SnsCacheMigrationPlan = {
+  legacyBaseDir: string
+  currentBaseDir: string
+  candidates: SnsCacheMigrationCandidate[]
+  totalFiles: number
+}
+
+type SnsCacheMigrationProgressPayload = {
+  status: 'running' | 'done' | 'error'
+  phase: 'copying' | 'cleanup' | 'done' | 'error'
+  current: number
+  total: number
+  copied: number
+  skipped: number
+  remaining: number
+  message?: string
+  currentItemLabel?: string
+}
+
+let snsCacheMigrationInProgress = false
+
+const countFilesInDir = async (dirPath: string): Promise<number> => {
+  if (!dirPath || !existsSync(dirPath)) return 0
+  try {
+    const entries = await readdir(dirPath, { withFileTypes: true })
+    let count = 0
+    for (const entry of entries) {
+      const fullPath = join(dirPath, entry.name)
+      if (entry.isDirectory()) {
+        count += await countFilesInDir(fullPath)
+        continue
+      }
+      if (entry.isFile()) count += 1
+    }
+    return count
+  } catch {
+    return 0
+  }
+}
+
+const migrateDirectoryPreserveNewFiles = async (
+  sourceDir: string,
+  targetDir: string,
+  onFileProcessed?: (payload: { copied: boolean }) => void
+): Promise<{ copied: number; skipped: number; processed: number }> => {
+  let copied = 0
+  let skipped = 0
+  let processed = 0
+
+  if (!existsSync(sourceDir)) return { copied, skipped, processed }
+  await mkdir(targetDir, { recursive: true })
+
+  const entries = await readdir(sourceDir, { withFileTypes: true })
+  for (const entry of entries) {
+    const sourcePath = join(sourceDir, entry.name)
+    const targetPath = join(targetDir, entry.name)
+
+    if (entry.isDirectory()) {
+      const nested = await migrateDirectoryPreserveNewFiles(sourcePath, targetPath, onFileProcessed)
+      copied += nested.copied
+      skipped += nested.skipped
+      processed += nested.processed
+      continue
+    }
+
+    if (!entry.isFile()) continue
+
+    if (existsSync(targetPath)) {
+      skipped += 1
+      processed += 1
+      onFileProcessed?.({ copied: false })
+      continue
+    }
+
+    await mkdir(dirname(targetPath), { recursive: true })
+    await copyFile(sourcePath, targetPath)
+    copied += 1
+    processed += 1
+    onFileProcessed?.({ copied: true })
+  }
+
+  return { copied, skipped, processed }
+}
+
+const collectLegacySnsCacheMigrationPlan = async (): Promise<SnsCacheMigrationPlan | null> => {
+  if (!configService) return null
+
+  const legacyBaseDir = configService.getCacheBasePath()
+  const configuredCachePath = String(configService.get('cachePath') || '').trim()
+  const currentBaseDir = configuredCachePath || join(app.getPath('documents'), 'WeFlow')
+
+  if (!legacyBaseDir || !currentBaseDir) return null
+
+  const candidates = [
+    {
+      label: '朋友圈媒体缓存',
+      sourceDir: join(legacyBaseDir, 'sns_cache'),
+      targetDir: join(currentBaseDir, 'sns_cache')
+    },
+    {
+      label: '朋友圈表情缓存（合并到 Emojis）',
+      sourceDir: join(legacyBaseDir, 'sns_emoji_cache'),
+      targetDir: join(currentBaseDir, 'Emojis')
+    },
+    {
+      label: '朋友圈表情缓存（当前目录残留）',
+      sourceDir: join(currentBaseDir, 'sns_emoji_cache'),
+      targetDir: join(currentBaseDir, 'Emojis')
+    }
+  ]
+
+  const pendingKeys = new Set<string>()
+  const pending: SnsCacheMigrationCandidate[] = []
+  for (const item of candidates) {
+    const sourceKey = normalizeFsPathForCompare(item.sourceDir)
+    const targetKey = normalizeFsPathForCompare(item.targetDir)
+    if (!sourceKey || sourceKey === targetKey) continue
+    const dedupeKey = `${sourceKey}=>${targetKey}`
+    if (pendingKeys.has(dedupeKey)) continue
+    const fileCount = await countFilesInDir(item.sourceDir)
+    if (fileCount <= 0) continue
+    pendingKeys.add(dedupeKey)
+    pending.push({ ...item, fileCount })
+  }
+  if (pending.length === 0) return null
+
+  const totalFiles = pending.reduce((sum, item) => sum + item.fileCount, 0)
+  return {
+    legacyBaseDir,
+    currentBaseDir,
+    candidates: pending,
+    totalFiles
+  }
+}
+
+const runLegacySnsCacheMigration = async (
+  plan: SnsCacheMigrationPlan,
+  onProgress: (payload: SnsCacheMigrationProgressPayload) => void
+): Promise<{ copied: number; skipped: number; totalFiles: number }> => {
+  let processed = 0
+  let copied = 0
+  let skipped = 0
+  const total = plan.totalFiles
+
+  const emitProgress = (patch?: Partial<SnsCacheMigrationProgressPayload>) => {
+    onProgress({
+      status: 'running',
+      phase: 'copying',
+      current: processed,
+      total,
+      copied,
+      skipped,
+      remaining: Math.max(0, total - processed),
+      ...patch
+    })
+  }
+
+  emitProgress({ message: '准备迁移缓存...' })
+
+  for (const item of plan.candidates) {
+    emitProgress({ currentItemLabel: item.label, message: `正在迁移：${item.label}` })
+    const result = await migrateDirectoryPreserveNewFiles(item.sourceDir, item.targetDir, ({ copied: copiedThisFile }) => {
+      processed += 1
+      if (copiedThisFile) copied += 1
+      else skipped += 1
+      emitProgress({ currentItemLabel: item.label })
+    })
+    // 兜底对齐计数，防止回调未触发造成偏差
+    const expectedProcessed = copied + skipped
+    if (processed !== expectedProcessed) {
+      processed = expectedProcessed
+      copied = Math.max(copied, result.copied)
+      skipped = Math.max(skipped, result.skipped)
+      emitProgress({ currentItemLabel: item.label })
+    }
+  }
+
+  emitProgress({ phase: 'cleanup', message: '正在清理旧目录...' })
+  for (const item of plan.candidates) {
+    await rm(item.sourceDir, { recursive: true, force: true })
+  }
+
+  if (existsSync(plan.legacyBaseDir)) {
+    try {
+      const remaining = await readdir(plan.legacyBaseDir)
+      if (remaining.length === 0) {
+        await rm(plan.legacyBaseDir, { recursive: true, force: true })
+      }
+    } catch {
+      // 忽略旧目录清理失败，不影响迁移结果
+    }
+  }
+
+  onProgress({
+    status: 'done',
+    phase: 'done',
+    current: processed,
+    total,
+    copied,
+    skipped,
+    remaining: Math.max(0, total - processed),
+    message: '迁移完成'
+  })
+
+  return { copied, skipped, totalFiles: total }
+}
+
 // 注册 IPC 处理器
 function registerIpcHandlers() {
   registerNotificationHandlers()
+  bizService.registerHandlers()
   // 配置相关
   ipcMain.handle('config:get', async (_, key: string) => {
     return configService?.get(key as any)
   })
 
   ipcMain.handle('config:set', async (_, key: string, value: any) => {
-    return configService?.set(key as any, value)
+    let result: unknown
+    if (key === 'launchAtStartup') {
+      result = applyLaunchAtStartupPreference(value === true)
+    } else {
+      result = configService?.set(key as any, value)
+    }
+    if (key === 'updateChannel') {
+      applyAutoUpdateChannel('settings')
+    }
+    void messagePushService.handleConfigChanged(key)
+    void insightService.handleConfigChanged(key)
+    return result
+  })
+
+  // AI 见解
+  ipcMain.handle('insight:testConnection', async () => {
+    return insightService.testConnection()
+  })
+
+  ipcMain.handle('insight:getTodayStats', async () => {
+    return insightService.getTodayStats()
+  })
+
+  ipcMain.handle('insight:triggerTest', async () => {
+    return insightService.triggerTest()
+  })
+
+  ipcMain.handle('insight:generateFootprintInsight', async (_, payload: {
+    rangeLabel: string
+    summary: {
+      private_inbound_people?: number
+      private_replied_people?: number
+      private_outbound_people?: number
+      private_reply_rate?: number
+      mention_count?: number
+      mention_group_count?: number
+    }
+    privateSegments?: Array<{ displayName?: string; session_id?: string; incoming_count?: number; outgoing_count?: number; message_count?: number; replied?: boolean }>
+    mentionGroups?: Array<{ displayName?: string; session_id?: string; count?: number }>
+  }) => {
+    return insightService.generateFootprintInsight(payload)
   })
 
   ipcMain.handle('config:clear', async () => {
+    if (isLaunchAtStartupSupported() && getSystemLaunchAtStartup()) {
+      const result = setSystemLaunchAtStartup(false)
+      if (!result.success && result.error) {
+        console.error('[WeFlow] 清空配置时关闭开机自启动失败:', result.error)
+      }
+    }
     configService?.clear()
+    messagePushService.handleConfigCleared()
+    insightService.handleConfigCleared()
     return true
   })
 
@@ -886,6 +1710,14 @@ function registerIpcHandlers() {
     return app.getVersion()
   })
 
+  ipcMain.handle('app:getLaunchAtStartupStatus', async () => {
+    return getLaunchAtStartupStatus()
+  })
+
+  ipcMain.handle('app:setLaunchAtStartup', async (_, enabled: boolean) => {
+    return applyLaunchAtStartupPreference(enabled === true)
+  })
+
   ipcMain.handle('log:getPath', async () => {
     return join(app.getPath('userData'), 'logs', 'wcdb.log')
   })
@@ -895,6 +1727,17 @@ function registerIpcHandlers() {
       const logPath = join(app.getPath('userData'), 'logs', 'wcdb.log')
       const content = await readFile(logPath, 'utf8')
       return { success: true, content }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  })
+
+  ipcMain.handle('log:clear', async () => {
+    try {
+      const logPath = join(app.getPath('userData'), 'logs', 'wcdb.log')
+      await mkdir(dirname(logPath), { recursive: true })
+      await writeFile(logPath, '', 'utf8')
+      return { success: true }
     } catch (e) {
       return { success: false, error: String(e) }
     }
@@ -937,16 +1780,19 @@ function registerIpcHandlers() {
     if (!AUTO_UPDATE_ENABLED) {
       return { hasUpdate: false }
     }
+    // 每次主动检查前重新应用一次通道配置，确保使用最新选择的更新通道。
+    applyAutoUpdateChannel('settings')
     try {
       const result = await autoUpdater.checkForUpdates()
       if (result && result.updateInfo) {
         const currentVersion = app.getVersion()
         const latestVersion = result.updateInfo.version
-        if (latestVersion !== currentVersion) {
+        if (shouldOfferUpdateForTrack(latestVersion, currentVersion)) {
           return {
             hasUpdate: true,
             version: latestVersion,
-            releaseNotes: result.updateInfo.releaseNotes as string || ''
+            releaseNotes: getDialogReleaseNotes(result.updateInfo.releaseNotes),
+            minimumVersion: (result.updateInfo as any).minimumVersion
           }
         }
       }
@@ -1004,7 +1850,7 @@ function registerIpcHandlers() {
     try {
       console.log('[Update] 开始下载更新...')
       await autoUpdater.downloadUpdate()
-    } catch (error) {
+    } catch (error: any) {
       console.error('[Update] 下载更新失败:', error)
       // 失败时清理状态和监听器
       isDownloadInProgress = false
@@ -1016,7 +1862,10 @@ function registerIpcHandlers() {
         autoUpdater.removeListener('update-downloaded', downloadedHandler)
         downloadedHandler = null
       }
-      throw error
+      
+      // 统一错误提示格式，避免出现 [object Object] 的 JSON 字符串
+      const errorMessage = error.message || (typeof error === 'string' ? error : JSON.stringify(error))
+      throw new Error(errorMessage)
     }
   })
 
@@ -1039,8 +1888,40 @@ function registerIpcHandlers() {
     }
   })
 
+  ipcMain.handle('window:isMaximized', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    return Boolean(win?.isMaximized() || win?.isFullScreen())
+  })
+
   ipcMain.on('window:close', (event) => {
     BrowserWindow.fromWebContents(event.sender)?.close()
+  })
+
+  ipcMain.handle('window:respondCloseConfirm', async (_event, action: 'tray' | 'quit' | 'cancel') => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      isClosePromptVisible = false
+      return false
+    }
+
+    try {
+      if (action === 'tray') {
+        if (tray) {
+          mainWindow.hide()
+          return true
+        }
+        return false
+      }
+
+      if (action === 'quit') {
+        isAppQuitting = true
+        app.quit()
+        return true
+      }
+
+      return true
+    } finally {
+      isClosePromptVisible = false
+    }
   })
 
   // 更新窗口控件主题色
@@ -1070,9 +1951,26 @@ function registerIpcHandlers() {
     return true
   })
 
+  ipcMain.handle('window:openChatHistoryPayloadWindow', (_, payload: { sessionId: string; title?: string; recordList: any[] }) => {
+    const payloadId = randomUUID()
+    chatHistoryPayloadStore.set(payloadId, {
+      sessionId: String(payload?.sessionId || '').trim(),
+      title: String(payload?.title || '').trim() || '聊天记录',
+      recordList: Array.isArray(payload?.recordList) ? payload.recordList : []
+    })
+    createChatHistoryPayloadWindow(payloadId)
+    return true
+  })
+
+  ipcMain.handle('window:getChatHistoryPayload', (_, payloadId: string) => {
+    const payload = chatHistoryPayloadStore.get(String(payloadId || '').trim())
+    if (!payload) return { success: false, error: '聊天记录载荷不存在或已失效' }
+    return { success: true, payload }
+  })
+
   // 打开会话聊天窗口（同会话仅保留一个窗口并聚焦）
-  ipcMain.handle('window:openSessionChatWindow', (_, sessionId: string) => {
-    const win = createSessionChatWindow(sessionId)
+  ipcMain.handle('window:openSessionChatWindow', (_, sessionId: string, options?: OpenSessionChatWindowOptions) => {
+    const win = createSessionChatWindow(sessionId, options)
     return Boolean(win)
   })
 
@@ -1126,9 +2024,9 @@ function registerIpcHandlers() {
   })
 
   // 视频相关
-  ipcMain.handle('video:getVideoInfo', async (_, videoMd5: string) => {
+  ipcMain.handle('video:getVideoInfo', async (_, videoMd5: string, options?: { includePoster?: boolean; posterFormat?: 'dataUrl' | 'fileUrl' }) => {
     try {
-      const result = await videoService.getVideoInfo(videoMd5)
+      const result = await videoService.getVideoInfo(videoMd5, options)
       return { success: true, ...result }
     } catch (e) {
       return { success: false, error: String(e), exists: false }
@@ -1229,6 +2127,18 @@ function registerIpcHandlers() {
     return chatService.deleteMessage(sessionId, localId, createTime, dbPathHint)
   })
 
+  ipcMain.handle('chat:checkAntiRevokeTriggers', async (_, sessionIds: string[]) => {
+    return chatService.checkAntiRevokeTriggers(sessionIds)
+  })
+
+  ipcMain.handle('chat:installAntiRevokeTriggers', async (_, sessionIds: string[]) => {
+    return chatService.installAntiRevokeTriggers(sessionIds)
+  })
+
+  ipcMain.handle('chat:uninstallAntiRevokeTriggers', async (_, sessionIds: string[]) => {
+    return chatService.uninstallAntiRevokeTriggers(sessionIds)
+  })
+
   ipcMain.handle('chat:getContact', async (_, username: string) => {
     return await chatService.getContact(username)
   })
@@ -1242,8 +2152,8 @@ function registerIpcHandlers() {
     return await chatService.resolveTransferDisplayNames(chatroomId, payerUsername, receiverUsername)
   })
 
-  ipcMain.handle('chat:getContacts', async () => {
-    return await chatService.getContacts()
+  ipcMain.handle('chat:getContacts', async (_, options?: { lite?: boolean }) => {
+    return await chatService.getContacts(options)
   })
 
   ipcMain.handle('chat:getCachedMessages', async (_, sessionId: string) => {
@@ -1359,6 +2269,39 @@ function registerIpcHandlers() {
         const defaultValue = key === 'lastSession' ? '' : {}
         cfg.set(key as any, defaultValue as any)
       }
+
+      try {
+        const dbPath = String(cfg.get('dbPath') || '').trim()
+        const automationMapRaw = cfg.get('exportAutomationTaskMap') as Record<string, unknown> | undefined
+        if (automationMapRaw && typeof automationMapRaw === 'object') {
+          const nextAutomationMap: Record<string, unknown> = { ...automationMapRaw }
+          let changed = false
+          for (const scopeKey of Object.keys(automationMapRaw)) {
+            const normalizedScopeKey = String(scopeKey || '').trim()
+            if (!normalizedScopeKey) continue
+            const separatorIndex = normalizedScopeKey.lastIndexOf('::')
+            const scopedDbPath = separatorIndex >= 0
+              ? normalizedScopeKey.slice(0, separatorIndex)
+              : ''
+            const scopedWxidRaw = separatorIndex >= 0
+              ? normalizedScopeKey.slice(separatorIndex + 2)
+              : normalizedScopeKey
+            const scopedWxid = normalizeAccountId(scopedWxidRaw)
+            const wxidMatched = wxidCandidates.includes(scopedWxidRaw) || scopedWxid === normalizedWxid
+            const dbPathMatched = !dbPath || !scopedDbPath || scopedDbPath === dbPath
+            if (!wxidMatched || !dbPathMatched) continue
+            delete nextAutomationMap[scopeKey]
+            changed = true
+          }
+          if (changed) {
+            cfg.set('exportAutomationTaskMap' as any, nextAutomationMap as any)
+          } else if (!Object.keys(automationMapRaw).length) {
+            cfg.set('exportAutomationTaskMap' as any, {} as any)
+          }
+        }
+      } catch (error) {
+        warnings.push(`清理自动化导出任务失败: ${String(error)}`)
+      }
     }
 
     if (clearCache) {
@@ -1410,6 +2353,7 @@ function registerIpcHandlers() {
     forceRefresh?: boolean
     allowStaleCache?: boolean
     preferAccurateSpecialTypes?: boolean
+    cacheOnly?: boolean
   }) => {
     return chatService.getExportSessionStats(sessionIds, options)
   })
@@ -1437,13 +2381,35 @@ function registerIpcHandlers() {
   ipcMain.handle('chat:getMessageDateCounts', async (_, sessionId: string) => {
     return chatService.getMessageDateCounts(sessionId)
   })
+
+  ipcMain.handle('chat:getResourceMessages', async (_, options?: {
+    sessionId?: string
+    types?: Array<'image' | 'video' | 'voice' | 'file'>
+    beginTimestamp?: number
+    endTimestamp?: number
+    limit?: number
+    offset?: number
+  }) => {
+    return chatService.getResourceMessages(options)
+  })
+
+  ipcMain.handle('chat:getMediaStream', async (_, options?: {
+    sessionId?: string
+    mediaType?: 'image' | 'video' | 'all'
+    beginTimestamp?: number
+    endTimestamp?: number
+    limit?: number
+    offset?: number
+  }) => {
+    return wcdbService.getMediaStream(options)
+  })
   ipcMain.handle('chat:resolveVoiceCache', async (_, sessionId: string, msgId: string) => {
     return chatService.resolveVoiceCache(sessionId, msgId)
   })
 
   ipcMain.handle('chat:getVoiceTranscript', async (event, sessionId: string, msgId: string, createTime?: number) => {
     return chatService.getVoiceTranscript(sessionId, msgId, createTime, (text) => {
-      event.sender.send('chat:voiceTranscriptPartial', { msgId, text })
+      event.sender.send('chat:voiceTranscriptPartial', { sessionId, msgId, createTime, text })
     })
   })
 
@@ -1451,8 +2417,23 @@ function registerIpcHandlers() {
     return chatService.getMessageById(sessionId, localId)
   })
 
-  ipcMain.handle('chat:execQuery', async (_, kind: string, path: string | null, sql: string) => {
-    return chatService.execQuery(kind, path, sql)
+  ipcMain.handle('chat:searchMessages', async (_, keyword: string, sessionId?: string, limit?: number, offset?: number, beginTimestamp?: number, endTimestamp?: number) => {
+    return chatService.searchMessages(keyword, sessionId, limit, offset, beginTimestamp, endTimestamp)
+  })
+
+  ipcMain.handle('chat:getMyFootprintStats', async (_, beginTimestamp: number, endTimestamp: number, options?: {
+    myWxid?: string
+    privateSessionIds?: string[]
+    groupSessionIds?: string[]
+    mentionLimit?: number
+    privateLimit?: number
+    mentionMode?: 'text_at_me' | string
+  }) => {
+    return chatService.getMyFootprintStats(beginTimestamp, endTimestamp, options)
+  })
+
+  ipcMain.handle('chat:exportMyFootprint', async (_, beginTimestamp: number, endTimestamp: number, format: 'csv' | 'json', filePath: string) => {
+    return chatService.exportMyFootprint(beginTimestamp, endTimestamp, format, filePath)
   })
 
   ipcMain.handle('sns:getTimeline', async (_, limit: number, offset: number, usernames?: string[], keyword?: string, startTime?: number, endTime?: number) => {
@@ -1463,12 +2444,20 @@ function registerIpcHandlers() {
     return snsService.getSnsUsernames()
   })
 
+  ipcMain.handle('sns:getUserPostCounts', async () => {
+    return snsService.getUserPostCounts()
+  })
+
   ipcMain.handle('sns:getExportStats', async () => {
     return snsService.getExportStats()
   })
 
   ipcMain.handle('sns:getExportStatsFast', async () => {
     return snsService.getExportStatsFast()
+  })
+
+  ipcMain.handle('sns:getUserPostStats', async (_, username: string) => {
+    return snsService.getUserPostStats(username)
   })
 
   ipcMain.handle('sns:debugResource', async (_, url: string) => {
@@ -1563,17 +2552,128 @@ function registerIpcHandlers() {
     return snsService.downloadSnsEmoji(params.url, params.encryptUrl, params.aesKey)
   })
 
+  ipcMain.handle('sns:getCacheMigrationStatus', async () => {
+    try {
+      const plan = await collectLegacySnsCacheMigrationPlan()
+      if (!plan) {
+        return {
+          success: true,
+          needed: false,
+          inProgress: snsCacheMigrationInProgress,
+          totalFiles: 0,
+          items: []
+        }
+      }
+      return {
+        success: true,
+        needed: true,
+        inProgress: snsCacheMigrationInProgress,
+        totalFiles: plan.totalFiles,
+        legacyBaseDir: plan.legacyBaseDir,
+        currentBaseDir: plan.currentBaseDir,
+        items: plan.candidates
+      }
+    } catch (error) {
+      return { success: false, needed: false, error: String((error as Error)?.message || error || '') }
+    }
+  })
+
+  ipcMain.handle('sns:startCacheMigration', async (event) => {
+    if (snsCacheMigrationInProgress) {
+      return { success: false, error: '迁移任务正在进行中' }
+    }
+
+    const sender = event.sender
+    let lastProgress: SnsCacheMigrationProgressPayload = {
+      status: 'running',
+      phase: 'copying',
+      current: 0,
+      total: 0,
+      copied: 0,
+      skipped: 0,
+      remaining: 0
+    }
+    const emitProgress = (payload: SnsCacheMigrationProgressPayload) => {
+      lastProgress = payload
+      if (!sender.isDestroyed()) {
+        sender.send('sns:cacheMigrationProgress', payload)
+      }
+    }
+
+    try {
+      const plan = await collectLegacySnsCacheMigrationPlan()
+      if (!plan) {
+        emitProgress({
+          status: 'done',
+          phase: 'done',
+          current: 0,
+          total: 0,
+          copied: 0,
+          skipped: 0,
+          remaining: 0,
+          message: '无需迁移'
+        })
+        return { success: true, copied: 0, skipped: 0, totalFiles: 0, message: '无需迁移' }
+      }
+
+      snsCacheMigrationInProgress = true
+      const result = await runLegacySnsCacheMigration(plan, emitProgress)
+      return { success: true, ...result }
+    } catch (error) {
+      const message = String((error as Error)?.message || error || '')
+      emitProgress({
+        ...lastProgress,
+        status: 'error',
+        phase: 'error',
+        message
+      })
+      return { success: false, error: message }
+    } finally {
+      snsCacheMigrationInProgress = false
+    }
+  })
+
   // 私聊克隆
 
 
   ipcMain.handle('image:decrypt', async (_, payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean }) => {
     return imageDecryptService.decryptImage(payload)
   })
-  ipcMain.handle('image:resolveCache', async (_, payload: { sessionId?: string; imageMd5?: string; imageDatName?: string }) => {
+  ipcMain.handle('image:resolveCache', async (_, payload: {
+    sessionId?: string
+    imageMd5?: string
+    imageDatName?: string
+    disableUpdateCheck?: boolean
+    allowCacheIndex?: boolean
+  }) => {
     return imageDecryptService.resolveCachedImage(payload)
   })
-  ipcMain.handle('image:preload', async (_, payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>) => {
-    imagePreloadService.enqueue(payloads || [])
+  ipcMain.handle(
+    'image:resolveCacheBatch',
+    async (
+      _,
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
+      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean }
+    ) => {
+      const list = Array.isArray(payloads) ? payloads : []
+      const rows = await Promise.all(list.map(async (payload) => {
+        return imageDecryptService.resolveCachedImage({
+          ...payload,
+          disableUpdateCheck: options?.disableUpdateCheck === true,
+          allowCacheIndex: options?.allowCacheIndex !== false
+        })
+      }))
+      return { success: true, rows }
+    }
+  )
+  ipcMain.handle(
+    'image:preload',
+    async (
+      _,
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
+      options?: { allowDecrypt?: boolean; allowCacheIndex?: boolean }
+    ) => {
+    imagePreloadService.enqueue(payloads || [], options)
     return true
   })
 
@@ -1652,13 +2752,138 @@ function registerIpcHandlers() {
   })
 
   ipcMain.handle('export:exportSessions', async (event, sessionIds: string[], outputDir: string, options: ExportOptions) => {
-    const onProgress = (progress: ExportProgress) => {
-      if (!event.sender.isDestroyed()) {
-        event.sender.send('export:progress', progress)
+    const PROGRESS_FORWARD_INTERVAL_MS = 180
+    let pendingProgress: ExportProgress | null = null
+    let progressTimer: NodeJS.Timeout | null = null
+    let lastProgressSentAt = 0
+
+    const flushProgress = () => {
+      if (!pendingProgress) return
+      if (progressTimer) {
+        clearTimeout(progressTimer)
+        progressTimer = null
       }
+      if (!event.sender.isDestroyed()) {
+        event.sender.send('export:progress', pendingProgress)
+      }
+      pendingProgress = null
+      lastProgressSentAt = Date.now()
     }
 
-    return exportService.exportSessions(sessionIds, outputDir, options, onProgress)
+    const queueProgress = (progress: ExportProgress) => {
+      pendingProgress = progress
+      const force = progress.phase === 'complete'
+      if (force) {
+        flushProgress()
+        return
+      }
+
+      const now = Date.now()
+      const elapsed = now - lastProgressSentAt
+      if (elapsed >= PROGRESS_FORWARD_INTERVAL_MS) {
+        flushProgress()
+        return
+      }
+
+      if (progressTimer) return
+      progressTimer = setTimeout(() => {
+        flushProgress()
+      }, PROGRESS_FORWARD_INTERVAL_MS - elapsed)
+    }
+
+    const onProgress = (progress: ExportProgress) => {
+      queueProgress(progress)
+    }
+
+    const runMainFallback = async (reason: string) => {
+      console.warn(`[fallback-export-main] ${reason}`)
+      return exportService.exportSessions(sessionIds, outputDir, options, onProgress)
+    }
+
+    const cfg = configService || new ConfigService()
+    configService = cfg
+    const logEnabled = cfg.get('logEnabled')
+    const dbPath = String(cfg.get('dbPath') || '').trim()
+    const decryptKey = String(cfg.get('decryptKey') || '').trim()
+    const myWxid = String(cfg.get('myWxid') || '').trim()
+    const resourcesPath = app.isPackaged
+      ? join(process.resourcesPath, 'resources')
+      : join(app.getAppPath(), 'resources')
+    const userDataPath = app.getPath('userData')
+    const workerPath = join(__dirname, 'exportWorker.js')
+
+    const runWorker = async () => {
+      return await new Promise<any>((resolve, reject) => {
+        const worker = new Worker(workerPath, {
+          workerData: {
+            sessionIds,
+            outputDir,
+            options,
+            dbPath,
+            decryptKey,
+            myWxid,
+            resourcesPath,
+            userDataPath,
+            logEnabled
+          }
+        })
+
+        let settled = false
+        const finalizeResolve = (value: any) => {
+          if (settled) return
+          settled = true
+          worker.removeAllListeners()
+          void worker.terminate()
+          resolve(value)
+        }
+        const finalizeReject = (error: Error) => {
+          if (settled) return
+          settled = true
+          worker.removeAllListeners()
+          void worker.terminate()
+          reject(error)
+        }
+
+        worker.on('message', (msg: any) => {
+          if (msg && msg.type === 'export:progress') {
+            onProgress(msg.data as ExportProgress)
+            return
+          }
+          if (msg && msg.type === 'export:result') {
+            finalizeResolve(msg.data)
+            return
+          }
+          if (msg && msg.type === 'export:error') {
+            finalizeReject(new Error(String(msg.error || '导出 Worker 执行失败')))
+          }
+        })
+
+        worker.on('error', (error) => {
+          finalizeReject(error instanceof Error ? error : new Error(String(error)))
+        })
+
+        worker.on('exit', (code) => {
+          if (settled) return
+          if (code === 0) {
+            finalizeResolve({ success: false, successCount: 0, failCount: 0, error: '导出 Worker 未返回结果' })
+          } else {
+            finalizeReject(new Error(`导出 Worker 异常退出: ${code}`))
+          }
+        })
+      })
+    }
+
+    try {
+      return await runWorker()
+    } catch (error) {
+      return runMainFallback(error instanceof Error ? error.message : String(error))
+    } finally {
+      flushProgress()
+      if (progressTimer) {
+        clearTimeout(progressTimer)
+        progressTimer = null
+      }
+    }
   })
 
   ipcMain.handle('export:exportSession', async (_, sessionId: string, outputPath: string, options: ExportOptions) => {
@@ -1769,6 +2994,25 @@ function registerIpcHandlers() {
     return groupAnalyticsService.getGroupMediaStats(chatroomId, startTime, endTime)
   })
 
+  ipcMain.handle(
+    'groupAnalytics:getGroupMemberAnalytics',
+    async (_, chatroomId: string, memberUsername: string, startTime?: number, endTime?: number) => {
+      return groupAnalyticsService.getGroupMemberAnalytics(chatroomId, memberUsername, startTime, endTime)
+    }
+  )
+
+  ipcMain.handle(
+    'groupAnalytics:getGroupMemberMessages',
+    async (
+      _,
+      chatroomId: string,
+      memberUsername: string,
+      options?: { startTime?: number; endTime?: number; limit?: number; cursor?: number }
+    ) => {
+      return groupAnalyticsService.getGroupMemberMessages(chatroomId, memberUsername, options)
+    }
+  )
+
   ipcMain.handle('groupAnalytics:exportGroupMembers', async (_, chatroomId: string, outputPath: string) => {
     return groupAnalyticsService.exportGroupMembers(chatroomId, outputPath)
   })
@@ -1817,12 +3061,13 @@ function registerIpcHandlers() {
   })
 
   // 重新打开首次引导窗口，并隐藏主窗口
-  ipcMain.handle('window:openOnboardingWindow', async () => {
+  ipcMain.handle('window:openOnboardingWindow', async (_, options?: { mode?: 'add-account' }) => {
     shouldShowMain = false
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.hide()
     }
-    createOnboardingWindow()
+    const mode = options?.mode === 'add-account' ? 'add-account' : 'default'
+    createOnboardingWindow(mode)
     return true
   })
 
@@ -1929,7 +3174,6 @@ function registerIpcHandlers() {
           dbPath,
           decryptKey,
           wxid,
-          nativeTimeoutMs: 5000,
           onProgress: (progress) => {
             if (isYearsLoadCanceled(taskId)) return
             const snapshot = updateTaskSnapshot({
@@ -2188,26 +3432,27 @@ function registerIpcHandlers() {
 
   // 密钥获取
   ipcMain.handle('key:autoGetDbKey', async (event) => {
-    return keyService.autoGetDbKey(180_000, (message, level) => {
+    return keyService.autoGetDbKey(180_000, (message: string, level: number) => {
       event.sender.send('key:dbKeyStatus', { message, level })
     })
   })
 
   ipcMain.handle('key:autoGetImageKey', async (event, manualDir?: string, wxid?: string) => {
-    return keyService.autoGetImageKey(manualDir, (message) => {
+    return keyService.autoGetImageKey(manualDir, (message: string) => {
       event.sender.send('key:imageKeyStatus', { message })
     }, wxid)
   })
 
   ipcMain.handle('key:scanImageKeyFromMemory', async (event, userDir: string) => {
-    return keyService.autoGetImageKeyByMemoryScan(userDir, (message) => {
+    return keyService.autoGetImageKeyByMemoryScan(userDir, (message: string) => {
       event.sender.send('key:imageKeyStatus', { message })
     })
   })
 
   // HTTP API 服务
-  ipcMain.handle('http:start', async (_, port?: number) => {
-    return httpService.start(port || 5031)
+  ipcMain.handle('http:start', async (_, port?: number, host?: string) => {
+    const bindHost = typeof host === 'string' && host.trim() ? host.trim() : '127.0.0.1'
+    return httpService.start(port || 5031, bindHost)
   })
 
   ipcMain.handle('http:stop', async () => {
@@ -2243,7 +3488,7 @@ function checkForUpdatesOnStartup() {
         const latestVersion = result.updateInfo.version
 
         // 检查是否有新版本
-        if (latestVersion !== currentVersion && mainWindow) {
+        if (shouldOfferUpdateForTrack(latestVersion, currentVersion) && mainWindow) {
           // 检查该版本是否被用户忽略
           const ignoredVersion = configService?.get('ignoredUpdateVersion')
           if (ignoredVersion === latestVersion) {
@@ -2254,7 +3499,8 @@ function checkForUpdatesOnStartup() {
           // 通知渲染进程有新版本
           mainWindow.webContents.send('app:updateAvailable', {
             version: latestVersion,
-            releaseNotes: result.updateInfo.releaseNotes || ''
+            releaseNotes: getDialogReleaseNotes(result.updateInfo.releaseNotes),
+            minimumVersion: (result.updateInfo as any).minimumVersion
           })
         }
       }
@@ -2283,10 +3529,38 @@ app.whenReady().then(async () => {
   }
 
   const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+  const withTimeout = <T>(task: () => Promise<T>, timeoutMs: number): Promise<{ timedOut: boolean; value?: T; error?: string }> => {
+    return new Promise((resolve) => {
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        resolve({ timedOut: true, error: `timeout(${timeoutMs}ms)` })
+      }, timeoutMs)
+
+      task()
+        .then((value) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve({ timedOut: false, value })
+        })
+        .catch((error) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve({ timedOut: false, error: String(error) })
+        })
+    })
+  }
 
   // 初始化配置服务
   updateSplashProgress(5, '正在加载配置...')
   configService = new ConfigService()
+  applyAutoUpdateChannel('startup')
+  syncLaunchAtStartupPreference()
+  const onboardingDone = configService.get('onboardingDone') === true
+  shouldShowMain = onboardingDone
 
   // 将用户主题配置推送给 Splash 窗口
   if (splashWindow && !splashWindow.isDestroyed()) {
@@ -2299,7 +3573,7 @@ app.whenReady().then(async () => {
   await delay(200)
 
   // 设置资源路径
-  updateSplashProgress(10, '正在初始化...')
+  updateSplashProgress(12, '正在初始化...')
   const candidateResources = app.isPackaged
     ? join(process.resourcesPath, 'resources')
     : join(app.getAppPath(), 'resources')
@@ -2309,23 +3583,128 @@ app.whenReady().then(async () => {
   await delay(200)
 
   // 初始化数据库服务
-  updateSplashProgress(18, '正在初始化...')
+  updateSplashProgress(20, '正在初始化...')
   wcdbService.setPaths(resourcesPath, userDataPath)
   wcdbService.setLogEnabled(configService.get('logEnabled') === true)
   await delay(200)
 
   // 注册 IPC 处理器
-  updateSplashProgress(25, '正在初始化...')
+  updateSplashProgress(28, '正在初始化...')
   registerIpcHandlers()
+  chatService.addDbMonitorListener((type, json) => {
+    messagePushService.handleDbMonitorChange(type, json)
+    insightService.handleDbMonitorChange(type, json)
+  })
+  messagePushService.start()
+  insightService.start()
   await delay(200)
 
-  // 检查配置状态
-  const onboardingDone = configService.get('onboardingDone')
-  shouldShowMain = onboardingDone === true
+  // 已完成引导时，在 Splash 阶段预热核心数据（联系人、消息库索引等）
+  if (onboardingDone) {
+    updateSplashProgress(34, '正在连接数据库...')
+    const connectWarmup = await withTimeout(() => chatService.connect(), 12000)
+    const connected = !connectWarmup.timedOut && connectWarmup.value?.success === true
+
+    if (!connected) {
+      const reason = connectWarmup.timedOut
+        ? connectWarmup.error
+        : (connectWarmup.value?.error || connectWarmup.error || 'unknown')
+      console.warn('[StartupWarmup] 跳过预热，数据库连接失败:', reason)
+      updateSplashProgress(68, '数据库预热已跳过')
+    } else {
+      const preloadUsernames = new Set<string>()
+
+      updateSplashProgress(44, '正在预加载会话...')
+      const sessionsWarmup = await withTimeout(() => chatService.getSessions(), 12000)
+      if (!sessionsWarmup.timedOut && sessionsWarmup.value?.success && Array.isArray(sessionsWarmup.value.sessions)) {
+        for (const session of sessionsWarmup.value.sessions) {
+          const username = String((session as any)?.username || '').trim()
+          if (username) preloadUsernames.add(username)
+        }
+      }
+
+      updateSplashProgress(56, '正在预加载联系人...')
+      const contactsWarmup = await withTimeout(() => chatService.getContacts(), 15000)
+      if (!contactsWarmup.timedOut && contactsWarmup.value?.success && Array.isArray(contactsWarmup.value.contacts)) {
+        for (const contact of contactsWarmup.value.contacts) {
+          const username = String((contact as any)?.username || '').trim()
+          if (username) preloadUsernames.add(username)
+        }
+      }
+
+      updateSplashProgress(63, '正在缓存联系人头像...')
+      const avatarWarmupUsernames = Array.from(preloadUsernames).slice(0, 2000)
+      if (avatarWarmupUsernames.length > 0) {
+        await withTimeout(() => chatService.enrichSessionsContactInfo(avatarWarmupUsernames), 15000)
+      }
+
+      updateSplashProgress(68, '正在初始化消息库索引...')
+      await withTimeout(() => chatService.warmupMessageDbSnapshot(), 10000)
+    }
+  } else {
+    updateSplashProgress(68, '首次启动准备中...')
+  }
 
   // 创建主窗口（不显示，由启动流程统一控制）
-  updateSplashProgress(30, '正在加载界面...')
+  updateSplashProgress(70, '正在准备主窗口...')
   mainWindow = createWindow({ autoShow: false })
+
+  let iconName = 'icon.ico';
+  if (process.platform === 'linux') {
+    iconName = 'icon.png';
+  } else if (process.platform === 'darwin') {
+    iconName = 'icon.icns';
+  }
+
+  const isDev = !!process.env.VITE_DEV_SERVER_URL
+
+  const resolvedTrayIcon = isDev
+      ? join(__dirname, `../public/${iconName}`)
+      : join(process.resourcesPath, iconName);
+
+
+  try {
+    tray = new Tray(resolvedTrayIcon)
+    tray.setToolTip('WeFlow')
+    const contextMenu = Menu.buildFromTemplate([
+      {
+        label: '显示主窗口',
+        click: () => {
+          if (mainWindow) {
+            mainWindow.show()
+            mainWindow.focus()
+          }
+        }
+      },
+      { type: 'separator' },
+      {
+        label: '退出',
+        click: () => {
+          isAppQuitting = true
+          app.quit()
+        }
+      }
+    ])
+    tray.setContextMenu(contextMenu)
+    tray.on('click', () => {
+      if (mainWindow) {
+        if (mainWindow.isVisible()) {
+          mainWindow.focus()
+        } else {
+          mainWindow.show()
+          mainWindow.focus()
+        }
+      }
+    })
+    tray.on('double-click', () => {
+      if (mainWindow) {
+        mainWindow.show()
+        mainWindow.focus()
+      }
+    })
+  } catch (e) {
+    console.warn('[Tray] Failed to create tray icon:', e)
+  }
 
   // 配置网络服务
   session.defaultSession.webRequest.onBeforeSendHeaders(
@@ -2339,7 +3718,7 @@ app.whenReady().then(async () => {
   )
 
   // 等待主窗口加载完成（真正耗时阶段，进度条末端呼吸光点）
-  updateSplashProgress(30, '正在加载界面...', true)
+  updateSplashProgress(70, '正在准备主窗口...', true)
   await new Promise<void>((resolve) => {
     if (mainWindowReady) {
       resolve()
@@ -2365,27 +3744,32 @@ app.whenReady().then(async () => {
   // 启动时检测更新（不阻塞启动）
   checkForUpdatesOnStartup()
 
-  // Auto-start HTTP API if enabled
-  const httpApiAutoStart = configService?.get('httpApiAutoStart')
-  if (httpApiAutoStart === true) {
-    const httpApiPort = configService?.get('httpApiPort') || 5031
-    console.log('[Main] Auto-starting HTTP API on port', httpApiPort)
-    httpService.start(httpApiPort).then((result) => {
-      if (result.success) {
-        console.log('[Main] HTTP API auto-started on port', result.port)
-      } else {
-        console.error('[Main] HTTP API auto-start failed:', result.error)
-      }
-    }).catch((err) => {
-      console.error('[Main] HTTP API auto-start error:', err)
-    })
-  }
+  await httpService.autoStart()
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = createWindow()
     }
   })
+})
+
+app.on('before-quit', async () => {
+  isAppQuitting = true
+  // 销毁 tray 图标
+  if (tray) { try { tray.destroy() } catch {} tray = null }
+  // 通知窗使用 hide 而非 close，退出时主动销毁，避免残留窗口阻塞进程退出。
+  destroyNotificationWindow()
+  insightService.stop()
+  // 兜底：5秒后强制退出，防止某个异步任务卡住导致进程残留
+  const forceExitTimer = setTimeout(() => {
+    console.warn('[App] Force exit after timeout')
+    app.exit(0)
+  }, 5000)
+  forceExitTimer.unref()
+  // 停止 HTTP 服务器，释放 TCP 端口占用，避免进程无法退出
+  try { await httpService.stop() } catch {}
+  // 终止 wcdb Worker 线程，避免线程阻止进程退出
+  try { await wcdbService.shutdown() } catch {}
 })
 
 app.on('window-all-closed', () => {

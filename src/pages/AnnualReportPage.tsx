@@ -1,6 +1,12 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Calendar, Loader2, Sparkles, Users } from 'lucide-react'
+import {
+  finishBackgroundTask,
+  isBackgroundTaskCancelRequested,
+  registerBackgroundTask,
+  updateBackgroundTask
+} from '../services/backgroundTaskMonitor'
 import './AnnualReportPage.scss'
 
 type YearOption = number | 'all'
@@ -49,8 +55,17 @@ function AnnualReportPage() {
   useEffect(() => {
     let disposed = false
     let taskId = ''
+    let uiTaskId = ''
 
     const applyLoadPayload = (payload: YearsLoadPayload) => {
+      if (uiTaskId) {
+        updateBackgroundTask(uiTaskId, {
+          detail: payload.statusText || '正在加载可用年份',
+          progressText: payload.done
+            ? '已完成'
+            : `${Array.isArray(payload.years) ? payload.years.length : 0} 个年份`
+        })
+      }
       if (payload.strategy) setLoadStrategy(payload.strategy)
       if (payload.phase) setLoadPhase(payload.phase)
       if (typeof payload.statusText === 'string' && payload.statusText) setLoadStatusText(payload.statusText)
@@ -91,6 +106,14 @@ function AnnualReportPage() {
         setIsLoadingMoreYears(false)
         setHasYearsLoadFinished(true)
         setLoadPhase('done')
+        if (uiTaskId) {
+          finishBackgroundTask(uiTaskId, payload.canceled ? 'canceled' : 'completed', {
+            detail: payload.canceled
+              ? '年度报告年份加载已停止'
+              : `年度报告年份加载完成，共 ${years.length} 个年份`,
+            progressText: payload.canceled ? '已停止' : `${years.length} 个年份`
+          })
+        }
       } else {
         setIsLoadingMoreYears(true)
         setHasYearsLoadFinished(false)
@@ -105,6 +128,18 @@ function AnnualReportPage() {
     })
 
     const startLoad = async () => {
+      uiTaskId = registerBackgroundTask({
+        sourcePage: 'annualReport',
+        title: '年度报告年份加载',
+        detail: '准备使用原生快速模式加载年份',
+        progressText: '初始化',
+        cancelable: true,
+        onCancel: async () => {
+          if (taskId) {
+            await window.electronAPI.annualReport.cancelAvailableYearsLoad(taskId)
+          }
+        }
+      })
       setIsLoading(true)
       setIsLoadingMoreYears(true)
       setHasYearsLoadFinished(false)
@@ -120,6 +155,9 @@ function AnnualReportPage() {
       try {
         const startResult = await window.electronAPI.annualReport.startAvailableYearsLoad()
         if (!startResult.success || !startResult.taskId) {
+          finishBackgroundTask(uiTaskId, 'failed', {
+            detail: startResult.error || '加载年度数据失败'
+          })
           setLoadError(startResult.error || '加载年度数据失败')
           setIsLoading(false)
           setIsLoadingMoreYears(false)
@@ -131,6 +169,9 @@ function AnnualReportPage() {
         }
       } catch (e) {
         console.error(e)
+        finishBackgroundTask(uiTaskId, 'failed', {
+          detail: String(e)
+        })
         setLoadError(String(e))
         setIsLoading(false)
         setIsLoadingMoreYears(false)
@@ -168,16 +209,7 @@ function AnnualReportPage() {
     return (
       <div className="annual-report-page">
         <Loader2 size={32} className="spin" style={{ color: 'var(--text-tertiary)' }} />
-        <p style={{ color: 'var(--text-tertiary)', marginTop: 16 }}>正在加载年份数据（首批）...</p>
-        <div className="load-telemetry compact">
-          <p><span className="label">加载方式：</span>{getStrategyLabel({ loadStrategy, loadPhase, hasYearsLoadFinished, hasSwitchedStrategy, nativeTimedOut })}</p>
-          <p><span className="label">状态：</span>{loadStatusText || '正在加载年份数据...'}</p>
-          <p>
-            <span className="label">原生耗时：</span>{formatLoadElapsed(nativeElapsedMs)}{nativeTimedOut ? '（超时）' : ''} ｜{' '}
-            <span className="label">扫表耗时：</span>{formatLoadElapsed(scanElapsedMs)} ｜{' '}
-            <span className="label">总耗时：</span>{formatLoadElapsed(totalElapsedMs)}
-          </p>
-        </div>
+        <p style={{ color: 'var(--text-tertiary)', marginTop: 16 }}>正在准备年度报告...</p>
       </div>
     )
   }
@@ -223,30 +255,6 @@ function AnnualReportPage() {
       <Sparkles size={32} className="header-icon" />
       <h1 className="page-title">年度报告</h1>
       <p className="page-desc">选择年份，回顾你在微信里的点点滴滴</p>
-      {loadedYearCount > 0 && (
-        <p className={`page-desc load-summary ${isYearStatusComplete ? 'complete' : 'loading'}`}>
-          {isYearStatusComplete ? (
-            <>已显示 {loadedYearCount} 个年份，年份数据已全部加载完毕。总耗时 {formatLoadElapsed(totalElapsedMs)}</>
-          ) : (
-            <>
-              已显示 {loadedYearCount} 个年份，正在补充更多年份<span className="dot-ellipsis" aria-hidden="true">...</span>
-              （已耗时 {formatLoadElapsed(totalElapsedMs)}）
-            </>
-          )}
-        </p>
-      )}
-      <div className={`load-telemetry ${isYearStatusComplete ? 'complete' : 'loading'}`}>
-        <p><span className="label">加载方式：</span>{strategyLabel}</p>
-        <p>
-          <span className="label">状态：</span>
-          {loadStatusText || (isYearStatusComplete ? '全部年份已加载完毕' : '正在加载年份数据...')}
-        </p>
-        <p>
-          <span className="label">原生耗时：</span>{formatLoadElapsed(nativeElapsedMs)}{nativeTimedOut ? '（超时）' : ''} ｜{' '}
-          <span className="label">扫表耗时：</span>{formatLoadElapsed(scanElapsedMs)} ｜{' '}
-          <span className="label">总耗时：</span>{formatLoadElapsed(totalElapsedMs)}
-        </p>
-      </div>
 
       <div className="report-sections">
         <section className="report-section">
@@ -270,7 +278,6 @@ function AnnualReportPage() {
                 </div>
               ))}
             </div>
-            {renderYearLoadStatus()}
           </div>
 
           <button
@@ -317,7 +324,6 @@ function AnnualReportPage() {
                 </div>
               ))}
             </div>
-            {renderYearLoadStatus()}
           </div>
 
           <button

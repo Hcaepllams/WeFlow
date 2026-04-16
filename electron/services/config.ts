@@ -5,6 +5,13 @@ import Store from 'electron-store'
 
 // 加密前缀标记
 const SAFE_PREFIX = 'safe:'  // safeStorage 加密（普通模式）
+const isSafeStorageAvailable = (): boolean => {
+  try {
+    return typeof safeStorage?.isEncryptionAvailable === 'function' && safeStorage.isEncryptionAvailable()
+  } catch {
+    return false
+  }
+}
 const LOCK_PREFIX = 'lock:'  // 密码派生密钥加密（锁定模式）
 
 interface ConfigSchema {
@@ -16,7 +23,7 @@ interface ConfigSchema {
   imageXorKey: number
   imageAesKey: string
   wxidConfigs: Record<string, { decryptKey?: string; imageXorKey?: number; imageAesKey?: string; updatedAt?: number }>
-
+  exportPath?: string;
   // 缓存相关
   cachePath: string
   lastOpenedDb: string
@@ -27,6 +34,7 @@ interface ConfigSchema {
   themeId: string
   language: string
   logEnabled: boolean
+  launchAtStartup?: boolean
   llmModelPath: string
   whisperModelName: string
   whisperModelDir: string
@@ -34,6 +42,7 @@ interface ConfigSchema {
   autoTranscribeVoice: boolean
   transcribeLanguages: string[]
   exportDefaultConcurrency: number
+  exportDefaultImageDeepSearchOnMiss: boolean
   analyticsExcludedUsernames: string[]
 
   // 安全相关
@@ -44,6 +53,7 @@ interface ConfigSchema {
 
   // 更新相关
   ignoredUpdateVersion: string
+  updateChannel: 'auto' | 'stable' | 'preview' | 'dev'
 
   // HTTP API
   httpApiAutoStart: boolean
@@ -51,9 +61,18 @@ interface ConfigSchema {
 
   // 通知
   notificationEnabled: boolean
-  notificationPosition: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left'
+  notificationPosition: 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'top-center'
   notificationFilterMode: 'all' | 'whitelist' | 'blacklist'
   notificationFilterList: string[]
+  messagePushEnabled: boolean
+  messagePushFilterMode: 'all' | 'whitelist' | 'blacklist'
+  messagePushFilterList: string[]
+  httpApiEnabled: boolean
+  httpApiPort: number
+  httpApiHost: string
+  httpApiToken: string
+  windowCloseBehavior: 'ask' | 'tray' | 'quit'
+  quoteLayout: 'quote-top' | 'quote-bottom'
   wordCloudExcludeWords: string[]
 
   // Webhook 配置
@@ -75,7 +94,14 @@ interface ConfigSchema {
 }
 
 // 需要 safeStorage 加密的字段（普通模式）
-const ENCRYPTED_STRING_KEYS: Set<string> = new Set(['decryptKey', 'imageAesKey', 'authPassword'])
+const ENCRYPTED_STRING_KEYS: Set<string> = new Set([
+  'decryptKey',
+  'imageAesKey',
+  'authPassword',
+  'httpApiToken',
+  'aiModelApiKey',
+  'aiInsightApiKey'
+])
 const ENCRYPTED_BOOL_KEYS: Set<string> = new Set(['authEnabled', 'authUseHello'])
 const ENCRYPTED_NUMBER_KEYS: Set<string> = new Set(['imageXorKey'])
 
@@ -103,7 +129,76 @@ export class ConfigService {
       return ConfigService.instance
     }
     ConfigService.instance = this
-    this.store = new Store<ConfigSchema>({
+    const defaults: ConfigSchema = {
+      dbPath: '',
+      decryptKey: '',
+      myWxid: '',
+      onboardingDone: false,
+      imageXorKey: 0,
+      imageAesKey: '',
+      wxidConfigs: {},
+      cachePath: '',
+      lastOpenedDb: '',
+      lastSession: '',
+      theme: 'system',
+      themeId: 'cloud-dancer',
+      language: 'zh-CN',
+      logEnabled: false,
+      llmModelPath: '',
+      whisperModelName: 'base',
+      whisperModelDir: '',
+      whisperDownloadSource: 'tsinghua',
+      autoTranscribeVoice: false,
+      transcribeLanguages: ['zh'],
+      exportDefaultConcurrency: 4,
+      exportDefaultImageDeepSearchOnMiss: true,
+      analyticsExcludedUsernames: [],
+      authEnabled: false,
+      authPassword: '',
+      authUseHello: false,
+      authHelloSecret: '',
+      ignoredUpdateVersion: '',
+      updateChannel: 'auto',
+      notificationEnabled: true,
+      notificationPosition: 'top-right',
+      notificationFilterMode: 'all',
+      notificationFilterList: [],
+      httpApiToken: '',
+      httpApiEnabled: false,
+      httpApiPort: 5031,
+      httpApiHost: '127.0.0.1',
+      messagePushEnabled: false,
+      messagePushFilterMode: 'all',
+      messagePushFilterList: [],
+      windowCloseBehavior: 'ask',
+      quoteLayout: 'quote-top',
+      wordCloudExcludeWords: [],
+      exportWriteLayout: 'A',
+      exportAutomationTaskMap: {},
+      aiModelApiBaseUrl: '',
+      aiModelApiKey: '',
+      aiModelApiModel: 'gpt-4o-mini',
+      aiInsightEnabled: false,
+      aiInsightApiBaseUrl: '',
+      aiInsightApiKey: '',
+      aiInsightApiModel: 'gpt-4o-mini',
+      aiInsightSilenceDays: 3,
+      aiInsightAllowContext: false,
+      aiInsightWhitelistEnabled: false,
+      aiInsightWhitelist: [],
+      aiInsightCooldownMinutes: 120,
+      aiInsightScanIntervalHours: 4,
+      aiInsightContextCount: 40,
+      aiInsightSystemPrompt: '',
+      aiInsightTelegramEnabled: false,
+      aiInsightTelegramToken: '',
+      aiInsightTelegramChatIds: '',
+      aiFootprintEnabled: false,
+      aiFootprintSystemPrompt: '',
+      aiInsightDebugLogEnabled: false
+    }
+
+    const storeOptions: any = {
       name: 'WeFlow-config',
       defaults: {
         dbPath: '',
@@ -156,8 +251,25 @@ export class ConfigService {
           }
         }
       }
-    })
+    }
+
+    try {
+      this.store = new Store<ConfigSchema>(storeOptions)
+    } catch (error) {
+      const message = String((error as Error)?.message || error || '')
+      if (message.includes('projectName')) {
+        const fallbackOptions = {
+          ...storeOptions,
+          projectName: 'WeFlow',
+          cwd: storeOptions.cwd || process.env.WEFLOW_CONFIG_CWD || process.env.WEFLOW_USER_DATA_PATH || process.cwd()
+        }
+        this.store = new Store<ConfigSchema>(fallbackOptions)
+      } else {
+        throw error
+      }
+    }
     this.migrateAuthFields()
+    this.migrateAiConfig()
   }
 
   // === 状态查询 ===
@@ -215,7 +327,9 @@ export class ConfigService {
     const inLockMode = this.isLockMode() && this.unlockPassword
 
     if (ENCRYPTED_BOOL_KEYS.has(key)) {
-      toStore = this.safeEncrypt(String(value)) as ConfigSchema[K]
+      const boolValue = value === true || value === 'true'
+      // `false` 不需要写入 keychain，避免无意义触发 macOS 钥匙串弹窗
+      toStore = (boolValue ? this.safeEncrypt('true') : false) as ConfigSchema[K]
     } else if (ENCRYPTED_NUMBER_KEYS.has(key)) {
       if (inLockMode && LOCKABLE_NUMBER_KEYS.has(key)) {
         toStore = this.lockEncrypt(String(value), this.unlockPassword!) as ConfigSchema[K]
@@ -248,7 +362,7 @@ export class ConfigService {
   private safeEncrypt(plaintext: string): string {
     if (!plaintext) return ''
     if (plaintext.startsWith(SAFE_PREFIX)) return plaintext
-    if (!safeStorage.isEncryptionAvailable()) return plaintext
+    if (!isSafeStorageAvailable()) return plaintext
     const encrypted = safeStorage.encryptString(plaintext)
     return SAFE_PREFIX + encrypted.toString('base64')
   }
@@ -256,7 +370,7 @@ export class ConfigService {
   private safeDecrypt(stored: string): string {
     if (!stored) return ''
     if (!stored.startsWith(SAFE_PREFIX)) return stored
-    if (!safeStorage.isEncryptionAvailable()) return ''
+    if (!isSafeStorageAvailable()) return ''
     try {
       const buf = Buffer.from(stored.slice(SAFE_PREFIX.length), 'base64')
       return safeStorage.decryptString(buf)
@@ -594,7 +708,7 @@ export class ConfigService {
 
   clearHelloSecret(): void {
     this.store.set('authHelloSecret', '' as any)
-    this.store.set('authUseHello', this.safeEncrypt('false') as any)
+    this.store.set('authUseHello', false as any)
   }
 
   // === 迁移 ===
@@ -603,13 +717,18 @@ export class ConfigService {
     // 将旧版明文 auth 字段迁移为 safeStorage 加密格式
     // 如果已经是 safe: 或 lock: 前缀则跳过
     const rawEnabled: any = this.store.get('authEnabled')
-    if (typeof rawEnabled === 'boolean') {
-      this.store.set('authEnabled', this.safeEncrypt(String(rawEnabled)) as any)
+    if (rawEnabled === true || rawEnabled === 'true') {
+      this.store.set('authEnabled', this.safeEncrypt('true') as any)
+    } else if (rawEnabled === false || rawEnabled === 'false') {
+      // 保持 false 为明文布尔，避免冷启动访问 keychain
+      this.store.set('authEnabled', false as any)
     }
 
     const rawUseHello: any = this.store.get('authUseHello')
-    if (typeof rawUseHello === 'boolean') {
-      this.store.set('authUseHello', this.safeEncrypt(String(rawUseHello)) as any)
+    if (rawUseHello === true || rawUseHello === 'true') {
+      this.store.set('authUseHello', this.safeEncrypt('true') as any)
+    } else if (rawUseHello === false || rawUseHello === 'false') {
+      this.store.set('authUseHello', false as any)
     }
 
     const rawPassword: any = this.store.get('authPassword')
@@ -655,6 +774,26 @@ export class ConfigService {
     }
   }
 
+  private migrateAiConfig(): void {
+    const sharedBaseUrl = String(this.get('aiModelApiBaseUrl') || '').trim()
+    const sharedApiKey = String(this.get('aiModelApiKey') || '').trim()
+    const sharedModel = String(this.get('aiModelApiModel') || '').trim()
+
+    const legacyBaseUrl = String(this.get('aiInsightApiBaseUrl') || '').trim()
+    const legacyApiKey = String(this.get('aiInsightApiKey') || '').trim()
+    const legacyModel = String(this.get('aiInsightApiModel') || '').trim()
+
+    if (!sharedBaseUrl && legacyBaseUrl) {
+      this.set('aiModelApiBaseUrl', legacyBaseUrl)
+    }
+    if (!sharedApiKey && legacyApiKey) {
+      this.set('aiModelApiKey', legacyApiKey)
+    }
+    if (!sharedModel && legacyModel) {
+      this.set('aiModelApiModel', legacyModel)
+    }
+  }
+
   // === 验证 ===
 
   verifyAuthEnabled(): boolean {
@@ -666,11 +805,9 @@ export class ConfigService {
 
     // 即使 authEnabled 被删除/篡改，如果密钥是 lock: 格式，说明曾开启过应用锁
     const rawDecryptKey: any = this.store.get('decryptKey')
-    if (typeof rawDecryptKey === 'string' && rawDecryptKey.startsWith(LOCK_PREFIX)) {
-      return true
-    }
+    return typeof rawDecryptKey === 'string' && rawDecryptKey.startsWith(LOCK_PREFIX);
 
-    return false
+
   }
 
   // === 工具方法 ===
@@ -696,8 +833,16 @@ export class ConfigService {
     }
   }
 
+  private getUserDataPath(): string {
+    const workerUserDataPath = String(process.env.WEFLOW_USER_DATA_PATH || process.env.WEFLOW_CONFIG_CWD || '').trim()
+    if (workerUserDataPath) {
+      return workerUserDataPath
+    }
+    return app?.getPath?.('userData') || process.cwd()
+  }
+
   getCacheBasePath(): string {
-    return join(app.getPath('userData'), 'cache')
+    return join(this.getUserDataPath(), 'cache')
   }
 
   getAll(): Partial<ConfigSchema> {

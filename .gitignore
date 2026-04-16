@@ -56,13 +56,23 @@ Thumbs.db
 *.aps
 
 wcdb/
+!resources/wcdb/
+!resources/wcdb/**
 xkey/
 server/
 *info
 chatlab-format.md
 *.bak
 AGENTS.md
+AGENT.md
 .claude/
+CLAUDE.md
 .agents/
 resources/wx_send
 概述.md
+pnpm-lock.yaml
+/pnpm-workspace.yaml
+wechat-research-site
+.codex
+weflow-web-offical
+Insight

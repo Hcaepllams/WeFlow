@@ -1,5 +1,7 @@
 // 配置服务 - 封装 Electron Store
 import { config } from './ipc'
+import type { ExportDefaultDateRangeConfig } from '../utils/exportDateRange'
+import type { ExportAutomationTask } from '../types/exportAutomation'
 
 // 配置键名
 export const CONFIG_KEYS = {
@@ -12,6 +14,7 @@ export const CONFIG_KEYS = {
   LAST_SESSION: 'lastSession',
   WINDOW_BOUNDS: 'windowBounds',
   CACHE_PATH: 'cachePath',
+  LAUNCH_AT_STARTUP: 'launchAtStartup',
 
   EXPORT_PATH: 'exportPath',
   AGREEMENT_ACCEPTED: 'agreementAccepted',
@@ -26,12 +29,15 @@ export const CONFIG_KEYS = {
   AUTO_TRANSCRIBE_VOICE: 'autoTranscribeVoice',
   TRANSCRIBE_LANGUAGES: 'transcribeLanguages',
   EXPORT_DEFAULT_FORMAT: 'exportDefaultFormat',
+  EXPORT_DEFAULT_AVATARS: 'exportDefaultAvatars',
   EXPORT_DEFAULT_DATE_RANGE: 'exportDefaultDateRange',
+  EXPORT_DEFAULT_FILE_NAMING_MODE: 'exportDefaultFileNamingMode',
   EXPORT_DEFAULT_MEDIA: 'exportDefaultMedia',
   EXPORT_DEFAULT_VOICE_AS_TEXT: 'exportDefaultVoiceAsText',
   EXPORT_DEFAULT_EXCEL_COMPACT_COLUMNS: 'exportDefaultExcelCompactColumns',
   EXPORT_DEFAULT_TXT_COLUMNS: 'exportDefaultTxtColumns',
   EXPORT_DEFAULT_CONCURRENCY: 'exportDefaultConcurrency',
+  EXPORT_DEFAULT_IMAGE_DEEP_SEARCH_ON_MISS: 'exportDefaultImageDeepSearchOnMiss',
   EXPORT_WRITE_LAYOUT: 'exportWriteLayout',
   EXPORT_SESSION_NAME_PREFIX_ENABLED: 'exportSessionNamePrefixEnabled',
   EXPORT_LAST_SESSION_RUN_MAP: 'exportLastSessionRunMap',
@@ -41,6 +47,9 @@ export const CONFIG_KEYS = {
   EXPORT_SESSION_MESSAGE_COUNT_CACHE_MAP: 'exportSessionMessageCountCacheMap',
   EXPORT_SESSION_CONTENT_METRIC_CACHE_MAP: 'exportSessionContentMetricCacheMap',
   EXPORT_SNS_STATS_CACHE_MAP: 'exportSnsStatsCacheMap',
+  EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP: 'exportSnsUserPostCountsCacheMap',
+  EXPORT_SESSION_MUTUAL_FRIENDS_CACHE_MAP: 'exportSessionMutualFriendsCacheMap',
+  EXPORT_AUTOMATION_TASK_MAP: 'exportAutomationTaskMap',
   SNS_PAGE_CACHE_MAP: 'snsPageCacheMap',
   CONTACTS_LOAD_TIMEOUT_MS: 'contactsLoadTimeoutMs',
   CONTACTS_LIST_CACHE_MAP: 'contactsListCacheMap',
@@ -53,12 +62,22 @@ export const CONFIG_KEYS = {
 
   // 更新
   IGNORED_UPDATE_VERSION: 'ignoredUpdateVersion',
+  UPDATE_CHANNEL: 'updateChannel',
 
   // 通知
   NOTIFICATION_ENABLED: 'notificationEnabled',
   NOTIFICATION_POSITION: 'notificationPosition',
   NOTIFICATION_FILTER_MODE: 'notificationFilterMode',
   NOTIFICATION_FILTER_LIST: 'notificationFilterList',
+  HTTP_API_TOKEN: 'httpApiToken',
+  HTTP_API_ENABLED: 'httpApiEnabled',
+  HTTP_API_PORT: 'httpApiPort',
+  HTTP_API_HOST: 'httpApiHost',
+  MESSAGE_PUSH_ENABLED: 'messagePushEnabled',
+  MESSAGE_PUSH_FILTER_MODE: 'messagePushFilterMode',
+  MESSAGE_PUSH_FILTER_LIST: 'messagePushFilterList',
+  WINDOW_CLOSE_BEHAVIOR: 'windowCloseBehavior',
+  QUOTE_LAYOUT: 'quoteLayout',
 
   // 词云
   WORD_CLOUD_EXCLUDE_WORDS: 'wordCloudExcludeWords',
@@ -77,6 +96,28 @@ export interface WxidConfig {
   updatedAt?: number
 }
 
+export interface ExportDefaultMediaConfig {
+  images: boolean
+  videos: boolean
+  voices: boolean
+  emojis: boolean
+  files: boolean
+}
+
+export type ExportFileNamingMode = 'classic' | 'date-range'
+
+export type WindowCloseBehavior = 'ask' | 'tray' | 'quit'
+export type QuoteLayout = 'quote-top' | 'quote-bottom'
+export type UpdateChannel = 'stable' | 'preview' | 'dev'
+
+const DEFAULT_EXPORT_MEDIA_CONFIG: ExportDefaultMediaConfig = {
+  images: true,
+  videos: true,
+  voices: true,
+  emojis: true,
+  files: true
+}
+
 // 获取解密密钥
 export async function getDecryptKey(): Promise<string | null> {
   const value = await config.get(CONFIG_KEYS.DECRYPT_KEY)
@@ -92,6 +133,17 @@ export async function setDecryptKey(key: string): Promise<void> {
 export async function getDbPath(): Promise<string | null> {
   const value = await config.get(CONFIG_KEYS.DB_PATH)
   return value as string | null
+}
+
+// 获取api access_token
+export async function getHttpApiToken(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.HTTP_API_TOKEN)
+  return (value as string) || ''
+}
+
+// 设置access_token
+export async function setHttpApiToken(token: string): Promise<void> {
+  await config.set(CONFIG_KEYS.HTTP_API_TOKEN, token)
 }
 
 // 设置数据库路径
@@ -116,6 +168,10 @@ export async function getWxidConfigs(): Promise<Record<string, WxidConfig>> {
     return value as Record<string, WxidConfig>
   }
   return {}
+}
+
+export async function setWxidConfigs(configs: Record<string, WxidConfig>): Promise<void> {
+  await config.set(CONFIG_KEYS.WXID_CONFIGS, configs || {})
 }
 
 export async function getWxidConfig(wxid: string): Promise<WxidConfig | null> {
@@ -216,6 +272,18 @@ export async function getLogEnabled(): Promise<boolean> {
 // 设置日志开关
 export async function setLogEnabled(enabled: boolean): Promise<void> {
   await config.set(CONFIG_KEYS.LOG_ENABLED, enabled)
+}
+
+// 获取开机自启动偏好
+export async function getLaunchAtStartup(): Promise<boolean | null> {
+  const value = await config.get(CONFIG_KEYS.LAUNCH_AT_STARTUP)
+  if (typeof value === 'boolean') return value
+  return null
+}
+
+// 设置开机自启动偏好
+export async function setLaunchAtStartup(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.LAUNCH_AT_STARTUP, enabled)
 }
 
 // 获取 LLM 模型路径
@@ -335,27 +403,79 @@ export async function setExportDefaultFormat(format: string): Promise<void> {
   await config.set(CONFIG_KEYS.EXPORT_DEFAULT_FORMAT, format)
 }
 
-// 获取导出默认时间范围
-export async function getExportDefaultDateRange(): Promise<string | null> {
-  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_DATE_RANGE)
-  return (value as string) || null
-}
-
-// 设置导出默认时间范围
-export async function setExportDefaultDateRange(range: string): Promise<void> {
-  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_DATE_RANGE, range)
-}
-
-// 获取导出默认媒体设置
-export async function getExportDefaultMedia(): Promise<boolean | null> {
-  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_MEDIA)
+// 获取导出默认头像设置
+export async function getExportDefaultAvatars(): Promise<boolean | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_AVATARS)
   if (typeof value === 'boolean') return value
   return null
 }
 
+// 设置导出默认头像设置
+export async function setExportDefaultAvatars(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_AVATARS, enabled)
+}
+
+// 获取导出默认时间范围
+export async function getExportDefaultDateRange(): Promise<ExportDefaultDateRangeConfig | string | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_DATE_RANGE)
+  if (typeof value === 'string') return value
+  if (value && typeof value === 'object') {
+    return value as ExportDefaultDateRangeConfig
+  }
+  return null
+}
+
+// 设置导出默认时间范围
+export async function setExportDefaultDateRange(range: ExportDefaultDateRangeConfig | string): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_DATE_RANGE, range)
+}
+
+// 获取导出默认文件命名方式
+export async function getExportDefaultFileNamingMode(): Promise<ExportFileNamingMode | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_FILE_NAMING_MODE)
+  if (value === 'classic' || value === 'date-range') return value
+  return null
+}
+
+// 设置导出默认文件命名方式
+export async function setExportDefaultFileNamingMode(mode: ExportFileNamingMode): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_FILE_NAMING_MODE, mode)
+}
+
+// 获取导出默认媒体设置
+export async function getExportDefaultMedia(): Promise<ExportDefaultMediaConfig | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_MEDIA)
+  if (typeof value === 'boolean') {
+    return {
+      images: value,
+      videos: value,
+      voices: value,
+      emojis: value,
+      files: value
+    }
+  }
+  if (value && typeof value === 'object') {
+    const raw = value as Partial<Record<keyof ExportDefaultMediaConfig, unknown>>
+    return {
+      images: typeof raw.images === 'boolean' ? raw.images : DEFAULT_EXPORT_MEDIA_CONFIG.images,
+      videos: typeof raw.videos === 'boolean' ? raw.videos : DEFAULT_EXPORT_MEDIA_CONFIG.videos,
+      voices: typeof raw.voices === 'boolean' ? raw.voices : DEFAULT_EXPORT_MEDIA_CONFIG.voices,
+      emojis: typeof raw.emojis === 'boolean' ? raw.emojis : DEFAULT_EXPORT_MEDIA_CONFIG.emojis,
+      files: typeof raw.files === 'boolean' ? raw.files : DEFAULT_EXPORT_MEDIA_CONFIG.files
+    }
+  }
+  return null
+}
+
 // 设置导出默认媒体设置
-export async function setExportDefaultMedia(enabled: boolean): Promise<void> {
-  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_MEDIA, enabled)
+export async function setExportDefaultMedia(media: ExportDefaultMediaConfig): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_MEDIA, {
+    images: media.images,
+    videos: media.videos,
+    voices: media.voices,
+    emojis: media.emojis,
+    files: media.files
+  })
 }
 
 // 获取导出默认语音转文字
@@ -403,6 +523,18 @@ export async function getExportDefaultConcurrency(): Promise<number | null> {
 // 设置导出默认并发数
 export async function setExportDefaultConcurrency(concurrency: number): Promise<void> {
   await config.set(CONFIG_KEYS.EXPORT_DEFAULT_CONCURRENCY, concurrency)
+}
+
+// 获取缺图时是否深度搜索（默认导出行为）
+export async function getExportDefaultImageDeepSearchOnMiss(): Promise<boolean | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_IMAGE_DEEP_SEARCH_ON_MISS)
+  if (typeof value === 'boolean') return value
+  return null
+}
+
+// 设置缺图时是否深度搜索（默认导出行为）
+export async function setExportDefaultImageDeepSearchOnMiss(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_IMAGE_DEEP_SEARCH_ON_MISS, enabled)
 }
 
 export type ExportWriteLayout = 'A' | 'B' | 'C'
@@ -512,6 +644,183 @@ export async function setExportLastSnsPostCount(count: number): Promise<void> {
   await config.set(CONFIG_KEYS.EXPORT_LAST_SNS_POST_COUNT, normalized)
 }
 
+export interface ExportAutomationTaskMapItem {
+  updatedAt: number
+  tasks: ExportAutomationTask[]
+}
+
+const normalizeAutomationNumeric = (value: unknown, fallback: number): number => {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return fallback
+  return Math.floor(numeric)
+}
+
+const normalizeAutomationTask = (raw: unknown): ExportAutomationTask | null => {
+  if (!raw || typeof raw !== 'object') return null
+  const source = raw as Record<string, unknown>
+
+  const id = String(source.id || '').trim()
+  const name = String(source.name || '').trim()
+  if (!id || !name) return null
+
+  const sessionIds = Array.isArray(source.sessionIds)
+    ? Array.from(new Set(source.sessionIds.map((item) => String(item || '').trim()).filter(Boolean)))
+    : []
+  const sessionNames = Array.isArray(source.sessionNames)
+    ? source.sessionNames.map((item) => String(item || '').trim()).filter(Boolean)
+    : []
+  if (sessionIds.length === 0) return null
+
+  const scheduleRaw = source.schedule
+  if (!scheduleRaw || typeof scheduleRaw !== 'object') return null
+  const scheduleObj = scheduleRaw as Record<string, unknown>
+  const scheduleType = String(scheduleObj.type || '').trim() as ExportAutomationTask['schedule']['type']
+  let schedule: ExportAutomationTask['schedule'] | null = null
+  if (scheduleType === 'interval') {
+    const rawDays = Math.max(0, normalizeAutomationNumeric(scheduleObj.intervalDays, 0))
+    const rawHours = Math.max(0, normalizeAutomationNumeric(scheduleObj.intervalHours, 0))
+    const totalHours = (rawDays * 24) + rawHours
+    if (totalHours <= 0) return null
+    const intervalDays = Math.floor(totalHours / 24)
+    const intervalHours = totalHours % 24
+    schedule = { type: 'interval', intervalDays, intervalHours }
+  }
+  if (!schedule) return null
+
+  const conditionRaw = source.condition
+  if (!conditionRaw || typeof conditionRaw !== 'object') return null
+  const conditionType = String((conditionRaw as Record<string, unknown>).type || '').trim()
+  if (conditionType !== 'new-message-since-last-success') return null
+
+  const templateRaw = source.template
+  if (!templateRaw || typeof templateRaw !== 'object') return null
+  const template = templateRaw as Record<string, unknown>
+  const scope = String(template.scope || '').trim() as ExportAutomationTask['template']['scope']
+  if (scope !== 'single' && scope !== 'multi' && scope !== 'content') return null
+  const optionTemplate = template.optionTemplate
+  if (!optionTemplate || typeof optionTemplate !== 'object') return null
+  const dateRangeConfig = template.dateRangeConfig
+  const outputDirRaw = String(source.outputDir || '').trim()
+  const runStateRaw = source.runState && typeof source.runState === 'object'
+    ? (source.runState as Record<string, unknown>)
+    : null
+  const stopConditionRaw = source.stopCondition && typeof source.stopCondition === 'object'
+    ? (source.stopCondition as Record<string, unknown>)
+    : null
+  const rawContentType = String(template.contentType || '').trim()
+  const contentType = (
+    rawContentType === 'text' ||
+    rawContentType === 'voice' ||
+    rawContentType === 'image' ||
+    rawContentType === 'video' ||
+    rawContentType === 'emoji' ||
+    rawContentType === 'file'
+  )
+    ? rawContentType
+    : undefined
+  const rawRunStatus = runStateRaw ? String(runStateRaw.lastRunStatus || '').trim() : ''
+  const lastRunStatus = (
+    rawRunStatus === 'idle' ||
+    rawRunStatus === 'queued' ||
+    rawRunStatus === 'running' ||
+    rawRunStatus === 'success' ||
+    rawRunStatus === 'error' ||
+    rawRunStatus === 'skipped'
+  )
+    ? rawRunStatus
+    : undefined
+  const endAt = stopConditionRaw ? Math.max(0, normalizeAutomationNumeric(stopConditionRaw.endAt, 0)) : 0
+  const maxRuns = stopConditionRaw ? Math.max(0, normalizeAutomationNumeric(stopConditionRaw.maxRuns, 0)) : 0
+
+  return {
+    id,
+    name,
+    enabled: source.enabled !== false,
+    sessionIds,
+    sessionNames,
+    outputDir: outputDirRaw || undefined,
+    schedule,
+    condition: { type: 'new-message-since-last-success' },
+    stopCondition: (endAt > 0 || maxRuns > 0)
+      ? {
+          endAt: endAt > 0 ? endAt : undefined,
+          maxRuns: maxRuns > 0 ? maxRuns : undefined
+        }
+      : undefined,
+    template: {
+      scope,
+      contentType,
+      optionTemplate: optionTemplate as ExportAutomationTask['template']['optionTemplate'],
+      dateRangeConfig: (dateRangeConfig ?? null) as ExportAutomationTask['template']['dateRangeConfig']
+    },
+    runState: runStateRaw
+      ? {
+          lastRunStatus,
+          lastTriggeredAt: normalizeAutomationNumeric(runStateRaw.lastTriggeredAt, 0) || undefined,
+          lastStartedAt: normalizeAutomationNumeric(runStateRaw.lastStartedAt, 0) || undefined,
+          lastFinishedAt: normalizeAutomationNumeric(runStateRaw.lastFinishedAt, 0) || undefined,
+          lastSuccessAt: normalizeAutomationNumeric(runStateRaw.lastSuccessAt, 0) || undefined,
+          lastSkipAt: normalizeAutomationNumeric(runStateRaw.lastSkipAt, 0) || undefined,
+          lastSkipReason: String(runStateRaw.lastSkipReason || '').trim() || undefined,
+          lastError: String(runStateRaw.lastError || '').trim() || undefined,
+          lastScheduleKey: String(runStateRaw.lastScheduleKey || '').trim() || undefined,
+          successCount: Math.max(0, normalizeAutomationNumeric(runStateRaw.successCount, 0)) || undefined
+        }
+      : undefined,
+    createdAt: Math.max(0, normalizeAutomationNumeric(source.createdAt, Date.now())),
+    updatedAt: Math.max(0, normalizeAutomationNumeric(source.updatedAt, Date.now()))
+  }
+}
+
+export async function getExportAutomationTasks(scopeKey: string): Promise<ExportAutomationTaskMapItem | null> {
+  if (!scopeKey) return null
+  const value = await config.get(CONFIG_KEYS.EXPORT_AUTOMATION_TASK_MAP)
+  if (!value || typeof value !== 'object') return null
+  const rawMap = value as Record<string, unknown>
+  const rawItem = rawMap[scopeKey]
+  if (!rawItem || typeof rawItem !== 'object') return null
+
+  const item = rawItem as Record<string, unknown>
+  const updatedAt = Number(item.updatedAt)
+  const rawTasks = Array.isArray(item.tasks)
+    ? item.tasks
+    : (Array.isArray(rawItem) ? rawItem : [])
+  const tasks: ExportAutomationTask[] = []
+  for (const rawTask of rawTasks) {
+    const normalized = normalizeAutomationTask(rawTask)
+    if (normalized) {
+      tasks.push(normalized)
+    }
+  }
+  return {
+    updatedAt: Number.isFinite(updatedAt) ? Math.max(0, Math.floor(updatedAt)) : 0,
+    tasks
+  }
+}
+
+export async function setExportAutomationTasks(scopeKey: string, tasks: ExportAutomationTask[]): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_AUTOMATION_TASK_MAP)
+  const map = current && typeof current === 'object'
+    ? { ...(current as Record<string, unknown>) }
+    : {}
+  map[scopeKey] = {
+    updatedAt: Date.now(),
+    tasks: (Array.isArray(tasks) ? tasks : []).map((task) => ({ ...task }))
+  }
+  await config.set(CONFIG_KEYS.EXPORT_AUTOMATION_TASK_MAP, map)
+}
+
+export async function clearExportAutomationTasks(scopeKey: string): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_AUTOMATION_TASK_MAP)
+  if (!current || typeof current !== 'object') return
+  const map = { ...(current as Record<string, unknown>) }
+  if (!(scopeKey in map)) return
+  delete map[scopeKey]
+  await config.set(CONFIG_KEYS.EXPORT_AUTOMATION_TASK_MAP, map)
+}
+
 export interface ExportSessionMessageCountCacheItem {
   updatedAt: number
   counts: Record<string, number>
@@ -523,6 +832,8 @@ export interface ExportSessionContentMetricCacheEntry {
   imageMessages?: number
   videoMessages?: number
   emojiMessages?: number
+  firstTimestamp?: number
+  lastTimestamp?: number
 }
 
 export interface ExportSessionContentMetricCacheItem {
@@ -534,6 +845,39 @@ export interface ExportSnsStatsCacheItem {
   updatedAt: number
   totalPosts: number
   totalFriends: number
+}
+
+export interface ExportSnsUserPostCountsCacheItem {
+  updatedAt: number
+  counts: Record<string, number>
+}
+
+export type ExportSessionMutualFriendDirection = 'incoming' | 'outgoing' | 'bidirectional'
+export type ExportSessionMutualFriendBehavior = 'likes' | 'comments' | 'both'
+
+export interface ExportSessionMutualFriendCacheItem {
+  name: string
+  incomingLikeCount: number
+  incomingCommentCount: number
+  outgoingLikeCount: number
+  outgoingCommentCount: number
+  totalCount: number
+  latestTime: number
+  direction: ExportSessionMutualFriendDirection
+  behavior: ExportSessionMutualFriendBehavior
+}
+
+export interface ExportSessionMutualFriendsCacheEntry {
+  count: number
+  items: ExportSessionMutualFriendCacheItem[]
+  loadedPosts: number
+  totalPosts: number | null
+  computedAt: number
+}
+
+export interface ExportSessionMutualFriendsCacheItem {
+  updatedAt: number
+  metrics: Record<string, ExportSessionMutualFriendsCacheEntry>
 }
 
 export interface SnsPageOverviewCache {
@@ -555,6 +899,10 @@ export interface ContactsListCacheContact {
   displayName: string
   remark?: string
   nickname?: string
+  alias?: string
+  labels?: string[]
+  detailDescription?: string
+  region?: string
   type: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
 }
 
@@ -652,6 +1000,12 @@ export async function getExportSessionContentMetricCache(scopeKey: string): Prom
     if (typeof source.emojiMessages === 'number' && Number.isFinite(source.emojiMessages) && source.emojiMessages >= 0) {
       metric.emojiMessages = Math.floor(source.emojiMessages)
     }
+    if (typeof source.firstTimestamp === 'number' && Number.isFinite(source.firstTimestamp) && source.firstTimestamp > 0) {
+      metric.firstTimestamp = Math.floor(source.firstTimestamp)
+    }
+    if (typeof source.lastTimestamp === 'number' && Number.isFinite(source.lastTimestamp) && source.lastTimestamp > 0) {
+      metric.lastTimestamp = Math.floor(source.lastTimestamp)
+    }
     if (Object.keys(metric).length === 0) continue
     metrics[sessionId] = metric
   }
@@ -690,6 +1044,12 @@ export async function setExportSessionContentMetricCache(
     }
     if (typeof rawMetric.emojiMessages === 'number' && Number.isFinite(rawMetric.emojiMessages) && rawMetric.emojiMessages >= 0) {
       metric.emojiMessages = Math.floor(rawMetric.emojiMessages)
+    }
+    if (typeof rawMetric.firstTimestamp === 'number' && Number.isFinite(rawMetric.firstTimestamp) && rawMetric.firstTimestamp > 0) {
+      metric.firstTimestamp = Math.floor(rawMetric.firstTimestamp)
+    }
+    if (typeof rawMetric.lastTimestamp === 'number' && Number.isFinite(rawMetric.lastTimestamp) && rawMetric.lastTimestamp > 0) {
+      metric.lastTimestamp = Math.floor(rawMetric.lastTimestamp)
     }
     if (Object.keys(metric).length === 0) continue
     normalized[sessionId] = metric
@@ -741,6 +1101,200 @@ export async function setExportSnsStatsCache(
   }
 
   await config.set(CONFIG_KEYS.EXPORT_SNS_STATS_CACHE_MAP, map)
+}
+
+export async function getExportSnsUserPostCountsCache(scopeKey: string): Promise<ExportSnsUserPostCountsCacheItem | null> {
+  if (!scopeKey) return null
+  const value = await config.get(CONFIG_KEYS.EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP)
+  if (!value || typeof value !== 'object') return null
+  const rawMap = value as Record<string, unknown>
+  const rawItem = rawMap[scopeKey]
+  if (!rawItem || typeof rawItem !== 'object') return null
+
+  const raw = rawItem as Record<string, unknown>
+  const rawCounts = raw.counts
+  if (!rawCounts || typeof rawCounts !== 'object') return null
+
+  const counts: Record<string, number> = {}
+  for (const [rawUsername, rawCount] of Object.entries(rawCounts as Record<string, unknown>)) {
+    const username = String(rawUsername || '').trim()
+    if (!username) continue
+    const valueNum = Number(rawCount)
+    counts[username] = Number.isFinite(valueNum) ? Math.max(0, Math.floor(valueNum)) : 0
+  }
+
+  const updatedAt = typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)
+    ? raw.updatedAt
+    : 0
+  return { updatedAt, counts }
+}
+
+export async function setExportSnsUserPostCountsCache(
+  scopeKey: string,
+  counts: Record<string, number>
+): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP)
+  const map = current && typeof current === 'object'
+    ? { ...(current as Record<string, unknown>) }
+    : {}
+
+  const normalized: Record<string, number> = {}
+  for (const [rawUsername, rawCount] of Object.entries(counts || {})) {
+    const username = String(rawUsername || '').trim()
+    if (!username) continue
+    const valueNum = Number(rawCount)
+    normalized[username] = Number.isFinite(valueNum) ? Math.max(0, Math.floor(valueNum)) : 0
+  }
+
+  map[scopeKey] = {
+    updatedAt: Date.now(),
+    counts: normalized
+  }
+
+  await config.set(CONFIG_KEYS.EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP, map)
+}
+
+const normalizeMutualFriendDirection = (value: unknown): ExportSessionMutualFriendDirection | null => {
+  if (value === 'incoming' || value === 'outgoing' || value === 'bidirectional') {
+    return value
+  }
+  return null
+}
+
+const normalizeMutualFriendBehavior = (value: unknown): ExportSessionMutualFriendBehavior | null => {
+  if (value === 'likes' || value === 'comments' || value === 'both') {
+    return value
+  }
+  return null
+}
+
+const normalizeExportSessionMutualFriendsCacheEntry = (raw: unknown): ExportSessionMutualFriendsCacheEntry | null => {
+  if (!raw || typeof raw !== 'object') return null
+  const source = raw as Record<string, unknown>
+  const count = Number(source.count)
+  const loadedPosts = Number(source.loadedPosts)
+  const computedAt = Number(source.computedAt)
+  const itemsRaw = Array.isArray(source.items) ? source.items : []
+  const totalPostsRaw = source.totalPosts
+  const totalPosts = totalPostsRaw === null || totalPostsRaw === undefined
+    ? null
+    : Number(totalPostsRaw)
+
+  if (!Number.isFinite(count) || count < 0 || !Number.isFinite(loadedPosts) || loadedPosts < 0 || !Number.isFinite(computedAt) || computedAt < 0) {
+    return null
+  }
+
+  const items: ExportSessionMutualFriendCacheItem[] = []
+  for (const itemRaw of itemsRaw) {
+    if (!itemRaw || typeof itemRaw !== 'object') continue
+    const item = itemRaw as Record<string, unknown>
+    const name = String(item.name || '').trim()
+    const direction = normalizeMutualFriendDirection(item.direction)
+    const behavior = normalizeMutualFriendBehavior(item.behavior)
+    const incomingLikeCount = Number(item.incomingLikeCount)
+    const incomingCommentCount = Number(item.incomingCommentCount)
+    const outgoingLikeCount = Number(item.outgoingLikeCount)
+    const outgoingCommentCount = Number(item.outgoingCommentCount)
+    const totalCount = Number(item.totalCount)
+    const latestTime = Number(item.latestTime)
+    if (!name || !direction || !behavior) continue
+    if (
+      !Number.isFinite(incomingLikeCount) || incomingLikeCount < 0 ||
+      !Number.isFinite(incomingCommentCount) || incomingCommentCount < 0 ||
+      !Number.isFinite(outgoingLikeCount) || outgoingLikeCount < 0 ||
+      !Number.isFinite(outgoingCommentCount) || outgoingCommentCount < 0 ||
+      !Number.isFinite(totalCount) || totalCount < 0 ||
+      !Number.isFinite(latestTime) || latestTime < 0
+    ) {
+      continue
+    }
+    items.push({
+      name,
+      incomingLikeCount: Math.floor(incomingLikeCount),
+      incomingCommentCount: Math.floor(incomingCommentCount),
+      outgoingLikeCount: Math.floor(outgoingLikeCount),
+      outgoingCommentCount: Math.floor(outgoingCommentCount),
+      totalCount: Math.floor(totalCount),
+      latestTime: Math.floor(latestTime),
+      direction,
+      behavior
+    })
+  }
+
+  return {
+    count: Math.floor(count),
+    items,
+    loadedPosts: Math.floor(loadedPosts),
+    totalPosts: totalPosts === null
+      ? null
+      : (Number.isFinite(totalPosts) && totalPosts >= 0 ? Math.floor(totalPosts) : null),
+    computedAt: Math.floor(computedAt)
+  }
+}
+
+export async function getExportSessionMutualFriendsCache(scopeKey: string): Promise<ExportSessionMutualFriendsCacheItem | null> {
+  if (!scopeKey) return null
+  const value = await config.get(CONFIG_KEYS.EXPORT_SESSION_MUTUAL_FRIENDS_CACHE_MAP)
+  if (!value || typeof value !== 'object') return null
+  const rawMap = value as Record<string, unknown>
+  const rawItem = rawMap[scopeKey]
+  if (!rawItem || typeof rawItem !== 'object') return null
+
+  const rawUpdatedAt = (rawItem as Record<string, unknown>).updatedAt
+  const rawMetrics = (rawItem as Record<string, unknown>).metrics
+  if (!rawMetrics || typeof rawMetrics !== 'object') return null
+
+  const metrics: Record<string, ExportSessionMutualFriendsCacheEntry> = {}
+  for (const [sessionIdRaw, metricRaw] of Object.entries(rawMetrics as Record<string, unknown>)) {
+    const sessionId = String(sessionIdRaw || '').trim()
+    if (!sessionId) continue
+    const metric = normalizeExportSessionMutualFriendsCacheEntry(metricRaw)
+    if (!metric) continue
+    metrics[sessionId] = metric
+  }
+
+  return {
+    updatedAt: typeof rawUpdatedAt === 'number' && Number.isFinite(rawUpdatedAt) ? rawUpdatedAt : 0,
+    metrics
+  }
+}
+
+export async function setExportSessionMutualFriendsCache(
+  scopeKey: string,
+  metrics: Record<string, ExportSessionMutualFriendsCacheEntry>
+): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_SESSION_MUTUAL_FRIENDS_CACHE_MAP)
+  const map = current && typeof current === 'object'
+    ? { ...(current as Record<string, unknown>) }
+    : {}
+
+  const normalized: Record<string, ExportSessionMutualFriendsCacheEntry> = {}
+  for (const [sessionIdRaw, metricRaw] of Object.entries(metrics || {})) {
+    const sessionId = String(sessionIdRaw || '').trim()
+    if (!sessionId) continue
+    const metric = normalizeExportSessionMutualFriendsCacheEntry(metricRaw)
+    if (!metric) continue
+    normalized[sessionId] = metric
+  }
+
+  map[scopeKey] = {
+    updatedAt: Date.now(),
+    metrics: normalized
+  }
+
+  await config.set(CONFIG_KEYS.EXPORT_SESSION_MUTUAL_FRIENDS_CACHE_MAP, map)
+}
+
+export async function clearExportSessionMutualFriendsCache(scopeKey: string): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_SESSION_MUTUAL_FRIENDS_CACHE_MAP)
+  if (!current || typeof current !== 'object') return
+  const map = { ...(current as Record<string, unknown>) }
+  if (!(scopeKey in map)) return
+  delete map[scopeKey]
+  await config.set(CONFIG_KEYS.EXPORT_SESSION_MUTUAL_FRIENDS_CACHE_MAP, map)
 }
 
 export async function getSnsPageCache(scopeKey: string): Promise<SnsPageCacheItem | null> {
@@ -823,16 +1377,18 @@ export async function setSnsPageCache(
 export async function getContactsLoadTimeoutMs(): Promise<number> {
   const value = await config.get(CONFIG_KEYS.CONTACTS_LOAD_TIMEOUT_MS)
   if (typeof value === 'number' && Number.isFinite(value) && value >= 1000 && value <= 60000) {
-    return Math.floor(value)
+    const normalized = Math.floor(value)
+    // 兼容历史默认值 3000ms：自动提升到新的更稳妥阈值。
+    return normalized === 3000 ? 10000 : normalized
   }
-  return 3000
+  return 10000
 }
 
 // 设置通讯录加载超时阈值（毫秒）
 export async function setContactsLoadTimeoutMs(timeoutMs: number): Promise<void> {
   const normalized = Number.isFinite(timeoutMs)
     ? Math.min(60000, Math.max(1000, Math.floor(timeoutMs)))
-    : 3000
+    : 10000
   await config.set(CONFIG_KEYS.CONTACTS_LOAD_TIMEOUT_MS, normalized)
 }
 
@@ -861,6 +1417,12 @@ export async function getContactsListCache(scopeKey: string): Promise<ContactsLi
       displayName,
       remark: typeof item.remark === 'string' ? item.remark : undefined,
       nickname: typeof item.nickname === 'string' ? item.nickname : undefined,
+      alias: typeof item.alias === 'string' ? item.alias : undefined,
+      labels: Array.isArray(item.labels)
+        ? Array.from(new Set(item.labels.map((label) => String(label || '').trim()).filter(Boolean)))
+        : undefined,
+      detailDescription: typeof item.detailDescription === 'string' ? (item.detailDescription.trim() || undefined) : undefined,
+      region: typeof item.region === 'string' ? (item.region.trim() || undefined) : undefined,
       type: (type === 'friend' || type === 'group' || type === 'official' || type === 'former_friend' || type === 'other')
         ? type
         : 'other'
@@ -894,6 +1456,12 @@ export async function setContactsListCache(scopeKey: string, contacts: ContactsL
       displayName,
       remark: contact?.remark ? String(contact.remark) : undefined,
       nickname: contact?.nickname ? String(contact.nickname) : undefined,
+      alias: contact?.alias ? String(contact.alias) : undefined,
+      labels: Array.isArray(contact?.labels)
+        ? Array.from(new Set(contact.labels.map((label) => String(label || '').trim()).filter(Boolean)))
+        : undefined,
+      detailDescription: contact?.detailDescription ? (String(contact.detailDescription).trim() || undefined) : undefined,
+      region: contact?.region ? (String(contact.region).trim() || undefined) : undefined,
       type
     })
   }
@@ -1035,6 +1603,18 @@ export async function setIgnoredUpdateVersion(version: string): Promise<void> {
   await config.set(CONFIG_KEYS.IGNORED_UPDATE_VERSION, version)
 }
 
+// 获取更新渠道（空值/auto 视为未显式设置，交由安装包类型决定默认渠道）
+export async function getUpdateChannel(): Promise<UpdateChannel | null> {
+  const value = await config.get(CONFIG_KEYS.UPDATE_CHANNEL)
+  if (value === 'stable' || value === 'preview' || value === 'dev') return value
+  return null
+}
+
+// 设置更新渠道
+export async function setUpdateChannel(channel: UpdateChannel): Promise<void> {
+  await config.set(CONFIG_KEYS.UPDATE_CHANNEL, channel)
+}
+
 // 获取通知开关
 export async function getNotificationEnabled(): Promise<boolean> {
   const value = await config.get(CONFIG_KEYS.NOTIFICATION_ENABLED)
@@ -1077,6 +1657,58 @@ export async function getNotificationFilterList(): Promise<string[]> {
 // 设置通知过滤列表
 export async function setNotificationFilterList(list: string[]): Promise<void> {
   await config.set(CONFIG_KEYS.NOTIFICATION_FILTER_LIST, list)
+}
+
+export async function getMessagePushEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.MESSAGE_PUSH_ENABLED)
+  return value === true
+}
+
+export async function setMessagePushEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.MESSAGE_PUSH_ENABLED, enabled)
+}
+
+export type MessagePushFilterMode = 'all' | 'whitelist' | 'blacklist'
+export type MessagePushSessionType = 'private' | 'group' | 'official' | 'other'
+
+export async function getMessagePushFilterMode(): Promise<MessagePushFilterMode> {
+  const value = await config.get(CONFIG_KEYS.MESSAGE_PUSH_FILTER_MODE)
+  if (value === 'whitelist' || value === 'blacklist') return value
+  return 'all'
+}
+
+export async function setMessagePushFilterMode(mode: MessagePushFilterMode): Promise<void> {
+  await config.set(CONFIG_KEYS.MESSAGE_PUSH_FILTER_MODE, mode)
+}
+
+export async function getMessagePushFilterList(): Promise<string[]> {
+  const value = await config.get(CONFIG_KEYS.MESSAGE_PUSH_FILTER_LIST)
+  return Array.isArray(value) ? value.map(item => String(item || '').trim()).filter(Boolean) : []
+}
+
+export async function setMessagePushFilterList(list: string[]): Promise<void> {
+  const normalized = Array.from(new Set((list || []).map(item => String(item || '').trim()).filter(Boolean)))
+  await config.set(CONFIG_KEYS.MESSAGE_PUSH_FILTER_LIST, normalized)
+}
+
+export async function getWindowCloseBehavior(): Promise<WindowCloseBehavior> {
+  const value = await config.get(CONFIG_KEYS.WINDOW_CLOSE_BEHAVIOR)
+  if (value === 'tray' || value === 'quit') return value
+  return 'ask'
+}
+
+export async function setWindowCloseBehavior(behavior: WindowCloseBehavior): Promise<void> {
+  await config.set(CONFIG_KEYS.WINDOW_CLOSE_BEHAVIOR, behavior)
+}
+
+export async function getQuoteLayout(): Promise<QuoteLayout> {
+  const value = await config.get(CONFIG_KEYS.QUOTE_LAYOUT)
+  if (value === 'quote-bottom') return value
+  return 'quote-top'
+}
+
+export async function setQuoteLayout(layout: QuoteLayout): Promise<void> {
+  await config.set(CONFIG_KEYS.QUOTE_LAYOUT, layout)
 }
 
 // 获取词云排除词列表
