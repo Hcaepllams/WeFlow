@@ -25,23 +25,16 @@ type HardlinkState = {
   dirTable?: string
 }
 
-// 额外的 monitor handlers（供其他服务如 httpService 使用）
+// 额外的 monitor handlers（供 httpService 的 webhook 使用）
 export type MonitorHandler = (type: string, json: string) => void
 const extraMonitorHandlers: MonitorHandler[] = []
 
-/**
- * 注册额外的 monitor handler
- * 供 httpService 等服务使用
- */
 export function registerMonitorHandler(handler: MonitorHandler): void {
   if (!extraMonitorHandlers.includes(handler)) {
     extraMonitorHandlers.push(handler)
   }
 }
 
-/**
- * 移除 monitor handler
- */
 export function unregisterMonitorHandler(handler: MonitorHandler): void {
   const index = extraMonitorHandlers.indexOf(handler)
   if (index > -1) {
@@ -49,6 +42,590 @@ export function unregisterMonitorHandler(handler: MonitorHandler): void {
   }
 }
 
+export interface ChatSession {
+  username: string
+  type: number
+  unreadCount: number
+  summary: string
+  sortTimestamp: number  // 用于排序
+  lastTimestamp: number  // 用于显示时间
+  lastMsgType: number
+  messageCountHint?: number
+  displayName?: string
+  avatarUrl?: string
+  lastMsgSender?: string
+  lastSenderDisplayName?: string
+  selfWxid?: string
+  isFolded?: boolean  // 是否已折叠进"折叠的群聊"
+  isMuted?: boolean   // 是否开启免打扰
+}
+
+export interface Message {
+  messageKey: string
+  localId: number
+  serverId: number
+  serverIdRaw?: string
+  localType: number
+  createTime: number
+  sortSeq: number
+  isSend: number | null
+  senderUsername: string | null
+  parsedContent: string
+  rawContent: string
+  content?: string  // 原始XML内容（与rawContent相同，供前端使用）
+  // 表情包相关
+  emojiCdnUrl?: string
+  emojiMd5?: string
+  emojiLocalPath?: string  // 本地缓存 castle 路径
+  emojiThumbUrl?: string
+  emojiEncryptUrl?: string
+  emojiAesKey?: string
+  // 引用消息相关
+  quotedContent?: string
+  quotedSender?: string
+  // 图片/视频相关
+  imageMd5?: string
+  imageDatName?: string
+  videoMd5?: string
+  aesKey?: string
+  encrypVer?: number
+  cdnThumbUrl?: string
+  voiceDurationSeconds?: number
+  // Type 49 细分字段
+  linkTitle?: string        // 链接/文件标题
+  linkUrl?: string          // 链接 URL
+  linkThumb?: string        // 链接缩略图
+  fileName?: string         // 文件名
+  fileSize?: number         // 文件大小
+  fileExt?: string          // 文件扩展名
+  fileMd5?: string          // 文件 MD5
+  xmlType?: string          // XML 中的 type 字段
+  appMsgKind?: string       // 归一化 appmsg 类型
+  appMsgDesc?: string
+  appMsgAppName?: string
+  appMsgSourceName?: string
+  appMsgSourceUsername?: string
+  appMsgThumbUrl?: string
+  appMsgMusicUrl?: string
+  appMsgDataUrl?: string
+  appMsgLocationLabel?: string
+  finderNickname?: string
+  finderUsername?: string
+  finderCoverUrl?: string
+  finderAvatar?: string
+  finderDuration?: number
+  // 位置消息
+  locationLat?: number
+  locationLng?: number
+  locationPoiname?: string
+  locationLabel?: string
+  // 音乐消息
+  musicAlbumUrl?: string
+  musicUrl?: string
+  // 礼物消息
+  giftImageUrl?: string
+  giftWish?: string
+  giftPrice?: string
+  // 名片消息
+  cardUsername?: string     // 名片的微信ID
+  cardNickname?: string     // 名片的昵称
+  cardAvatarUrl?: string    // 名片头像 URL
+  // 转账消息
+  transferPayerUsername?: string   // 转账付款人
+  transferReceiverUsername?: string // 转账收款人
+  // 聊天记录
+  chatRecordTitle?: string  // 聊天记录标题
+  chatRecordList?: Array<{
+    datatype: number
+    sourcename: string
+    sourcetime: string
+    sourceheadurl?: string
+    datadesc?: string
+    datatitle?: string
+    fileext?: string
+    datasize?: number
+    messageuuid?: string
+    dataurl?: string
+    datathumburl?: string
+    datacdnurl?: string
+    cdndatakey?: string
+    cdnthumbkey?: string
+    aeskey?: string
+    md5?: string
+    fullmd5?: string
+    thumbfullmd5?: string
+    srcMsgLocalid?: number
+    imgheight?: number
+    imgwidth?: number
+    duration?: number
+    chatRecordTitle?: string
+    chatRecordDesc?: string
+    chatRecordList?: any[]
+  }>
+  _db_path?: string // 内部字段：记录消息所属数据库路径
+}
+
+type ResourceMessageType = 'image' | 'video' | 'voice' | 'file'
+
+interface ResourceMessageItem extends Message {
+  sessionId: string
+  sessionDisplayName?: string
+  resourceType: ResourceMessageType
+}
+
+export interface Contact {
+  username: string
+  alias: string
+  remark: string
+  nickName: string
+}
+
+export interface ContactInfo {
+  username: string
+  displayName: string
+  remark?: string
+  nickname?: string
+  alias?: string
+  labels?: string[]
+  detailDescription?: string
+  region?: string
+  avatarUrl?: string
+  type: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
+}
+
+interface GetContactsOptions {
+  lite?: boolean
+}
+
+interface ExportSessionStats {
+  totalMessages: number
+  voiceMessages: number
+  imageMessages: number
+  videoMessages: number
+  emojiMessages: number
+  transferMessages: number
+  redPacketMessages: number
+  callMessages: number
+  firstTimestamp?: number
+  lastTimestamp?: number
+  privateMutualGroups?: number
+  groupMemberCount?: number
+  groupMyMessages?: number
+  groupActiveSpeakers?: number
+  groupMutualFriends?: number
+}
+
+interface ExportSessionStatsOptions {
+  includeRelations?: boolean
+  forceRefresh?: boolean
+  allowStaleCache?: boolean
+  preferAccurateSpecialTypes?: boolean
+  cacheOnly?: boolean
+}
+
+interface ExportSessionStatsCacheMeta {
+  updatedAt: number
+  stale: boolean
+  includeRelations: boolean
+  source: 'memory' | 'disk' | 'fresh'
+}
+
+interface ExportTabCounts {
+  private: number
+  group: number
+  official: number
+  former_friend: number
+}
+
+interface SessionDetailFast {
+  wxid: string
+  displayName: string
+  remark?: string
+  nickName?: string
+  alias?: string
+  avatarUrl?: string
+  messageCount: number
+}
+
+interface SessionDetailExtra {
+  firstMessageTime?: number
+  latestMessageTime?: number
+  messageTables: { dbName: string; tableName: string; count: number }[]
+}
+
+type SessionDetail = SessionDetailFast & SessionDetailExtra
+
+interface SyntheticUnreadState {
+  readTimestamp: number
+  scannedTimestamp: number
+  latestTimestamp: number
+  unreadCount: number
+  summaryTimestamp?: number
+  summary?: string
+  lastMsgType?: number
+}
+
+interface MyFootprintSummary {
+  private_inbound_people: number
+  private_replied_people: number
+  private_outbound_people: number
+  private_reply_rate: number
+  mention_count: number
+  mention_group_count: number
+}
+
+interface MyFootprintPrivateSession {
+  session_id: string
+  incoming_count: number
+  outgoing_count: number
+  replied: boolean
+  first_incoming_ts: number
+  first_reply_ts: number
+  latest_ts: number
+  anchor_local_id: number
+  anchor_create_time: number
+  displayName?: string
+  avatarUrl?: string
+}
+
+interface MyFootprintPrivateSegment {
+  session_id: string
+  segment_index: number
+  start_ts: number
+  end_ts: number
+  duration_sec: number
+  incoming_count: number
+  outgoing_count: number
+  message_count: number
+  replied: boolean
+  first_incoming_ts: number
+  first_reply_ts: number
+  latest_ts: number
+  anchor_local_id: number
+  anchor_create_time: number
+  displayName?: string
+  avatarUrl?: string
+}
+
+interface MyFootprintMentionItem {
+  session_id: string
+  local_id: number
+  create_time: number
+  sender_username: string
+  message_content: string
+  source: string
+  sessionDisplayName?: string
+  senderDisplayName?: string
+  senderAvatarUrl?: string
+}
+
+interface MyFootprintMentionGroup {
+  session_id: string
+  count: number
+  latest_ts: number
+  displayName?: string
+  avatarUrl?: string
+}
+
+interface MyFootprintDiagnostics {
+  truncated: boolean
+  scanned_dbs: number
+  elapsed_ms: number
+  mention_truncated?: boolean
+  private_truncated?: boolean
+  native_ms?: number
+  source_filter_ms?: number
+  fallback_ms?: number
+  enrich_ms?: number
+  pipeline_ms?: number
+  fallback_used?: boolean
+  private_limit_effective?: number
+  mention_candidate_limit?: number
+  native_mention_candidates?: number
+  source_filtered_mentions?: number
+  private_session_count?: number
+  group_session_count?: number
+  native_passes?: number
+  native_group_chunks?: number
+}
+
+interface MyFootprintData {
+  summary: MyFootprintSummary
+  private_sessions: MyFootprintPrivateSession[]
+  private_segments: MyFootprintPrivateSegment[]
+  mentions: MyFootprintMentionItem[]
+  mention_groups: MyFootprintMentionGroup[]
+  diagnostics: MyFootprintDiagnostics
+}
+
+// 表情包缓存
+const emojiCache: Map<string, string> = new Map()
+const emojiDownloading: Map<string, Promise<string | null>> = new Map()
+const FRIEND_EXCLUDE_USERNAMES = new Set(['medianote', 'floatbottle', 'qmessage', 'qqmail', 'fmessage'])
+
+class ChatService {
+  private configService: ConfigService
+  private connected = false
+  private readonly dbMonitorListeners = new Set<(type: string, json: string) => void>()
+  private messageCursors: Map<string, { cursor: number; fetched: number; batchSize: number; startTime?: number; endTime?: number; ascending?: boolean; bufferedMessages?: any[] }> = new Map()
+  private messageCursorMutex: boolean = false
+  private readonly messageBatchDefault = 50
+  private avatarCache: Map<string, ContactCacheEntry>
+  private readonly avatarCacheTtlMs = 10 * 60 * 1000
+  private readonly defaultV1AesKey = 'cfcd208495d565ef'
+  private readonly contactCacheService: ContactCacheService
+  private readonly messageCacheService: MessageCacheService
+  private readonly sessionStatsCacheService: SessionStatsCacheService
+  private readonly groupMyMessageCountCacheService: GroupMyMessageCountCacheService
+  private readonly imageDecryptService: ImageDecryptService
+  private voiceWavCache: LRUCache<string, Buffer>
+  private voiceTranscriptCache: LRUCache<string, string>
+  private voiceTranscriptPending = new Map<string, Promise<{ success: boolean; transcript?: string; error?: string }>>()
+  private transcriptCacheLoaded = false
+  private transcriptCacheDirty = false
+  private transcriptFlushTimer: ReturnType<typeof setTimeout> | null = null
+  private mediaDbsCache: string[] | null = null
+  private mediaDbsCacheTime = 0
+  private readonly mediaDbsCacheTtl = 300000 // 5分钟
+  private readonly voiceWavCacheMaxEntries = 50
+  // 缓存 media.db 的表结构信息
+  private mediaDbSchemaCache = new Map<string, {
+    voiceTable: string
+    dataColumn: string
+    chatNameIdColumn?: string
+    timeColumn?: string
+    name2IdTable?: string
+  }>()
+  // 缓存会话表信息，避免每次查询
+  private sessionTablesCache = new Map<string, { tables: Array<{ tableName: string; dbPath: string }>; updatedAt: number }>()
+  private messageTableColumnsCache = new Map<string, { columns: Set<string>; updatedAt: number }>()
+  private messageName2IdTableCache = new Map<string, string | null>()
+  private messageSenderIdCache = new Map<string, string | null>()
+  private readonly sessionTablesCacheTtl = 300000 // 5分钟
+  private readonly messageTableColumnsCacheTtlMs = 30 * 60 * 1000
+  private messageDbCountSnapshotCache: {
+    dbPaths: string[]
+    dbSignature: string
+    updatedAt: number
+  } | null = null
+  private readonly messageDbCountSnapshotCacheTtlMs = 8000
+  private sessionMessageCountCache = new Map<string, { count: number; updatedAt: number }>()
+  private sessionMessageCountHintCache = new Map<string, number>()
+  private syntheticUnreadState = new Map<string, SyntheticUnreadState>()
+  private sessionMessageCountBatchCache: {
+    dbSignature: string
+    sessionIdsKey: string
+    counts: Record<string, number>
+    updatedAt: number
+  } | null = null
+  private sessionMessageCountCacheScope = ''
+  private readonly sessionMessageCountCacheTtlMs = 10 * 60 * 1000
+  private readonly sessionMessageCountBatchCacheTtlMs = 5 * 60 * 1000
+  private sessionDetailFastCache = new Map<string, { detail: SessionDetailFast; updatedAt: number }>()
+  private sessionDetailExtraCache = new Map<string, { detail: SessionDetailExtra; updatedAt: number }>()
+  private readonly sessionDetailFastCacheTtlMs = 60 * 1000
+  private readonly sessionDetailExtraCacheTtlMs = 5 * 60 * 1000
+  private sessionStatusCache = new Map<string, { isFolded?: boolean; isMuted?: boolean; updatedAt: number }>()
+  private readonly sessionStatusCacheTtlMs = 10 * 60 * 1000
+  private sessionStatsCacheScope = ''
+  private sessionStatsMemoryCache = new Map<string, SessionStatsCacheEntry>()
+  private sessionStatsPendingBasic = new Map<string, Promise<ExportSessionStats>>()
+  private sessionStatsPendingFull = new Map<string, Promise<ExportSessionStats>>()
+  private allGroupSessionIdsCache: { ids: string[]; updatedAt: number } | null = null
+  private readonly sessionStatsCacheTtlMs = 10 * 60 * 1000
+  private readonly allGroupSessionIdsCacheTtlMs = 5 * 60 * 1000
+  private groupMyMessageCountCacheScope = ''
+  private groupMyMessageCountMemoryCache = new Map<string, GroupMyMessageCountCacheEntry>()
+  private initFailureDialogShown = false
+  private readonly contactExtendedFieldCandidates = [
+    'label_list', 'labelList', 'labels', 'label_names', 'labelNames', 'tags', 'tag_list', 'tagList',
+    'detail_description', 'detailDescription', 'description', 'desc', 'contact_description', 'contactDescription', 'signature', 'sign',
+    'country', 'province', 'city', 'region',
+    'profile', 'introduction', 'phone', 'mobile', 'telephone', 'tel', 'vcard', 'card_info', 'cardInfo',
+    'extra_buffer', 'extraBuffer'
+  ]
+  private readonly contactExtendedFieldCandidateSet = new Set(this.contactExtendedFieldCandidates.map((name) => name.toLowerCase()))
+  private contactExtendedSelectableColumns: string[] | null = null
+  private contactLabelNameMapCache: Map<number, string> | null = null
+  private contactLabelNameMapCacheAt = 0
+  private readonly contactLabelNameMapCacheTtlMs = 10 * 60 * 1000
+  private contactsLoadInFlight: { mode: 'lite' | 'full'; promise: Promise<{ success: boolean; contacts?: ContactInfo[]; error?: string }> } | null = null
+  private contactsMemoryCache = new Map<'lite' | 'full', { scope: string; updatedAt: number; contacts: ContactInfo[] }>()
+  private readonly contactsMemoryCacheTtlMs = 3 * 60 * 1000
+  private readonly contactDisplayNameCollator = new Intl.Collator('zh-CN')
+  private readonly slowGetContactsLogThresholdMs = 1200
+
+  constructor() {
+    this.configService = new ConfigService()
+    this.contactCacheService = new ContactCacheService(this.configService.getCacheBasePath())
+    const persisted = this.contactCacheService.getAllEntries()
+    this.avatarCache = new Map(Object.entries(persisted))
+    this.messageCacheService = new MessageCacheService(this.configService.getCacheBasePath())
+    this.sessionStatsCacheService = new SessionStatsCacheService(this.configService.getCacheBasePath())
+    this.groupMyMessageCountCacheService = new GroupMyMessageCountCacheService(this.configService.getCacheBasePath())
+    this.imageDecryptService = new ImageDecryptService()
+    // 初始化LRU缓存，限制大小防止内存泄漏
+    this.voiceWavCache = new LRUCache(this.voiceWavCacheMaxEntries)
+    this.voiceTranscriptCache = new LRUCache(1000) // 最多缓存1000条转写记录
+  }
+
+  /**
+   * 清理账号目录名
+   */
+  private cleanAccountDirName(dirName: string): string {
+    const trimmed = dirName.trim()
+    if (!trimmed) return trimmed
+
+    if (trimmed.toLowerCase().startsWith('wxid_')) {
+      const match = trimmed.match(/^(wxid_[^_]+)/i)
+      if (match) return match[1]
+      return trimmed
+    }
+
+    const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/)
+    const cleaned = suffixMatch ? suffixMatch[1] : trimmed
+
+    return cleaned
+  }
+
+  /**
+   * 判断头像 URL 是否可用，过滤历史缓存里的错误 hex 数据。
+   */
+  private isValidAvatarUrl(avatarUrl?: string): avatarUrl is string {
+    const normalized = String(avatarUrl || '').trim()
+    if (!normalized) return false
+    const normalizedLower = normalized.toLowerCase()
+    if (normalizedLower.includes('base64,ffd8')) return false
+    if (normalizedLower.startsWith('ffd8')) return false
+    return true
+  }
+
+  private extractErrorCode(message?: string): number | null {
+    const text = String(message || '').trim()
+    if (!text) return null
+    const match = text.match(/(?:错误码\s*[:：]\s*|\()(-?\d{2,6})(?:\)|\b)/)
+    if (!match) return null
+    const parsed = Number(match[1])
+    return Number.isFinite(parsed) ? parsed : null
+  }
+
+  private toCodeOnlyMessage(rawMessage?: string, fallbackCode = -3999): string {
+    const code = this.extractErrorCode(rawMessage) ?? fallbackCode
+    return `错误码: ${code}`
+  }
+
+  private async maybeShowInitFailureDialog(errorMessage: string): Promise<void> {
+    if (!app.isPackaged) return
+    if (this.initFailureDialogShown) return
+
+    const code = this.extractErrorCode(errorMessage)
+    if (code === null) return
+    const isSecurityCode =
+      code === -101 ||
+      code === -102 ||
+      code === -2299 ||
+      code === -2301 ||
+      code === -2302 ||
+      code === -1006 ||
+      (code <= -2201 && code >= -2212)
+    if (!isSecurityCode) return
+
+    this.initFailureDialogShown = true
+    const detail = [
+      `错误码: ${code}`
+    ].join('\n')
+
+    try {
+      await dialog.showMessageBox({
+        type: 'error',
+        title: 'WeFlow 启动失败',
+        message: '启动失败，请反馈错误码。',
+        detail,
+        buttons: ['确定'],
+        noLink: true
+      })
+    } catch {
+      // 弹窗失败不阻断主流程
+    }
+  }
+
+  /**
+   * 连接数据库
+   */
+  async connect(): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (this.connected && wcdbService.isReady()) {
+        return { success: true }
+      }
+      const wxid = this.configService.get('myWxid')
+      const dbPath = this.configService.get('dbPath')
+      const decryptKey = this.configService.get('decryptKey')
+      if (!wxid) {
+        return { success: false, error: '请先在设置页面配置微信ID' }
+      }
+      if (!dbPath) {
+        return { success: false, error: '请先在设置页面配置数据库路径' }
+      }
+      if (!decryptKey) {
+        return { success: false, error: '请先在设置页面配置解密密钥' }
+      }
+
+      const cleanedWxid = this.cleanAccountDirName(wxid)
+      const openOk = await wcdbService.open(dbPath, decryptKey, cleanedWxid)
+      if (!openOk) {
+        const detailedError = this.toCodeOnlyMessage(await wcdbService.getLastInitError())
+        await this.maybeShowInitFailureDialog(detailedError)
+        return { success: false, error: detailedError }
+      }
+
+      this.connected = true
+
+      // 设置数据库监控
+      this.setupDbMonitor()
+
+      // 预热 listMediaDbs 缓存（后台异步执行，不阻塞连接）
+      this.warmupMediaDbsCache()
+
+      return { success: true }
+    } catch (e) {
+      console.error('ChatService: 连接数据库失败:', e)
+      return { success: false, error: this.toCodeOnlyMessage(String(e), -3998) }
+    }
+  }
+
+  private monitorSetup = false
+
+  addDbMonitorListener(listener: (type: string, json: string) => void): () => void {
+    this.dbMonitorListeners.add(listener)
+    return () => {
+      this.dbMonitorListeners.delete(listener)
+    }
+  }
+
+  private setupDbMonitor() {
+    if (this.monitorSetup) return
+    this.monitorSetup = true
+
+    // 使用 C++数据服务内部的文件监控 (ReadDirectoryChangesW)
+    // 这种方式更高效，且不占用 JS 线程，并能直接监听 session/message 目录变更
+    wcdbService.setMonitor((type, json) => {
+      this.handleSessionStatsMonitorChange(type, json)
+      // 调用额外的 monitor handlers（如 httpService 的 webhook）
+      for (const handler of extraMonitorHandlers) {
+        try {
+          handler(type, json)
+        } catch (e) {
+          console.error('[ChatService] Monitor handler error:', e)
+        }
+      }
+      for (const listener of this.dbMonitorListeners) {
+        try {
+          listener(type, json)
+        } catch (error) {
+          console.error('[ChatService] 数据库监听回调失败:', error)
+        }
+      }
+      const windows = BrowserWindow.getAllWindows()
       // 广播给所有渲染进程窗口
       windows.forEach((win) => {
         if (!win.isDestroyed()) {
