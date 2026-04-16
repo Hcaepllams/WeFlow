@@ -336,9 +336,8 @@ class HttpService {
     private verifyToken(req: http.IncomingMessage, url: URL, body: Record<string, any>): boolean {
         const expectedToken = String(this.configService.get('httpApiToken') || '').trim()
         if (!expectedToken) {
-            // token 未配置时拒绝所有请求，防止未授权访问
-            console.warn('[HttpService] Access denied: httpApiToken not configured')
-            return false
+            // token 未配置时跳过验证
+            return true
         }
 
         const authHeader = req.headers.authorization
